@@ -832,9 +832,6 @@ function Dashboard({
     onSaveSource: saveSource,
     onImportExpenses: importExpenses,
     onSignOut: () => db.auth.signOut()
-  }), tab === "ai" && /*#__PURE__*/React.createElement(AskAI, {
-    people: people,
-    expenses: expenses
   })), toast && /*#__PURE__*/React.createElement("div", {
     style: S.toast
   }, toast), /*#__PURE__*/React.createElement("nav", {
@@ -861,11 +858,6 @@ function Dashboard({
     onClick: () => setTab("budgets"),
     icon: "🎯",
     label: "Budgets"
-  }), /*#__PURE__*/React.createElement(TabBtn, {
-    active: tab === "ai",
-    onClick: () => setTab("ai"),
-    icon: "✨",
-    label: "Ask AI"
   })));
 }
 function TabBtn({
@@ -1803,87 +1795,6 @@ function ImportExpenses({
     disabled: busy,
     onClick: runImport
   }, busy ? progress ? `Importeren… ${progress.done}/${progress.total}` : "Importeren…" : `Importeer ${rows.length} uitgaven`));
-}
-
-// ---------- Ask AI ----------
-const EXAMPLE_QUESTIONS = ["Hoeveel gaven we deze maand uit aan boodschappen?", "Wat is ons gemiddelde maandelijkse Uber-bedrag dit jaar?", "Wie heeft er meer betaald aan gedeelde uitgaven deze maand?"];
-function AskAI({
-  people,
-  expenses
-}) {
-  const [question, setQuestion] = useState("");
-  const [answer, setAnswer] = useState(null);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState(null);
-  const ask = async q => {
-    const query = (q || question).trim();
-    if (!query) return;
-    setBusy(true);
-    setErr(null);
-    setAnswer(null);
-    try {
-      const context = expenses.map(e => {
-        const payerName = e.kind === "shared" ? people[e.payer] : e.kind === "p0" ? people[0] : people[1];
-        const note = (e.note || "").replace(/[,\n]/g, " ");
-        return `${e.spent_on},${e.category},${e.kind},${payerName},${Number(e.amount_eur).toFixed(2)},${note}`;
-      }).join("\n");
-      const {
-        data,
-        error
-      } = await db.functions.invoke("ask-ai", {
-        body: {
-          question: query,
-          context
-        }
-      });
-      if (error) throw error;
-      setAnswer(data.answer);
-    } catch (e2) {
-      setErr("Kon geen antwoord ophalen: " + e2.message);
-    } finally {
-      setBusy(false);
-    }
-  };
-  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", {
-    style: S.pageTitle
-  }, "Ask AI"), /*#__PURE__*/React.createElement("div", {
-    style: S.privacyNote
-  }, "Stel een vraag over jullie uitgaven, bijvoorbeeld:"), /*#__PURE__*/React.createElement("div", {
-    style: S.chipRow
-  }, EXAMPLE_QUESTIONS.map((q, i) => /*#__PURE__*/React.createElement("button", {
-    key: i,
-    style: S.chip,
-    onClick: () => {
-      setQuestion(q);
-      ask(q);
-    }
-  }, q))), /*#__PURE__*/React.createElement("textarea", {
-    style: {
-      ...S.input,
-      minHeight: 70,
-      resize: "vertical",
-      fontFamily: "inherit"
-    },
-    placeholder: "Typ hier je vraag…",
-    value: question,
-    onChange: e => setQuestion(e.target.value)
-  }), /*#__PURE__*/React.createElement("button", {
-    style: {
-      ...S.primaryBtn,
-      marginTop: 8,
-      opacity: busy ? 0.6 : 1
-    },
-    disabled: busy,
-    onClick: () => ask()
-  }, busy ? "Denken…" : "Vraag stellen"), err && /*#__PURE__*/React.createElement("div", {
-    style: S.errBox
-  }, err), answer && /*#__PURE__*/React.createElement("div", {
-    style: {
-      ...S.hero,
-      marginTop: 14,
-      whiteSpace: "pre-wrap"
-    }
-  }, answer));
 }
 function Bar({
   spent,
