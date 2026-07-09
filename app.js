@@ -501,7 +501,7 @@ function Dashboard({
   const [budgets, setBudgets] = useState({});
   const [members, setMembers] = useState([]);
   const [tab, setTab] = useState("overview");
-  const [displayCur, setDisplayCur] = useState("EUR");
+  const [displayCur, setDisplayCur] = useState("COP");
   const [month, setMonth] = useState(() => {
     const d = new Date();
     return {
@@ -1004,7 +1004,7 @@ function AddExpense({
   onUpdateRates
 }) {
   const [amount, setAmount] = useState("");
-  const [currency, setCurrency] = useState("EUR");
+  const [currency, setCurrency] = useState("COP");
   const [kind, setKind] = useState("shared");
   const [payer, setPayer] = useState(0);
   const [category, setCategory] = useState("groceries");
