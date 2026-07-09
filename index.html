@@ -20,6 +20,8 @@
     html, body { margin: 0; padding: 0; background: var(--bg); }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; -webkit-font-smoothing: antialiased; }
     #root { min-height: 100vh; }
+    .auth-photo { width: 260px; max-width: 30vw; height: auto; border-radius: 18px; object-fit: cover; box-shadow: 0 8px 24px rgba(0,0,0,0.15); }
+    @media (max-width: 900px) { .auth-photo { display: none; } }
   </style>
 </head>
 <body>

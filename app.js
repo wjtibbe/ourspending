@@ -213,7 +213,11 @@ function Auth() {
   };
   return /*#__PURE__*/React.createElement("div", {
     style: S.authWrap
-  }, /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("img", {
+    className: "auth-photo",
+    src: "assets/couple-beach.png",
+    alt: ""
+  }), /*#__PURE__*/React.createElement("div", {
     style: S.authCard
   }, /*#__PURE__*/React.createElement("div", {
     style: S.brandBig
@@ -277,7 +281,11 @@ function Auth() {
     },
     disabled: busy,
     onClick: submit
-  }, busy ? "Please wait…" : mode === "signin" ? "Sign in" : "Create account")));
+  }, busy ? "Please wait…" : mode === "signin" ? "Sign in" : "Create account")), /*#__PURE__*/React.createElement("img", {
+    className: "auth-photo",
+    src: "assets/couple-mountain.png",
+    alt: ""
+  }));
 }
 
 // ============================================================
@@ -1492,6 +1500,7 @@ const S = {
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
+    gap: 24,
     padding: 16
   },
   authCard: {
