@@ -710,7 +710,11 @@ function Dashboard({
     style: S.iconBtn,
     onClick: loadAll,
     title: "Refresh"
-  }, "⟳"))), /*#__PURE__*/React.createElement("div", {
+  }, "⟳"), /*#__PURE__*/React.createElement("button", {
+    style: S.iconBtn,
+    onClick: () => db.auth.signOut(),
+    title: "Sign out"
+  }, "⎋"))), /*#__PURE__*/React.createElement("div", {
     style: S.ratesLine
   }, /*#__PURE__*/React.createElement("span", null, "1€ = $", rates.usdPerEur.toFixed(2), " · COP ", Math.round(rates.copPerEur).toLocaleString("en-US"), /*#__PURE__*/React.createElement("span", {
     style: {
