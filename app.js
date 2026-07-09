@@ -873,6 +873,7 @@ function Overview({
   displayCur
 }) {
   const [fKind, setFKind] = useState(null);
+  const [fWho, setFWho] = useState(null);
   const [fCat, setFCat] = useState(null);
   const [confirmId, setConfirmId] = useState(null);
   const shift = d => {
@@ -898,7 +899,13 @@ function Overview({
   const priv = ["p0", "p1"].map(k => monthExpenses.filter(e => e.kind === k).reduce((s, e) => s + Number(e.amount_eur), 0));
   const pct = v => total > 0 ? v / total * 100 : 0;
   let visible = monthExpenses;
-  if (fKind) visible = visible.filter(e => e.kind === fKind);
+  if (fKind === "shared") {
+    visible = visible.filter(e => e.kind === "shared");
+    if (fWho != null) visible = visible.filter(e => e.payer === fWho);
+  } else if (fKind === "private") {
+    visible = visible.filter(e => e.kind === "p0" || e.kind === "p1");
+    if (fWho != null) visible = visible.filter(e => e.kind === (fWho === 0 ? "p0" : "p1"));
+  }
   if (fCat) visible = visible.filter(e => e.category === fCat);
   const groups = {};
   visible.forEach(e => {
@@ -1019,26 +1026,49 @@ function Overview({
       ...S.chip,
       ...(!fKind ? S.chipOn : {})
     },
-    onClick: () => setFKind(null)
+    onClick: () => {
+      setFKind(null);
+      setFWho(null);
+    }
   }, "All"), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.chip,
       ...(fKind === "shared" ? S.chipOn : {})
     },
-    onClick: () => setFKind(fKind === "shared" ? null : "shared")
+    onClick: () => {
+      setFKind(fKind === "shared" ? null : "shared");
+      setFWho(null);
+    }
   }, "Shared"), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.chip,
-      ...(fKind === "p0" ? S.chipOn : {})
+      ...(fKind === "private" ? S.chipOn : {})
     },
-    onClick: () => setFKind(fKind === "p0" ? null : "p0")
-  }, people[0]), /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      setFKind(fKind === "private" ? null : "private");
+      setFWho(null);
+    }
+  }, "Private")), (fKind === "shared" || fKind === "private") && /*#__PURE__*/React.createElement("div", {
+    style: S.chipRow
+  }, fKind === "shared" && /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.chip,
-      ...(fKind === "p1" ? S.chipOn : {})
+      ...(fWho == null ? S.chipOn : {})
     },
-    onClick: () => setFKind(fKind === "p1" ? null : "p1")
-  }, people[1])), usedCats.length > 0 && /*#__PURE__*/React.createElement("div", {
+    onClick: () => setFWho(null)
+  }, "Any payer"), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.chip,
+      ...(fWho === 0 ? S.chipOn : {})
+    },
+    onClick: () => setFWho(fWho === 0 ? null : 0)
+  }, fKind === "shared" ? `Paid by ${people[0]}` : people[0]), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.chip,
+      ...(fWho === 1 ? S.chipOn : {})
+    },
+    onClick: () => setFWho(fWho === 1 ? null : 1)
+  }, fKind === "shared" ? `Paid by ${people[1]}` : people[1])), usedCats.length > 0 && /*#__PURE__*/React.createElement("div", {
     style: S.chipRow
   }, usedCats.map(c => /*#__PURE__*/React.createElement("button", {
     key: c,
