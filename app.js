@@ -664,6 +664,34 @@ function Dashboard({
     setTab("overview");
     loadAll();
   };
+  const importExpenses = async (parsedRows, onProgress) => {
+    const batchSize = 50;
+    for (let i = 0; i < parsedRows.length; i += batchSize) {
+      const batch = parsedRows.slice(i, i + batchSize).map(exp => {
+        const eur = toEUR(exp.amount, exp.currency, rates);
+        return {
+          household_id: hhId,
+          amount_orig: exp.amount,
+          currency: exp.currency,
+          amount_eur: Math.round(eur * 100) / 100,
+          rate_used: perEur(exp.currency, rates),
+          kind: exp.kind,
+          payer: exp.payer,
+          category: exp.category,
+          note: exp.note,
+          spent_on: exp.date,
+          created_by: user.id
+        };
+      });
+      const {
+        error
+      } = await db.from("expenses").insert(batch);
+      if (error) throw new Error(`Rij ${i + 1}-${i + batch.length}: ${error.message}`);
+      if (onProgress) onProgress(Math.min(i + batchSize, parsedRows.length), parsedRows.length);
+    }
+    showToast(`${parsedRows.length} uitgaven geïmporteerd`);
+    loadAll();
+  };
   const deleteExpense = async id => {
     await db.from("expenses").delete().eq("id", id);
     loadAll();
@@ -802,6 +830,7 @@ function Dashboard({
     onSaveName: saveMyName,
     onSaveRates: saveRates,
     onSaveSource: saveSource,
+    onImportExpenses: importExpenses,
     onSignOut: () => db.auth.signOut()
   })), toast && /*#__PURE__*/React.createElement("div", {
     style: S.toast
@@ -1346,6 +1375,7 @@ function Budgets({
   onSaveName,
   onSaveRates,
   onSaveSource,
+  onImportExpenses,
   onSignOut
 }) {
   const [draft, setDraft] = useState(() => {
@@ -1638,7 +1668,11 @@ function Budgets({
     }
   }, "Edit")), /*#__PURE__*/React.createElement("div", {
     style: S.privacyNote
-  }, "Each expense locks in the rate at the moment you save it, so past totals never shift. Everyone in your household sees the same data in real time."), /*#__PURE__*/React.createElement("button", {
+  }, "Each expense locks in the rate at the moment you save it, so past totals never shift. Everyone in your household sees the same data in real time."), /*#__PURE__*/React.createElement(ImportExpenses, {
+    people: people,
+    rates: rates,
+    onImport: onImportExpenses
+  }), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.ghostBtn,
       marginTop: 20,
@@ -1647,6 +1681,120 @@ function Budgets({
     },
     onClick: onSignOut
   }, "Sign out"));
+}
+
+// ---------- CSV import ----------
+function parseImportCsv(text) {
+  const lines = text.replace(/\r/g, "").split("\n").filter(l => l.trim().length);
+  if (!lines.length) return [];
+  const header = lines[0].split(",").map(h => h.trim());
+  return lines.slice(1).map(line => {
+    const cols = line.split(",");
+    const row = {};
+    header.forEach((h, i) => row[h] = (cols[i] || "").trim());
+    return row;
+  });
+}
+const VALID_KINDS = ["shared", "p0", "p1"];
+function ImportExpenses({
+  people,
+  rates,
+  onImport
+}) {
+  const [rows, setRows] = useState(null);
+  const [fileName, setFileName] = useState("");
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState(null);
+  const fileInputRef = useRef(null);
+  const onFile = e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setErr(null);
+    setProgress(null);
+    setFileName(file.name);
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = parseImportCsv(String(reader.result));
+        const invalid = [];
+        const clean = parsed.map((r, i) => {
+          const amount = parseFloat(r.amount);
+          const category = catById(r.category).id === r.category ? r.category : null;
+          const kind = VALID_KINDS.includes(r.kind) ? r.kind : null;
+          const currency = CURRENCIES.includes(r.currency) ? r.currency : null;
+          if (!r.date || !(amount > 0) || !currency || !category || !kind) invalid.push(i + 2);
+          return {
+            date: r.date,
+            amount,
+            currency,
+            category,
+            kind,
+            payer: Number(r.payer) === 1 ? 1 : 0,
+            note: r.note || ""
+          };
+        });
+        if (invalid.length) {
+          setErr(`Ongeldige rij(en) in CSV: regel ${invalid.slice(0, 10).join(", ")}${invalid.length > 10 ? "…" : ""}`);
+          setRows(null);
+          return;
+        }
+        setRows(clean);
+      } catch (e2) {
+        setErr("Kon CSV niet lezen: " + e2.message);
+        setRows(null);
+      }
+    };
+    reader.readAsText(file);
+  };
+  const totalEur = rows ? rows.reduce((s, r) => s + toEUR(r.amount, r.currency, rates), 0) : 0;
+  const byCategory = {};
+  if (rows) rows.forEach(r => {
+    byCategory[r.category] = (byCategory[r.category] || 0) + 1;
+  });
+  const runImport = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      await onImport(rows, (done, total) => setProgress({
+        done,
+        total
+      }));
+      setRows(null);
+      setFileName("");
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    } catch (e2) {
+      setErr(e2.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 20,
+      paddingTop: 16,
+      borderTop: "1px solid var(--line)"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, "Import expenses (CSV)"), /*#__PURE__*/React.createElement("input", {
+    ref: fileInputRef,
+    type: "file",
+    accept: ".csv",
+    onChange: onFile
+  }), err && /*#__PURE__*/React.createElement("div", {
+    style: S.errBox
+  }, err), rows && /*#__PURE__*/React.createElement("div", {
+    style: S.privacyNote
+  }, rows.length, " rijen in ", fileName, " · totaal ~", fmt(totalEur, "EUR"), " · ", Object.entries(byCategory).map(([c, n]) => `${catById(c).label}: ${n}`).join(", ")), rows && /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.primaryBtn,
+      marginTop: 8,
+      opacity: busy ? 0.6 : 1
+    },
+    disabled: busy,
+    onClick: runImport
+  }, busy ? progress ? `Importeren… ${progress.done}/${progress.total}` : "Importeren…" : `Importeer ${rows.length} uitgaven`));
 }
 function Bar({
   spent,
