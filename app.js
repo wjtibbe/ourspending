@@ -852,8 +852,10 @@ function TabBtn({
     }
   }, label));
 }
-const kindLabel = (e, people) => e.kind === "shared" ? "Shared" : e.kind === "p0" ? `Private · ${people[0]}` : `Private · ${people[1]}`;
 const kindDot = e => e.kind === "shared" ? "var(--green)" : e.kind === "p0" ? "var(--blue)" : "var(--ochre)";
+const kindText = (e, people) => e.kind === "shared" ? `Shared · paid by ${people[e.payer]}` : e.kind === "p0" ? `${people[0]} · private` : `${people[1]} · private`;
+const initialsOf = name => (name || "").trim().split(/[\s-]+/).filter(Boolean).map(w => w[0]).join("").slice(0, 2).toUpperCase();
+const kindInitials = (e, people) => initialsOf(e.kind === "shared" ? people[e.payer] : e.kind === "p0" ? people[0] : people[1]);
 
 // ---------- Overview ----------
 function Overview({
@@ -1071,13 +1073,33 @@ function Overview({
     }, /*#__PURE__*/React.createElement("div", {
       style: S.expTitle
     }, catById(e.category).label, e.note ? ` — ${e.note}` : ""), /*#__PURE__*/React.createElement("div", {
-      style: S.expSub
-    }, /*#__PURE__*/React.createElement("i", {
       style: {
-        ...S.dot,
-        background: kindDot(e)
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        marginTop: 2
       }
-    }), kindLabel(e, people), e.kind === "shared" && ` · paid by ${people[e.payer]}`)), /*#__PURE__*/React.createElement("div", {
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        width: 18,
+        height: 18,
+        borderRadius: "50%",
+        background: kindDot(e),
+        color: "#fff",
+        fontSize: 9,
+        fontWeight: 700,
+        flexShrink: 0
+      }
+    }, kindInitials(e, people)), /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 12,
+        fontWeight: 600,
+        color: kindDot(e)
+      }
+    }, kindText(e, people)))), /*#__PURE__*/React.createElement("div", {
       style: {
         textAlign: "right"
       }
