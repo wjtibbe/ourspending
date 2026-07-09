@@ -522,6 +522,7 @@ function Dashboard({
     from: todayStr(),
     to: todayStr()
   }));
+  const [editingExpense, setEditingExpense] = useState(null);
   const [toast, setToast] = useState(null);
   const [ratesLoading, setRatesLoading] = useState(false);
   const hhId = profile.household_id;
@@ -640,6 +641,29 @@ function Dashboard({
     setTab("overview");
     loadAll();
   };
+  const updateExpense = async (id, exp) => {
+    const {
+      error
+    } = await db.from("expenses").update({
+      amount_orig: exp.amountOrig,
+      currency: exp.currency,
+      amount_eur: exp.amountEUR,
+      rate_used: exp.rateUsed,
+      kind: exp.kind,
+      payer: exp.payer,
+      category: exp.category,
+      note: exp.note,
+      spent_on: exp.date
+    }).eq("id", id);
+    if (error) {
+      showToast("Save failed: " + error.message);
+      return;
+    }
+    showToast("Expense updated");
+    setEditingExpense(null);
+    setTab("overview");
+    loadAll();
+  };
   const deleteExpense = async id => {
     await db.from("expenses").delete().eq("id", id);
     loadAll();
@@ -745,8 +769,19 @@ function Dashboard({
     monthExpenses: monthExpenses,
     disp: disp,
     displayCur: displayCur,
-    onDelete: deleteExpense
+    onDelete: deleteExpense,
+    onEdit: exp => {
+      setEditingExpense(exp);
+      setTab("add");
+    }
   }), tab === "add" && /*#__PURE__*/React.createElement(AddExpense, {
+    key: editingExpense ? editingExpense.id : "new",
+    editingExpense: editingExpense,
+    onUpdate: updateExpense,
+    onCancelEdit: () => {
+      setEditingExpense(null);
+      setTab("overview");
+    },
     people: people,
     rates: rates,
     saving: false,
@@ -774,12 +809,18 @@ function Dashboard({
     style: S.tabbar
   }, /*#__PURE__*/React.createElement(TabBtn, {
     active: tab === "overview",
-    onClick: () => setTab("overview"),
+    onClick: () => {
+      setEditingExpense(null);
+      setTab("overview");
+    },
     icon: "📒",
     label: "Overview"
   }), /*#__PURE__*/React.createElement(TabBtn, {
     active: tab === "add",
-    onClick: () => setTab("add"),
+    onClick: () => {
+      setEditingExpense(null);
+      setTab("add");
+    },
     icon: "＋",
     label: "Add",
     big: true
@@ -825,6 +866,7 @@ function Overview({
   setRange,
   monthExpenses,
   onDelete,
+  onEdit,
   disp,
   displayCur
 }) {
@@ -1061,10 +1103,20 @@ function Overview({
     }, "Delete"), /*#__PURE__*/React.createElement("button", {
       style: S.miniBtn,
       onClick: () => setConfirmId(null)
-    }, "No")) : /*#__PURE__*/React.createElement("button", {
+    }, "No")) : /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        gap: 4,
+        marginTop: 4,
+        justifyContent: "flex-end"
+      }
+    }, /*#__PURE__*/React.createElement("button", {
+      style: S.miniBtn,
+      onClick: () => onEdit(e)
+    }, "Edit"), /*#__PURE__*/React.createElement("button", {
       style: S.delBtn,
       onClick: () => setConfirmId(e.id)
-    }, "×")))));
+    }, "×"))))));
   }));
 }
 
@@ -1075,15 +1127,18 @@ function AddExpense({
   onAdd,
   saving,
   ratesLoading,
-  onUpdateRates
+  onUpdateRates,
+  editingExpense,
+  onUpdate,
+  onCancelEdit
 }) {
-  const [amount, setAmount] = useState("");
-  const [currency, setCurrency] = useState("COP");
-  const [kind, setKind] = useState("shared");
-  const [payer, setPayer] = useState(0);
-  const [category, setCategory] = useState("groceries");
-  const [date, setDate] = useState(todayStr());
-  const [note, setNote] = useState("");
+  const [amount, setAmount] = useState(editingExpense ? String(editingExpense.amount_orig) : "");
+  const [currency, setCurrency] = useState(editingExpense ? editingExpense.currency : "COP");
+  const [kind, setKind] = useState(editingExpense ? editingExpense.kind : "shared");
+  const [payer, setPayer] = useState(editingExpense ? editingExpense.payer : 0);
+  const [category, setCategory] = useState(editingExpense ? editingExpense.category : "groceries");
+  const [date, setDate] = useState(editingExpense ? editingExpense.spent_on : todayStr());
+  const [note, setNote] = useState(editingExpense ? editingExpense.note || "" : "");
   const [err, setErr] = useState(null);
   const pa = parseFloat(String(amount).replace(",", "."));
   const eur = pa > 0 ? toEUR(pa, currency, rates) : NaN;
@@ -1091,7 +1146,7 @@ function AddExpense({
     if (!pa || pa <= 0) return setErr("Enter a valid amount.");
     setErr(null);
     const finalPayer = kind === "shared" ? payer : kind === "p0" ? 0 : 1;
-    onAdd({
+    const exp = {
       amountOrig: pa,
       currency,
       amountEUR: Math.round(eur * 100) / 100,
@@ -1101,13 +1156,18 @@ function AddExpense({
       category,
       date,
       note: note.trim()
-    });
+    };
+    if (editingExpense) {
+      onUpdate(editingExpense.id, exp);
+      return;
+    }
+    onAdd(exp);
     setAmount("");
     setNote("");
   };
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", {
     style: S.pageTitle
-  }, "New expense"), /*#__PURE__*/React.createElement("div", {
+  }, editingExpense ? "Edit expense" : "New expense"), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
   }, "Amount"), /*#__PURE__*/React.createElement("div", {
     style: {
@@ -1210,7 +1270,13 @@ function AddExpense({
     },
     disabled: saving,
     onClick: submit
-  }, saving ? "Saving…" : "Save expense"));
+  }, saving ? "Saving…" : editingExpense ? "Save changes" : "Save expense"), editingExpense && /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.ghostBtn,
+      marginTop: 8
+    },
+    onClick: onCancelEdit
+  }, "Cancel"));
 }
 
 // ---------- Budgets & settings ----------
