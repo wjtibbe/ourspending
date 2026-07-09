@@ -517,6 +517,11 @@ function Dashboard({
       m: d.getMonth()
     };
   });
+  const [rangeMode, setRangeMode] = useState(false);
+  const [range, setRange] = useState(() => ({
+    from: todayStr(),
+    to: todayStr()
+  }));
   const [toast, setToast] = useState(null);
   const [ratesLoading, setRatesLoading] = useState(false);
   const hhId = profile.household_id;
@@ -591,6 +596,7 @@ function Dashboard({
   }, [household]);
   const disp = eur => fmt(fromEUR(eur, displayCur, rates), displayCur);
   const monthExpenses = expenses.filter(e => {
+    if (rangeMode) return e.spent_on >= range.from && e.spent_on <= range.to;
     const [y, m] = e.spent_on.split("-").map(Number);
     return y === month.y && m - 1 === month.m;
   });
@@ -732,6 +738,10 @@ function Dashboard({
     people: people,
     month: month,
     setMonth: setMonth,
+    rangeMode: rangeMode,
+    setRangeMode: setRangeMode,
+    range: range,
+    setRange: setRange,
     monthExpenses: monthExpenses,
     disp: disp,
     displayCur: displayCur,
@@ -809,6 +819,10 @@ function Overview({
   people,
   month,
   setMonth,
+  rangeMode,
+  setRangeMode,
+  range,
+  setRange,
   monthExpenses,
   onDelete,
   disp,
@@ -849,6 +863,54 @@ function Overview({
   const dates = Object.keys(groups).sort().reverse();
   const usedCats = [...new Set(monthExpenses.map(e => e.category))];
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: S.chipRow
+  }, /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.chip,
+      ...(!rangeMode ? S.chipOn : {})
+    },
+    onClick: () => setRangeMode(false)
+  }, "Month"), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.chip,
+      ...(rangeMode ? S.chipOn : {})
+    },
+    onClick: () => setRangeMode(true)
+  }, "Custom period")), rangeMode ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...S.monthNav,
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "date",
+    style: {
+      ...S.input,
+      flex: 1
+    },
+    value: range.from,
+    max: range.to,
+    onChange: e => setRange({
+      ...range,
+      from: e.target.value
+    })
+  }), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: "var(--muted)",
+      fontSize: 13
+    }
+  }, "to"), /*#__PURE__*/React.createElement("input", {
+    type: "date",
+    style: {
+      ...S.input,
+      flex: 1
+    },
+    value: range.to,
+    min: range.from,
+    onChange: e => setRange({
+      ...range,
+      to: e.target.value
+    })
+  })) : /*#__PURE__*/React.createElement("div", {
     style: S.monthNav
   }, /*#__PURE__*/React.createElement("button", {
     style: S.iconBtn,
@@ -865,7 +927,7 @@ function Overview({
     style: S.hero
   }, /*#__PURE__*/React.createElement("div", {
     style: S.heroLabel
-  }, "Total this month · ", displayCur), /*#__PURE__*/React.createElement("div", {
+  }, rangeMode ? "Total for period · " : "Total this month · ", displayCur), /*#__PURE__*/React.createElement("div", {
     style: S.heroAmount
   }, disp(total)), /*#__PURE__*/React.createElement("div", {
     style: S.splitBar
@@ -943,7 +1005,7 @@ function Overview({
     onClick: () => setFCat(fCat === c ? null : c)
   }, catById(c).icon, " ", catById(c).label))), dates.length === 0 && /*#__PURE__*/React.createElement("div", {
     style: S.empty
-  }, "No expenses in ", MONTH_NAMES[month.m], " yet.", /*#__PURE__*/React.createElement("br", null), "Add the first one via ", /*#__PURE__*/React.createElement("b", null, "＋ Add"), "."), dates.map(date => {
+  }, rangeMode ? "No expenses in this period yet." : `No expenses in ${MONTH_NAMES[month.m]} yet.`, /*#__PURE__*/React.createElement("br", null), "Add the first one via ", /*#__PURE__*/React.createElement("b", null, "＋ Add"), "."), dates.map(date => {
     const [y, m, d] = date.split("-").map(Number);
     return /*#__PURE__*/React.createElement("div", {
       key: date,
