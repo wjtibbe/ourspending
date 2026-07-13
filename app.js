@@ -84,6 +84,8 @@ const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "Ju
 const perEur = (cur, r) => cur === "EUR" ? 1 : cur === "USD" ? r.usdPerEur : r.copPerEur;
 const toEUR = (a, cur, r) => a / perEur(cur, r);
 const fromEUR = (a, cur, r) => a * perEur(cur, r);
+// Converted amounts always round UP: whole pesos for COP, whole cents for EUR/USD.
+const ceilCur = (v, cur) => cur === "COP" ? Math.ceil(v) : Math.ceil(v * 100) / 100;
 const fmt = (n, cur) => {
   const v = n || 0;
   if (cur === "COP") return "COP " + v.toLocaleString("en-US", {
@@ -595,7 +597,7 @@ function Dashboard({
   useEffect(() => {
     if (household && ratesAreStale(rates) && RATES_ENABLED) updateRates(true);
   }, [household]);
-  const disp = eur => fmt(fromEUR(eur, displayCur, rates), displayCur);
+  const disp = eur => fmt(ceilCur(fromEUR(eur, displayCur, rates), displayCur), displayCur);
   const monthExpenses = expenses.filter(e => {
     if (rangeMode) return e.spent_on >= range.from && e.spent_on <= range.to;
     const [y, m] = e.spent_on.split("-").map(Number);
@@ -832,6 +834,9 @@ function Dashboard({
     onSaveSource: saveSource,
     onImportExpenses: importExpenses,
     onSignOut: () => db.auth.signOut()
+  }), tab === "groceries" && /*#__PURE__*/React.createElement(GroceryList, {
+    hhId: hhId,
+    user: user
   })), toast && /*#__PURE__*/React.createElement("div", {
     style: S.toast
   }, toast), /*#__PURE__*/React.createElement("nav", {
@@ -853,6 +858,11 @@ function Dashboard({
     icon: "＋",
     label: "Add",
     big: true
+  }), /*#__PURE__*/React.createElement(TabBtn, {
+    active: tab === "groceries",
+    onClick: () => setTab("groceries"),
+    icon: "🛒",
+    label: "List"
   }), /*#__PURE__*/React.createElement(TabBtn, {
     active: tab === "budgets",
     onClick: () => setTab("budgets"),
@@ -1164,7 +1174,7 @@ function Overview({
       }
     }, /*#__PURE__*/React.createElement("div", {
       style: S.expAmount
-    }, disp(Number(e.amount_eur))), e.currency !== displayCur && /*#__PURE__*/React.createElement("div", {
+    }, e.currency === displayCur ? fmt(Number(e.amount_orig), displayCur) : disp(Number(e.amount_eur))), e.currency !== displayCur && /*#__PURE__*/React.createElement("div", {
       style: S.origTag
     }, fmt(Number(e.amount_orig), e.currency)), confirmId === e.id ? /*#__PURE__*/React.createElement("div", {
       style: {
@@ -1272,7 +1282,7 @@ function AddExpense({
     onClick: () => setCurrency(c)
   }, c === "COP" ? "COP" : SYMBOL[c])))), pa > 0 && /*#__PURE__*/React.createElement("div", {
     style: S.convertHint
-  }, currency !== "EUR" && /*#__PURE__*/React.createElement("span", null, fmt(eur, "EUR")), currency !== "USD" && /*#__PURE__*/React.createElement("span", null, fmt(fromEUR(eur, "USD", rates), "USD")), currency !== "COP" && /*#__PURE__*/React.createElement("span", null, fmt(fromEUR(eur, "COP", rates), "COP")), /*#__PURE__*/React.createElement("span", {
+  }, currency !== "EUR" && /*#__PURE__*/React.createElement("span", null, fmt(ceilCur(eur, "EUR"), "EUR")), currency !== "USD" && /*#__PURE__*/React.createElement("span", null, fmt(ceilCur(fromEUR(eur, "USD", rates), "USD"), "USD")), currency !== "COP" && /*#__PURE__*/React.createElement("span", null, fmt(ceilCur(fromEUR(eur, "COP", rates), "COP"), "COP")), /*#__PURE__*/React.createElement("span", {
     style: {
       fontWeight: 400,
       color: "var(--muted)"
@@ -1795,6 +1805,176 @@ function ImportExpenses({
     disabled: busy,
     onClick: runImport
   }, busy ? progress ? `Importeren… ${progress.done}/${progress.total}` : "Importeren…" : `Importeer ${rows.length} uitgaven`));
+}
+
+// ---------- Grocery list ----------
+function GroceryList({
+  hhId,
+  user
+}) {
+  const [items, setItems] = useState([]);
+  const [text, setText] = useState("");
+  const [confirmClear, setConfirmClear] = useState(false);
+  const load = useCallback(async () => {
+    const {
+      data
+    } = await db.from("groceries").select("*").eq("household_id", hhId).order("created_at");
+    if (data) setItems(data);
+  }, [hhId]);
+  useEffect(() => {
+    load();
+  }, [load]);
+  useEffect(() => {
+    const ch = db.channel("groceries-" + hhId).on("postgres_changes", {
+      event: "*",
+      schema: "public",
+      table: "groceries",
+      filter: `household_id=eq.${hhId}`
+    }, load).subscribe();
+    return () => db.removeChannel(ch);
+  }, [hhId, load]);
+  const add = async () => {
+    const name = text.trim();
+    if (!name) return;
+    setText("");
+    setItems(cur => [...cur, {
+      id: "tmp-" + Date.now(),
+      name,
+      done: false
+    }]);
+    await db.from("groceries").insert({
+      household_id: hhId,
+      name,
+      created_by: user.id
+    });
+    load();
+  };
+  const toggle = async item => {
+    setItems(cur => cur.map(i => i.id === item.id ? {
+      ...i,
+      done: !i.done
+    } : i));
+    await db.from("groceries").update({
+      done: !item.done
+    }).eq("id", item.id);
+  };
+  const remove = async id => {
+    setItems(cur => cur.filter(i => i.id !== id));
+    await db.from("groceries").delete().eq("id", id);
+  };
+  const clearAll = async () => {
+    setConfirmClear(false);
+    setItems([]);
+    await db.from("groceries").delete().eq("household_id", hhId);
+  };
+  const remaining = items.filter(i => !i.done).length;
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", {
+    style: S.pageTitle
+  }, "Grocery list", items.length > 0 && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontWeight: 400,
+      fontSize: 14,
+      color: "var(--muted)"
+    }
+  }, " · ", remaining, " to get")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    style: {
+      ...S.input,
+      flex: 1
+    },
+    placeholder: "e.g. milk, arepas, coffee…",
+    value: text,
+    maxLength: 80,
+    onChange: e => setText(e.target.value),
+    onKeyDown: e => {
+      if (e.key === "Enter") add();
+    }
+  }), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.primaryBtn,
+      width: "auto",
+      marginTop: 0,
+      padding: "0 20px"
+    },
+    onClick: add
+  }, "Add")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 14
+    }
+  }, items.length === 0 && /*#__PURE__*/React.createElement("div", {
+    style: S.empty
+  }, "The list is empty.", /*#__PURE__*/React.createElement("br", null), "Add what you need to buy above."), items.map(item => /*#__PURE__*/React.createElement("div", {
+    key: item.id,
+    style: {
+      ...S.expRow,
+      opacity: item.done ? 0.55 : 1
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => toggle(item),
+    style: {
+      width: 26,
+      height: 26,
+      borderRadius: "50%",
+      border: item.done ? "2px solid var(--green)" : "2px solid var(--line)",
+      background: item.done ? "var(--green)" : "transparent",
+      color: "#fff",
+      fontSize: 14,
+      fontWeight: 700,
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      cursor: "pointer",
+      flexShrink: 0,
+      padding: 0
+    }
+  }, item.done ? "✓" : ""), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1,
+      minWidth: 0,
+      fontSize: 15,
+      textDecoration: item.done ? "line-through" : "none",
+      color: item.done ? "var(--muted)" : "var(--ink)",
+      overflowWrap: "break-word"
+    }
+  }, item.name), /*#__PURE__*/React.createElement("button", {
+    style: S.delBtn,
+    onClick: () => remove(item.id)
+  }, "×")))), items.length > 0 && (confirmClear ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      marginTop: 16
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.primaryBtn,
+      marginTop: 0,
+      flex: 1,
+      width: "auto",
+      background: "var(--danger)"
+    },
+    onClick: clearAll
+  }, "Yes, clear everything"), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.ghostBtn,
+      marginTop: 0,
+      flex: 1,
+      width: "auto"
+    },
+    onClick: () => setConfirmClear(false)
+  }, "Cancel")) : /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.ghostBtn,
+      marginTop: 16,
+      color: "var(--danger)",
+      borderColor: "var(--danger)"
+    },
+    onClick: () => setConfirmClear(true)
+  }, "Clear whole list")));
 }
 function Bar({
   spent,
