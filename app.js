@@ -1815,10 +1815,17 @@ function GroceryList({
   const [items, setItems] = useState([]);
   const [text, setText] = useState("");
   const [confirmClear, setConfirmClear] = useState(false);
+  const [err, setErr] = useState(null);
   const load = useCallback(async () => {
     const {
-      data
+      data,
+      error
     } = await db.from("groceries").select("*").eq("household_id", hhId).order("created_at");
+    if (error) {
+      setErr(error.message);
+      return;
+    }
+    setErr(null);
     if (data) setItems(data);
   }, [hhId]);
   useEffect(() => {
@@ -1837,16 +1844,25 @@ function GroceryList({
     const name = text.trim();
     if (!name) return;
     setText("");
+    const tmpId = "tmp-" + Date.now();
     setItems(cur => [...cur, {
-      id: "tmp-" + Date.now(),
+      id: tmpId,
       name,
       done: false
     }]);
-    await db.from("groceries").insert({
+    const {
+      error
+    } = await db.from("groceries").insert({
       household_id: hhId,
       name,
       created_by: user.id
     });
+    if (error) {
+      setErr("Opslaan mislukt: " + error.message);
+      setItems(cur => cur.filter(i => i.id !== tmpId));
+      setText(name);
+      return;
+    }
     load();
   };
   const toggle = async item => {
@@ -1901,7 +1917,9 @@ function GroceryList({
       padding: "0 20px"
     },
     onClick: add
-  }, "Add")), /*#__PURE__*/React.createElement("div", {
+  }, "Add")), err && /*#__PURE__*/React.createElement("div", {
+    style: S.errBox
+  }, err, /*#__PURE__*/React.createElement("br", null), err.includes("does not exist") && "De groceries-tabel bestaat nog niet — voer supabase/groceries.sql uit in de Supabase SQL Editor."), /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 14
     }
