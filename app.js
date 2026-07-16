@@ -101,6 +101,26 @@ const todayStr = () => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 };
 const catById = id => CATEGORIES.find(c => c.id === id) || CATEGORIES[CATEGORIES.length - 1];
+// Downscale a receipt photo to a small JPEG and return raw base64 (no data: prefix).
+const resizeReceiptImage = file => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onload = () => {
+    const img = new Image();
+    img.onload = () => {
+      const maxDim = 1568;
+      const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL("image/jpeg", 0.85).split(",")[1]);
+    };
+    img.onerror = () => reject(new Error("Kon de foto niet lezen"));
+    img.src = reader.result;
+  };
+  reader.onerror = () => reject(new Error("Kon het bestand niet lezen"));
+  reader.readAsDataURL(file);
+});
 const timeAgo = iso => {
   if (!iso) return "never";
   const mins = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
@@ -1231,6 +1251,43 @@ function AddExpense({
   const [date, setDate] = useState(editingExpense ? editingExpense.spent_on : todayStr());
   const [note, setNote] = useState(editingExpense ? editingExpense.note || "" : "");
   const [err, setErr] = useState(null);
+  const [scanning, setScanning] = useState(false);
+  const [scanErr, setScanErr] = useState(null);
+  const [scanned, setScanned] = useState(false);
+  const scanInputRef = useRef(null);
+  const onScanFile = async e => {
+    const file = e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    setScanErr(null);
+    setScanned(false);
+    setScanning(true);
+    try {
+      const image = await resizeReceiptImage(file);
+      const {
+        data,
+        error
+      } = await db.functions.invoke("scan-receipt", {
+        body: {
+          image,
+          mediaType: "image/jpeg"
+        }
+      });
+      if (error) throw error;
+      if (data.error) throw new Error(data.error);
+      if (!(data.amount > 0)) throw new Error("Kon geen totaalbedrag op de bon vinden — vul het handmatig in.");
+      setAmount(String(data.amount));
+      if (CURRENCIES.includes(data.currency)) setCurrency(data.currency);
+      if (data.category && CATEGORIES.some(c => c.id === data.category)) setCategory(data.category);
+      if (data.date && /^\d{4}-\d{2}-\d{2}$/.test(data.date)) setDate(data.date);
+      if (data.merchant) setNote(String(data.merchant).slice(0, 60));
+      setScanned(true);
+    } catch (e2) {
+      setScanErr("Scan mislukt: " + (e2.message || String(e2)));
+    } finally {
+      setScanning(false);
+    }
+  };
   const pa = parseFloat(String(amount).replace(",", "."));
   const eur = pa > 0 ? toEUR(pa, currency, rates) : NaN;
   const submit = () => {
@@ -1258,7 +1315,28 @@ function AddExpense({
   };
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", {
     style: S.pageTitle
-  }, editingExpense ? "Edit expense" : "New expense"), /*#__PURE__*/React.createElement("div", {
+  }, editingExpense ? "Edit expense" : "New expense"), !editingExpense && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("input", {
+    ref: scanInputRef,
+    type: "file",
+    accept: "image/*",
+    capture: "environment",
+    style: {
+      display: "none"
+    },
+    onChange: onScanFile
+  }), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.ghostBtn,
+      marginBottom: 14,
+      opacity: scanning ? 0.6 : 1
+    },
+    disabled: scanning,
+    onClick: () => scanInputRef.current && scanInputRef.current.click()
+  }, scanning ? "📷 Bon wordt gelezen…" : "📷 Scan receipt"), scanErr && /*#__PURE__*/React.createElement("div", {
+    style: S.errBox
+  }, scanErr), scanned && /*#__PURE__*/React.createElement("div", {
+    style: S.okBox
+  }, "Bon gelezen! Kies hieronder alleen nog Shared of privé en druk op Save.")), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
   }, "Amount"), /*#__PURE__*/React.createElement("div", {
     style: {
