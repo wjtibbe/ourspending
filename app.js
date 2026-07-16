@@ -121,6 +121,7 @@ const resizeReceiptImage = file => new Promise((resolve, reject) => {
   reader.onerror = () => reject(new Error("Kon het bestand niet lezen"));
   reader.readAsDataURL(file);
 });
+const withTimeout = (promise, ms, message) => Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms))]);
 const timeAgo = iso => {
   if (!iso) return "never";
   const mins = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
@@ -1263,16 +1264,16 @@ function AddExpense({
     setScanned(false);
     setScanning(true);
     try {
-      const image = await resizeReceiptImage(file);
+      const image = await withTimeout(resizeReceiptImage(file), 15000, "Foto verwerken duurde te lang — probeer een andere/kleinere foto.");
       const {
         data,
         error
-      } = await db.functions.invoke("scan-receipt", {
+      } = await withTimeout(db.functions.invoke("scan-receipt", {
         body: {
           image,
           mediaType: "image/jpeg"
         }
-      });
+      }), 45000, "Geen reactie van de server binnen 45 seconden — probeer het nog eens.");
       if (error) throw error;
       if (data.error) throw new Error(data.error);
       if (!(data.amount > 0)) throw new Error("Kon geen totaalbedrag op de bon vinden — vul het handmatig in.");
