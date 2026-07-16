@@ -31,38 +31,63 @@ Deno.serve(async (req) => {
     return new Response(null, { headers: corsHeaders });
   }
 
+  console.log("scan-receipt: request received");
+
   try {
     const { image, mediaType } = await req.json();
-    if (!image || typeof image !== "string") return json({ error: "Missing image" }, 400);
-    if (!ANTHROPIC_API_KEY) return json({ error: "ANTHROPIC_API_KEY secret is not set" }, 500);
+    console.log("scan-receipt: parsed body, image length =", image ? image.length : 0);
 
-    const resp = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        max_tokens: 300,
-        messages: [{
-          role: "user",
-          content: [
-            { type: "image", source: { type: "base64", media_type: mediaType || "image/jpeg", data: image } },
-            { type: "text", text: PROMPT },
-          ],
-        }],
-      }),
-    });
+    if (!image || typeof image !== "string") return json({ error: "Missing image" }, 400);
+    if (!ANTHROPIC_API_KEY) {
+      console.error("scan-receipt: ANTHROPIC_API_KEY is not set");
+      return json({ error: "ANTHROPIC_API_KEY secret is not set" }, 500);
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+
+    console.log("scan-receipt: calling Anthropic...");
+    let resp: Response;
+    try {
+      resp = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: MODEL,
+          max_tokens: 300,
+          messages: [{
+            role: "user",
+            content: [
+              { type: "image", source: { type: "base64", media_type: mediaType || "image/jpeg", data: image } },
+              { type: "text", text: PROMPT },
+            ],
+          }],
+        }),
+      });
+    } catch (fetchErr) {
+      console.error("scan-receipt: fetch to Anthropic failed/timed out:", String(fetchErr));
+      return json({ error: "Kon Claude niet bereiken (timeout of netwerkfout): " + String(fetchErr) }, 504);
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    console.log("scan-receipt: Anthropic responded with status", resp.status);
 
     if (!resp.ok) {
       const errText = await resp.text();
+      console.error("scan-receipt: Anthropic error body:", errText);
       return json({ error: `Anthropic API error (${resp.status}): ${errText}` }, 502);
     }
 
     const data = await resp.json();
     const text: string = data?.content?.[0]?.text ?? "";
+    console.log("scan-receipt: Anthropic text:", text.slice(0, 300));
+
     const match = text.match(/\{[\s\S]*\}/);
     if (!match) return json({ error: "Could not parse receipt: " + text.slice(0, 200) }, 422);
 
@@ -75,6 +100,7 @@ Deno.serve(async (req) => {
       category: typeof parsed.category === "string" ? parsed.category : null,
     });
   } catch (e) {
+    console.error("scan-receipt: unexpected error:", String(e));
     return json({ error: String(e) }, 500);
   }
 });
