@@ -1,5 +1,6 @@
 // Supabase Edge Function: reads a receipt photo with Claude vision and
-// returns { amount, currency, date, merchant, category }.
+// returns { amount, currency, merchant, category }.
+// The expense date is always set client-side to today, not read from the receipt.
 // Deploy: supabase functions deploy scan-receipt
 // Secret:  supabase secrets set ANTHROPIC_API_KEY=sk-ant-...
 
@@ -18,7 +19,7 @@ const json = (body: unknown, status = 200) =>
   });
 
 const PROMPT = `This is a photo of a store receipt. Reply with ONLY a JSON object, no other text:
-{"amount": <number>, "currency": "EUR"|"USD"|"COP", "date": "YYYY-MM-DD"|null, "merchant": "store name"|null, "category": "<id>"}
+{"amount": <number>, "currency": "EUR"|"USD"|"COP", "merchant": "store name"|null, "category": "<id>"}
 
 Rules:
 - amount = the grand total actually paid, after tax, tip and discounts.
@@ -95,7 +96,6 @@ Deno.serve(async (req) => {
     return json({
       amount: typeof parsed.amount === "number" ? parsed.amount : null,
       currency: ["EUR", "USD", "COP"].includes(parsed.currency) ? parsed.currency : null,
-      date: typeof parsed.date === "string" ? parsed.date : null,
       merchant: typeof parsed.merchant === "string" ? parsed.merchant : null,
       category: typeof parsed.category === "string" ? parsed.category : null,
     });

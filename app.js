@@ -1291,7 +1291,7 @@ function AddExpense({
       setAmount(String(data.amount));
       if (CURRENCIES.includes(data.currency)) setCurrency(data.currency);
       if (data.category && CATEGORIES.some(c => c.id === data.category)) setCategory(data.category);
-      if (data.date && /^\d{4}-\d{2}-\d{2}$/.test(data.date)) setDate(data.date);
+      setDate(todayStr());
       if (data.merchant) setNote(String(data.merchant).slice(0, 60));
       setScanned(true);
     } catch (e2) {
