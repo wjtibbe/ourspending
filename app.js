@@ -935,6 +935,7 @@ function Overview({
   const [fKind, setFKind] = useState(null);
   const [fWho, setFWho] = useState(null);
   const [fCat, setFCat] = useState(null);
+  const [search, setSearch] = useState("");
   const [confirmId, setConfirmId] = useState(null);
   const shift = d => {
     let m = month.m + d,
@@ -967,13 +968,23 @@ function Overview({
     if (fWho != null) visible = visible.filter(e => e.kind === (fWho === 0 ? "p0" : "p1"));
   }
   if (fCat) visible = visible.filter(e => e.category === fCat);
+  const q = search.trim().toLowerCase();
+  if (q) visible = visible.filter(e => (e.note || "").toLowerCase().includes(q) || catById(e.category).label.toLowerCase().includes(q));
   const groups = {};
   visible.forEach(e => {
     (groups[e.spent_on] = groups[e.spent_on] || []).push(e);
   });
   const dates = Object.keys(groups).sort().reverse();
   const usedCats = [...new Set(monthExpenses.map(e => e.category))];
-  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("input", {
+    style: {
+      ...S.input,
+      marginBottom: 10
+    },
+    placeholder: "🔍 Search notes or category…",
+    value: search,
+    onChange: e => setSearch(e.target.value)
+  }), /*#__PURE__*/React.createElement("div", {
     style: S.chipRow
   }, /*#__PURE__*/React.createElement("button", {
     style: {
@@ -1139,7 +1150,7 @@ function Overview({
     onClick: () => setFCat(fCat === c ? null : c)
   }, catById(c).icon, " ", catById(c).label))), dates.length === 0 && /*#__PURE__*/React.createElement("div", {
     style: S.empty
-  }, rangeMode ? "No expenses in this period yet." : `No expenses in ${MONTH_NAMES[month.m]} yet.`, /*#__PURE__*/React.createElement("br", null), "Add the first one via ", /*#__PURE__*/React.createElement("b", null, "＋ Add"), "."), dates.map(date => {
+  }, q ? `No expenses match "${search.trim()}".` : rangeMode ? "No expenses in this period yet." : `No expenses in ${MONTH_NAMES[month.m]} yet.`, /*#__PURE__*/React.createElement("br", null), !q && /*#__PURE__*/React.createElement(React.Fragment, null, "Add the first one via ", /*#__PURE__*/React.createElement("b", null, "＋ Add"), ".")), dates.map(date => {
     const [y, m, d] = date.split("-").map(Number);
     return /*#__PURE__*/React.createElement("div", {
       key: date,
