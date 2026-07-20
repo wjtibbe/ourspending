@@ -14,6 +14,12 @@ const SUPABASE_URL = "https://cleeaaqyhmevacsfjawi.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNsZWVhYXF5aG1ldmFjc2ZqYXdpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM1OTk4MjYsImV4cCI6MjA5OTE3NTgyNn0.iOVxSvzVrby5WJmlcnEne__l5mxpbC45MU2GtNJrYtc";
 const db = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
+// ---- i18n helpers (dictionaries live in i18n.js) ----
+const t = (k, v) => window.I18N.t(k, v);
+const monthName = m => window.I18N.months()[m];
+const numLocale = () => window.I18N.lang === "es" ? "es-CO" : "en-US";
+const catLabel = c => t("cat_" + (c && c.id ? c.id : c));
+
 // ============================================================
 //  CONSTANTS
 // ============================================================
@@ -80,7 +86,6 @@ const SYMBOL = {
   USD: "$",
   COP: "COP"
 };
-const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 const perEur = (cur, r) => cur === "EUR" ? 1 : cur === "USD" ? r.usdPerEur : r.copPerEur;
 const toEUR = (a, cur, r) => a / perEur(cur, r);
 const fromEUR = (a, cur, r) => a * perEur(cur, r);
@@ -88,10 +93,10 @@ const fromEUR = (a, cur, r) => a * perEur(cur, r);
 const ceilCur = (v, cur) => cur === "COP" ? Math.ceil(v) : Math.ceil(v * 100) / 100;
 const fmt = (n, cur) => {
   const v = n || 0;
-  if (cur === "COP") return "COP " + v.toLocaleString("en-US", {
+  if (cur === "COP") return "COP " + v.toLocaleString(numLocale(), {
     maximumFractionDigits: 0
   });
-  return SYMBOL[cur] + " " + v.toLocaleString("en-US", {
+  return SYMBOL[cur] + " " + v.toLocaleString(numLocale(), {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2
   });
@@ -115,21 +120,27 @@ const resizeReceiptImage = file => new Promise((resolve, reject) => {
       canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
       resolve(canvas.toDataURL("image/jpeg", 0.85).split(",")[1]);
     };
-    img.onerror = () => reject(new Error("Kon de foto niet lezen"));
+    img.onerror = () => reject(new Error(t("photo_read_error")));
     img.src = reader.result;
   };
-  reader.onerror = () => reject(new Error("Kon het bestand niet lezen"));
+  reader.onerror = () => reject(new Error(t("file_read_error")));
   reader.readAsDataURL(file);
 });
 const withTimeout = (promise, ms, message) => Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms))]);
 const timeAgo = iso => {
-  if (!iso) return "never";
+  if (!iso) return t("never");
   const mins = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins} min ago`;
+  if (mins < 1) return t("just_now");
+  if (mins < 60) return t("min_ago", {
+    n: mins
+  });
   const h = Math.floor(mins / 60);
-  if (h < 24) return `${h}h ago`;
-  return `${Math.floor(h / 24)}d ago`;
+  if (h < 24) return t("h_ago", {
+    n: h
+  });
+  return t("d_ago", {
+    n: Math.floor(h / 24)
+  });
 };
 const ratesAreStale = r => !r.updatedAt || Date.now() - new Date(r.updatedAt).getTime() > 6 * 3600 * 1000;
 
@@ -180,7 +191,7 @@ function App() {
       textAlign: "center",
       color: "var(--muted)"
     }
-  }, "Loading…");
+  }, t("loading"));
   if (!session) return /*#__PURE__*/React.createElement(Auth, null);
   return /*#__PURE__*/React.createElement(Home, {
     session: session
@@ -204,7 +215,7 @@ function Auth() {
     setBusy(true);
     try {
       if (mode === "signup") {
-        if (!name.trim()) throw new Error("Enter your name.");
+        if (!name.trim()) throw new Error(t("enter_your_name"));
         const {
           data,
           error
@@ -216,7 +227,7 @@ function Auth() {
         // store intended name for profile bootstrap
         localStorage.setItem("pending_name", name.trim());
         if (!data.session) {
-          setMsg("Account created. Check your email to confirm, then sign in.");
+          setMsg(t("account_created"));
           setMode("signin");
         }
       } else {
@@ -229,7 +240,7 @@ function Auth() {
         if (error) throw error;
       }
     } catch (e) {
-      setErr(e.message || "Something went wrong.");
+      setErr(e.message || t("something_wrong"));
     } finally {
       setBusy(false);
     }
@@ -256,7 +267,7 @@ function Auth() {
       fontSize: 14,
       marginTop: 0
     }
-  }, "Shared expenses for two — EUR · USD · COP"), /*#__PURE__*/React.createElement("div", {
+  }, t("tagline")), /*#__PURE__*/React.createElement("div", {
     style: S.segWide
   }, /*#__PURE__*/React.createElement("button", {
     style: {
@@ -264,22 +275,22 @@ function Auth() {
       ...(mode === "signin" ? S.segOn : {})
     },
     onClick: () => setMode("signin")
-  }, "Sign in"), /*#__PURE__*/React.createElement("button", {
+  }, t("sign_in")), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.segBtn,
       ...(mode === "signup" ? S.segOn : {})
     },
     onClick: () => setMode("signup")
-  }, "Sign up")), mode === "signup" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+  }, t("sign_up"))), mode === "signup" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, "Your name"), /*#__PURE__*/React.createElement("input", {
+  }, t("your_name")), /*#__PURE__*/React.createElement("input", {
     style: S.input,
     value: name,
     onChange: e => setName(e.target.value),
-    placeholder: "Willem-Jan or Steffania"
+    placeholder: t("name_ph")
   })), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, "Email"), /*#__PURE__*/React.createElement("input", {
+  }, t("email")), /*#__PURE__*/React.createElement("input", {
     style: S.input,
     type: "email",
     value: email,
@@ -287,7 +298,7 @@ function Auth() {
     placeholder: "you@email.com"
   }), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, "Password"), /*#__PURE__*/React.createElement("input", {
+  }, t("password")), /*#__PURE__*/React.createElement("input", {
     style: S.input,
     type: "password",
     value: pw,
@@ -304,7 +315,7 @@ function Auth() {
     },
     disabled: busy,
     onClick: submit
-  }, busy ? "Please wait…" : mode === "signin" ? "Sign in" : "Create account")), /*#__PURE__*/React.createElement("img", {
+  }, busy ? t("please_wait") : mode === "signin" ? t("sign_in") : t("create_account"))), /*#__PURE__*/React.createElement("img", {
     className: "auth-photo",
     src: "assets/couple-mountain.png",
     alt: ""
@@ -357,7 +368,7 @@ function Home({
       textAlign: "center",
       color: "var(--muted)"
     }
-  }, "Loading your profile…");
+  }, t("loading_profile"));
   if (err) return /*#__PURE__*/React.createElement("div", {
     style: {
       padding: 40,
@@ -365,7 +376,7 @@ function Home({
     }
   }, "Error: ", err, " ", /*#__PURE__*/React.createElement("button", {
     onClick: loadProfile
-  }, "Retry"));
+  }, t("retry")));
   if (!profile.household_id) return /*#__PURE__*/React.createElement(Onboard, {
     user: user,
     profile: profile,
@@ -426,7 +437,7 @@ function Onboard({
         error
       } = await db.from("households").select("id").eq("invite_code", code.trim().toLowerCase()).maybeSingle();
       if (error) throw error;
-      if (!hh) throw new Error("No household found with that code.");
+      if (!hh) throw new Error(t("no_household_code"));
       const {
         error: e2
       } = await db.from("profiles").update({
@@ -449,13 +460,13 @@ function Onboard({
     style: S.brandBig
   }, /*#__PURE__*/React.createElement("span", {
     style: S.brandMark
-  }), " Set up"), /*#__PURE__*/React.createElement("p", {
+  }), " " + t("set_up")), /*#__PURE__*/React.createElement("p", {
     style: {
       color: "var(--muted)",
       fontSize: 14,
       marginTop: 0
     }
-  }, "One of you creates the household, the other joins with the invite code."), /*#__PURE__*/React.createElement("div", {
+  }, t("onboard_hint")), /*#__PURE__*/React.createElement("div", {
     style: S.segWide
   }, /*#__PURE__*/React.createElement("button", {
     style: {
@@ -463,15 +474,15 @@ function Onboard({
       ...(tab === "create" ? S.segOn : {})
     },
     onClick: () => setTab("create")
-  }, "Create"), /*#__PURE__*/React.createElement("button", {
+  }, t("create")), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.segBtn,
       ...(tab === "join" ? S.segOn : {})
     },
     onClick: () => setTab("join")
-  }, "Join")), /*#__PURE__*/React.createElement("div", {
+  }, t("join"))), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, "You are"), /*#__PURE__*/React.createElement("div", {
+  }, t("you_are")), /*#__PURE__*/React.createElement("div", {
     style: S.segWide
   }, /*#__PURE__*/React.createElement("button", {
     style: {
@@ -487,7 +498,7 @@ function Onboard({
     onClick: () => setSlot(1)
   }, "Steffania")), tab === "create" ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, "Household name"), /*#__PURE__*/React.createElement("input", {
+  }, t("household_name")), /*#__PURE__*/React.createElement("input", {
     style: S.input,
     value: hhName,
     onChange: e => setHhName(e.target.value)
@@ -500,13 +511,13 @@ function Onboard({
     },
     disabled: busy,
     onClick: create
-  }, busy ? "Creating…" : "Create household")) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+  }, busy ? t("creating") : t("create_household"))) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, "Invite code"), /*#__PURE__*/React.createElement("input", {
+  }, t("invite_code")), /*#__PURE__*/React.createElement("input", {
     style: S.input,
     value: code,
     onChange: e => setCode(e.target.value),
-    placeholder: "e.g. a1b2c3d4"
+    placeholder: t("code_ph")
   }), err && /*#__PURE__*/React.createElement("div", {
     style: S.errBox
   }, err), /*#__PURE__*/React.createElement("button", {
@@ -516,7 +527,7 @@ function Onboard({
     },
     disabled: busy,
     onClick: join
-  }, busy ? "Joining…" : "Join household"))));
+  }, busy ? t("joining") : t("join_household")))));
 }
 
 // ============================================================
@@ -546,6 +557,11 @@ function Dashboard({
     to: todayStr()
   }));
   const [editingExpense, setEditingExpense] = useState(null);
+  const [lang, setLangState] = useState(window.I18N.lang);
+  const changeLang = l => {
+    window.I18N.set(l);
+    setLangState(l);
+  };
   const [toast, setToast] = useState(null);
   const [ratesLoading, setRatesLoading] = useState(false);
   const hhId = profile.household_id;
@@ -633,9 +649,9 @@ function Dashboard({
         cop_per_eur: r.copPerEur,
         rates_updated_at: r.updatedAt
       }).eq("id", hhId);
-      if (!silent) showToast(`Rates updated: $${r.usdPerEur.toFixed(2)} · COP ${Math.round(r.copPerEur).toLocaleString("en-US")}`);
+      if (!silent) showToast(`${t("rates_updated")}: $${r.usdPerEur.toFixed(2)} · COP ${Math.round(r.copPerEur).toLocaleString(numLocale())}`);
     } catch (e) {
-      if (!silent) showToast("Couldn't fetch live rates — using last known");
+      if (!silent) showToast(t("rates_fetch_failed"));
     } finally {
       setRatesLoading(false);
     }
@@ -657,10 +673,10 @@ function Dashboard({
       created_by: user.id
     });
     if (error) {
-      showToast("Save failed: " + error.message);
+      showToast(t("save_failed") + error.message);
       return;
     }
-    showToast("Expense saved");
+    showToast(t("expense_saved"));
     setTab("overview");
     loadAll();
   };
@@ -679,10 +695,10 @@ function Dashboard({
       spent_on: exp.date
     }).eq("id", id);
     if (error) {
-      showToast("Save failed: " + error.message);
+      showToast(t("save_failed") + error.message);
       return;
     }
-    showToast("Expense updated");
+    showToast(t("expense_updated"));
     setEditingExpense(null);
     setTab("overview");
     loadAll();
@@ -709,10 +725,15 @@ function Dashboard({
       const {
         error
       } = await db.from("expenses").insert(batch);
-      if (error) throw new Error(`Rij ${i + 1}-${i + batch.length}: ${error.message}`);
+      if (error) throw new Error(t("rows_failed", {
+        from: i + 1,
+        to: i + batch.length
+      }) + ": " + error.message);
       if (onProgress) onProgress(Math.min(i + batchSize, parsedRows.length), parsedRows.length);
     }
-    showToast(`${parsedRows.length} uitgaven geïmporteerd`);
+    showToast(t("expenses_imported", {
+      n: parsedRows.length
+    }));
     loadAll();
   };
   const deleteExpense = async id => {
@@ -727,14 +748,14 @@ function Dashboard({
       monthly_eur
     }));
     if (rows.length) await db.from("budgets").insert(rows);
-    showToast("Budgets saved");
+    showToast(t("budgets_saved"));
     loadAll();
   };
   const saveMyName = async nm => {
     await db.from("profiles").update({
       display_name: nm
     }).eq("id", user.id);
-    showToast("Name saved");
+    showToast(t("name_saved"));
     loadAll();
   };
   const saveRates = async r => {
@@ -743,14 +764,14 @@ function Dashboard({
       cop_per_eur: r.copPerEur,
       rates_updated_at: new Date().toISOString()
     }).eq("id", hhId);
-    showToast("Rates saved");
+    showToast(t("rates_saved"));
     loadAll();
   };
   const saveSource = async src => {
     await db.from("households").update({
       rate_source: src
     }).eq("id", hhId);
-    showToast("Rate source saved");
+    showToast(t("source_saved"));
     loadAll();
   };
   if (!household) return /*#__PURE__*/React.createElement("div", {
@@ -759,7 +780,7 @@ function Dashboard({
       textAlign: "center",
       color: "var(--muted)"
     }
-  }, "Loading household…");
+  }, t("loading_household"));
   return /*#__PURE__*/React.createElement("div", {
     style: S.appRoot
   }, /*#__PURE__*/React.createElement("header", {
@@ -790,26 +811,28 @@ function Dashboard({
   }, c === "COP" ? "COP" : SYMBOL[c]))), /*#__PURE__*/React.createElement("button", {
     style: S.iconBtn,
     onClick: loadAll,
-    title: "Refresh"
+    title: t("refresh")
   }, "⟳"), /*#__PURE__*/React.createElement("button", {
     style: S.iconBtn,
     onClick: () => db.auth.signOut(),
-    title: "Sign out"
+    title: t("sign_out")
   }, "⎋"))), /*#__PURE__*/React.createElement("div", {
     style: S.ratesLine
-  }, /*#__PURE__*/React.createElement("span", null, "1€ = $", rates.usdPerEur.toFixed(2), " · COP ", Math.round(rates.copPerEur).toLocaleString("en-US"), /*#__PURE__*/React.createElement("span", {
+  }, /*#__PURE__*/React.createElement("span", null, "1€ = $", rates.usdPerEur.toFixed(2), " · COP ", Math.round(rates.copPerEur).toLocaleString(numLocale()), /*#__PURE__*/React.createElement("span", {
     style: {
       opacity: 0.8
     }
-  }, " · ", ratesLoading ? "updating…" : timeAgo(rates.updatedAt))), /*#__PURE__*/React.createElement("button", {
+  }, " · ", ratesLoading ? t("updating") : timeAgo(rates.updatedAt))), /*#__PURE__*/React.createElement("button", {
     style: S.linkBtn,
     onClick: () => updateRates(false),
     disabled: ratesLoading
-  }, ratesLoading ? "…" : "Update rates")), /*#__PURE__*/React.createElement("main", {
+  }, ratesLoading ? "…" : t("update_rates"))), /*#__PURE__*/React.createElement("main", {
     style: {
       padding: "4px 16px 16px"
     }
   }, tab === "overview" && /*#__PURE__*/React.createElement(Overview, {
+    lang: lang,
+    onSetLang: changeLang,
     people: people,
     month: month,
     setMonth: setMonth,
@@ -869,7 +892,7 @@ function Dashboard({
       setTab("overview");
     },
     icon: "📒",
-    label: "Overview"
+    label: t("tab_overview")
   }), /*#__PURE__*/React.createElement(TabBtn, {
     active: tab === "add",
     onClick: () => {
@@ -877,18 +900,18 @@ function Dashboard({
       setTab("add");
     },
     icon: "＋",
-    label: "Add",
+    label: t("tab_add"),
     big: true
   }), /*#__PURE__*/React.createElement(TabBtn, {
     active: tab === "groceries",
     onClick: () => setTab("groceries"),
     icon: "🛒",
-    label: "List"
+    label: t("tab_list")
   }), /*#__PURE__*/React.createElement(TabBtn, {
     active: tab === "budgets",
     onClick: () => setTab("budgets"),
     icon: "🎯",
-    label: "Budgets"
+    label: t("tab_budgets")
   })));
 }
 function TabBtn({
@@ -913,12 +936,18 @@ function TabBtn({
   }, label));
 }
 const kindDot = e => e.kind === "shared" ? "var(--green)" : e.kind === "p0" ? "var(--blue)" : "var(--ochre)";
-const kindText = (e, people) => e.kind === "shared" ? `Shared · paid by ${people[e.payer]}` : e.kind === "p0" ? `${people[0]} · private` : `${people[1]} · private`;
+const kindText = (e, people) => e.kind === "shared" ? t("kind_shared_paid", {
+  name: people[e.payer]
+}) : t("kind_private", {
+  name: e.kind === "p0" ? people[0] : people[1]
+});
 const initialsOf = name => (name || "").trim().split(/[\s-]+/).filter(Boolean).map(w => w[0]).join("").slice(0, 2).toUpperCase();
 const kindInitials = (e, people) => initialsOf(e.kind === "shared" ? people[e.payer] : e.kind === "p0" ? people[0] : people[1]);
 
 // ---------- Overview ----------
 function Overview({
+  lang,
+  onSetLang,
   people,
   month,
   setMonth,
@@ -969,19 +998,33 @@ function Overview({
   }
   if (fCat) visible = visible.filter(e => e.category === fCat);
   const q = search.trim().toLowerCase();
-  if (q) visible = visible.filter(e => (e.note || "").toLowerCase().includes(q) || catById(e.category).label.toLowerCase().includes(q));
+  if (q) visible = visible.filter(e => (e.note || "").toLowerCase().includes(q) || catLabel(e.category).toLowerCase().includes(q));
   const groups = {};
   visible.forEach(e => {
     (groups[e.spent_on] = groups[e.spent_on] || []).push(e);
   });
   const dates = Object.keys(groups).sort().reverse();
   const usedCats = [...new Set(monthExpenses.map(e => e.category))];
-  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("input", {
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "flex-end",
+      gap: 6,
+      marginBottom: 8
+    }
+  }, window.I18N.languages.map(l => /*#__PURE__*/React.createElement("button", {
+    key: l,
+    style: {
+      ...S.chip,
+      ...(lang === l ? S.chipOn : {})
+    },
+    onClick: () => onSetLang(l)
+  }, l.toUpperCase()))), /*#__PURE__*/React.createElement("input", {
     style: {
       ...S.input,
       marginBottom: 10
     },
-    placeholder: "🔍 Search notes or category…",
+    placeholder: t("search_ph"),
     value: search,
     onChange: e => setSearch(e.target.value)
   }), /*#__PURE__*/React.createElement("div", {
@@ -992,13 +1035,13 @@ function Overview({
       ...(!rangeMode ? S.chipOn : {})
     },
     onClick: () => setRangeMode(false)
-  }, "Month"), /*#__PURE__*/React.createElement("button", {
+  }, t("month")), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.chip,
       ...(rangeMode ? S.chipOn : {})
     },
     onClick: () => setRangeMode(true)
-  }, "Custom period")), rangeMode ? /*#__PURE__*/React.createElement("div", {
+  }, t("custom_period"))), rangeMode ? /*#__PURE__*/React.createElement("div", {
     style: {
       ...S.monthNav,
       gap: 8
@@ -1020,7 +1063,7 @@ function Overview({
       color: "var(--muted)",
       fontSize: 13
     }
-  }, "to"), /*#__PURE__*/React.createElement("input", {
+  }, t("to")), /*#__PURE__*/React.createElement("input", {
     type: "date",
     style: {
       ...S.input,
@@ -1042,14 +1085,14 @@ function Overview({
       fontWeight: 600,
       fontSize: 16
     }
-  }, MONTH_NAMES[month.m], " ", month.y), /*#__PURE__*/React.createElement("button", {
+  }, monthName(month.m), " ", month.y), /*#__PURE__*/React.createElement("button", {
     style: S.iconBtn,
     onClick: () => shift(1)
   }, "›")), /*#__PURE__*/React.createElement("div", {
     style: S.hero
   }, /*#__PURE__*/React.createElement("div", {
     style: S.heroLabel
-  }, rangeMode ? "Total for period · " : "Total this month · ", displayCur), /*#__PURE__*/React.createElement("div", {
+  }, rangeMode ? t("total_for_period") : t("total_this_month"), displayCur), /*#__PURE__*/React.createElement("div", {
     style: S.heroAmount
   }, disp(total)), /*#__PURE__*/React.createElement("div", {
     style: S.splitBar
@@ -1078,7 +1121,7 @@ function Overview({
       ...S.dot,
       background: "var(--green)"
     }
-  }), "Shared ", disp(sharedTotal)), /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("i", {
+  }), t("shared") + " ", disp(sharedTotal)), /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("i", {
     style: {
       ...S.dot,
       background: "var(--blue)"
@@ -1090,7 +1133,7 @@ function Overview({
     }
   }), people[1], " ", disp(priv[1]))), sharedTotal > 0 && /*#__PURE__*/React.createElement("div", {
     style: S.sharedPaid
-  }, "Shared paid by: ", people[0], " ", disp(sharedPaid[0]), " · ", people[1], " ", disp(sharedPaid[1]))), /*#__PURE__*/React.createElement("div", {
+  }, t("shared_paid_by"), people[0], " ", disp(sharedPaid[0]), " · ", people[1], " ", disp(sharedPaid[1]))), /*#__PURE__*/React.createElement("div", {
     style: S.chipRow
   }, /*#__PURE__*/React.createElement("button", {
     style: {
@@ -1101,7 +1144,7 @@ function Overview({
       setFKind(null);
       setFWho(null);
     }
-  }, "All"), /*#__PURE__*/React.createElement("button", {
+  }, t("all")), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.chip,
       ...(fKind === "shared" ? S.chipOn : {})
@@ -1110,7 +1153,7 @@ function Overview({
       setFKind(fKind === "shared" ? null : "shared");
       setFWho(null);
     }
-  }, "Shared"), /*#__PURE__*/React.createElement("button", {
+  }, t("shared")), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.chip,
       ...(fKind === "private" ? S.chipOn : {})
@@ -1119,7 +1162,7 @@ function Overview({
       setFKind(fKind === "private" ? null : "private");
       setFWho(null);
     }
-  }, "Private")), (fKind === "shared" || fKind === "private") && /*#__PURE__*/React.createElement("div", {
+  }, t("private"))), (fKind === "shared" || fKind === "private") && /*#__PURE__*/React.createElement("div", {
     style: S.chipRow
   }, fKind === "shared" && /*#__PURE__*/React.createElement("button", {
     style: {
@@ -1127,19 +1170,23 @@ function Overview({
       ...(fWho == null ? S.chipOn : {})
     },
     onClick: () => setFWho(null)
-  }, "Any payer"), /*#__PURE__*/React.createElement("button", {
+  }, t("any_payer")), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.chip,
       ...(fWho === 0 ? S.chipOn : {})
     },
     onClick: () => setFWho(fWho === 0 ? null : 0)
-  }, fKind === "shared" ? `Paid by ${people[0]}` : people[0]), /*#__PURE__*/React.createElement("button", {
+  }, fKind === "shared" ? t("paid_by_name", {
+    name: people[0]
+  }) : people[0]), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.chip,
       ...(fWho === 1 ? S.chipOn : {})
     },
     onClick: () => setFWho(fWho === 1 ? null : 1)
-  }, fKind === "shared" ? `Paid by ${people[1]}` : people[1])), usedCats.length > 0 && /*#__PURE__*/React.createElement("div", {
+  }, fKind === "shared" ? t("paid_by_name", {
+    name: people[1]
+  }) : people[1])), usedCats.length > 0 && /*#__PURE__*/React.createElement("div", {
     style: S.chipRow
   }, usedCats.map(c => /*#__PURE__*/React.createElement("button", {
     key: c,
@@ -1148,9 +1195,13 @@ function Overview({
       ...(fCat === c ? S.chipOn : {})
     },
     onClick: () => setFCat(fCat === c ? null : c)
-  }, catById(c).icon, " ", catById(c).label))), dates.length === 0 && /*#__PURE__*/React.createElement("div", {
+  }, catById(c).icon, " ", catLabel(c)))), dates.length === 0 && /*#__PURE__*/React.createElement("div", {
     style: S.empty
-  }, q ? `No expenses match "${search.trim()}".` : rangeMode ? "No expenses in this period yet." : `No expenses in ${MONTH_NAMES[month.m]} yet.`, /*#__PURE__*/React.createElement("br", null), !q && /*#__PURE__*/React.createElement(React.Fragment, null, "Add the first one via ", /*#__PURE__*/React.createElement("b", null, "＋ Add"), ".")), dates.map(date => {
+  }, q ? t("no_match", {
+    q: search.trim()
+  }) : rangeMode ? t("no_expenses_period") : t("no_expenses_month", {
+    month: monthName(month.m)
+  }), /*#__PURE__*/React.createElement("br", null), !q && /*#__PURE__*/React.createElement(React.Fragment, null, t("add_first_via"), /*#__PURE__*/React.createElement("b", null, "＋ " + t("tab_add")), ".")), dates.map(date => {
     const [y, m, d] = date.split("-").map(Number);
     return /*#__PURE__*/React.createElement("div", {
       key: date,
@@ -1159,7 +1210,7 @@ function Overview({
       }
     }, /*#__PURE__*/React.createElement("div", {
       style: S.dayLabel
-    }, MONTH_NAMES[m - 1], " ", d), groups[date].map(e => /*#__PURE__*/React.createElement("div", {
+    }, monthName(m - 1), " ", d), groups[date].map(e => /*#__PURE__*/React.createElement("div", {
       key: e.id,
       style: S.expRow
     }, /*#__PURE__*/React.createElement("div", {
@@ -1173,7 +1224,7 @@ function Overview({
       }
     }, /*#__PURE__*/React.createElement("div", {
       style: S.expTitle
-    }, catById(e.category).label, e.note ? ` — ${e.note}` : ""), /*#__PURE__*/React.createElement("div", {
+    }, catLabel(e.category), e.note ? ` — ${e.note}` : ""), /*#__PURE__*/React.createElement("div", {
       style: {
         display: "flex",
         alignItems: "center",
@@ -1223,10 +1274,10 @@ function Overview({
         onDelete(e.id);
         setConfirmId(null);
       }
-    }, "Delete"), /*#__PURE__*/React.createElement("button", {
+    }, t("delete")), /*#__PURE__*/React.createElement("button", {
       style: S.miniBtn,
       onClick: () => setConfirmId(null)
-    }, "No")) : /*#__PURE__*/React.createElement("div", {
+    }, t("no"))) : /*#__PURE__*/React.createElement("div", {
       style: {
         display: "flex",
         gap: 4,
@@ -1236,7 +1287,7 @@ function Overview({
     }, /*#__PURE__*/React.createElement("button", {
       style: S.miniBtn,
       onClick: () => onEdit(e)
-    }, "Edit"), /*#__PURE__*/React.createElement("button", {
+    }, t("edit")), /*#__PURE__*/React.createElement("button", {
       style: S.delBtn,
       onClick: () => setConfirmId(e.id)
     }, "×"))))));
@@ -1275,7 +1326,7 @@ function AddExpense({
     setScanned(false);
     setScanning(true);
     try {
-      const image = await withTimeout(resizeReceiptImage(file), 15000, "Foto verwerken duurde te lang — probeer een andere/kleinere foto.");
+      const image = await withTimeout(resizeReceiptImage(file), 15000, t("scan_photo_slow"));
       const {
         data,
         error
@@ -1284,10 +1335,10 @@ function AddExpense({
           image,
           mediaType: "image/jpeg"
         }
-      }), 45000, "Geen reactie van de server binnen 45 seconden — probeer het nog eens.");
+      }), 45000, t("scan_server_slow"));
       if (error) throw error;
       if (data.error) throw new Error(data.error);
-      if (!(data.amount > 0)) throw new Error("Kon geen totaalbedrag op de bon vinden — vul het handmatig in.");
+      if (!(data.amount > 0)) throw new Error(t("scan_no_total"));
       setAmount(String(data.amount));
       if (CURRENCIES.includes(data.currency)) setCurrency(data.currency);
       if (data.category && CATEGORIES.some(c => c.id === data.category)) setCategory(data.category);
@@ -1295,7 +1346,7 @@ function AddExpense({
       if (data.merchant) setNote(String(data.merchant).slice(0, 60));
       setScanned(true);
     } catch (e2) {
-      setScanErr("Scan mislukt: " + (e2.message || String(e2)));
+      setScanErr(t("scan_failed") + (e2.message || String(e2)));
     } finally {
       setScanning(false);
     }
@@ -1303,7 +1354,7 @@ function AddExpense({
   const pa = parseFloat(String(amount).replace(",", "."));
   const eur = pa > 0 ? toEUR(pa, currency, rates) : NaN;
   const submit = () => {
-    if (!pa || pa <= 0) return setErr("Enter a valid amount.");
+    if (!pa || pa <= 0) return setErr(t("enter_valid_amount"));
     setErr(null);
     const finalPayer = kind === "shared" ? payer : kind === "p0" ? 0 : 1;
     const exp = {
@@ -1327,7 +1378,7 @@ function AddExpense({
   };
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", {
     style: S.pageTitle
-  }, editingExpense ? "Edit expense" : "New expense"), !editingExpense && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("input", {
+  }, editingExpense ? t("edit_expense") : t("new_expense")), !editingExpense && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("input", {
     ref: scanInputRef,
     type: "file",
     accept: "image/*",
@@ -1344,13 +1395,13 @@ function AddExpense({
     },
     disabled: scanning,
     onClick: () => scanInputRef.current && scanInputRef.current.click()
-  }, scanning ? "📷 Bon wordt gelezen…" : "📷 Scan receipt"), scanErr && /*#__PURE__*/React.createElement("div", {
+  }, scanning ? t("scanning") : t("scan_receipt")), scanErr && /*#__PURE__*/React.createElement("div", {
     style: S.errBox
   }, scanErr), scanned && /*#__PURE__*/React.createElement("div", {
     style: S.okBox
-  }, "Bon gelezen! Kies hieronder alleen nog Shared of privé en druk op Save.")), /*#__PURE__*/React.createElement("div", {
+  }, t("scan_done"))), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, "Amount"), /*#__PURE__*/React.createElement("div", {
+  }, t("amount")), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 8
@@ -1377,9 +1428,9 @@ function AddExpense({
       fontWeight: 400,
       color: "var(--muted)"
     }
-  }, "rate ", ratesLoading ? "updating…" : timeAgo(rates.updatedAt))), /*#__PURE__*/React.createElement("div", {
+  }, t("rate_word"), ratesLoading ? t("updating") : timeAgo(rates.updatedAt))), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, "Type"), /*#__PURE__*/React.createElement("div", {
+  }, t("type")), /*#__PURE__*/React.createElement("div", {
     style: S.segWide
   }, /*#__PURE__*/React.createElement("button", {
     style: {
@@ -1387,7 +1438,7 @@ function AddExpense({
       ...(kind === "shared" ? S.segOn : {})
     },
     onClick: () => setKind("shared")
-  }, "Shared"), /*#__PURE__*/React.createElement("button", {
+  }, t("shared")), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.segBtn,
       ...(kind === "p0" ? S.segOnA : {})
@@ -1401,9 +1452,11 @@ function AddExpense({
     onClick: () => setKind("p1")
   }, people[1])), /*#__PURE__*/React.createElement("div", {
     style: S.typeHint
-  }, kind === "shared" ? "A joint expense — select who paid below." : `Personal expense of ${kind === "p0" ? people[0] : people[1]}.`), kind === "shared" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+  }, kind === "shared" ? t("type_hint_shared") : t("type_hint_private", {
+    name: kind === "p0" ? people[0] : people[1]
+  })), kind === "shared" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, "Paid by"), /*#__PURE__*/React.createElement("div", {
+  }, t("paid_by")), /*#__PURE__*/React.createElement("div", {
     style: S.segWide
   }, people.map((p, i) => /*#__PURE__*/React.createElement("button", {
     key: i,
@@ -1414,7 +1467,7 @@ function AddExpense({
     onClick: () => setPayer(i)
   }, p)))), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, "Category"), /*#__PURE__*/React.createElement("div", {
+  }, t("category")), /*#__PURE__*/React.createElement("div", {
     style: S.catGrid
   }, CATEGORIES.map(c => /*#__PURE__*/React.createElement("button", {
     key: c.id,
@@ -1427,18 +1480,18 @@ function AddExpense({
     style: {
       fontSize: 18
     }
-  }, c.icon), /*#__PURE__*/React.createElement("span", null, c.label)))), /*#__PURE__*/React.createElement("div", {
+  }, c.icon), /*#__PURE__*/React.createElement("span", null, catLabel(c))))), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, "Date"), /*#__PURE__*/React.createElement("input", {
+  }, t("date")), /*#__PURE__*/React.createElement("input", {
     type: "date",
     style: S.input,
     value: date,
     onChange: e => setDate(e.target.value)
   }), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, "Note (optional)"), /*#__PURE__*/React.createElement("input", {
+  }, t("note_optional")), /*#__PURE__*/React.createElement("input", {
     style: S.input,
-    placeholder: "e.g. market, fuel, gift…",
+    placeholder: t("note_ph"),
     value: note,
     maxLength: 60,
     onChange: e => setNote(e.target.value)
@@ -1451,13 +1504,13 @@ function AddExpense({
     },
     disabled: saving,
     onClick: submit
-  }, saving ? "Saving…" : editingExpense ? "Save changes" : "Save expense"), editingExpense && /*#__PURE__*/React.createElement("button", {
+  }, saving ? t("saving") : editingExpense ? t("save_changes") : t("save_expense")), editingExpense && /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.ghostBtn,
       marginTop: 8
     },
     onClick: onCancelEdit
-  }, "Cancel"));
+  }, t("cancel")));
 }
 
 // ---------- Budgets & settings ----------
@@ -1520,16 +1573,18 @@ function Budgets({
   };
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", {
     style: S.pageTitle
-  }, "Budgets — ", MONTH_NAMES[month.m]), /*#__PURE__*/React.createElement("div", {
+  }, t("budgets_dash"), monthName(month.m)), /*#__PURE__*/React.createElement("div", {
     style: S.budgetNote
-  }, "Budgets are set in EUR and count all expenses. Shown in ", displayCur, "."), totalBudget > 0 && /*#__PURE__*/React.createElement("div", {
+  }, t("budgets_note", {
+    cur: displayCur
+  })), totalBudget > 0 && /*#__PURE__*/React.createElement("div", {
     style: {
       ...S.hero,
       padding: "14px 16px"
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: S.heroLabel
-  }, "Total"), /*#__PURE__*/React.createElement("div", {
+  }, t("total")), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       alignItems: "baseline",
@@ -1545,7 +1600,7 @@ function Budgets({
     style: {
       color: "var(--muted)"
     }
-  }, "of ", disp(totalBudget))), /*#__PURE__*/React.createElement(Bar, {
+  }, t("of_word"), disp(totalBudget))), /*#__PURE__*/React.createElement(Bar, {
     spent: totalSpent,
     budget: totalBudget
   })), CATEGORIES.map(c => {
@@ -1556,7 +1611,7 @@ function Budgets({
       style: S.budgetRow
     }, /*#__PURE__*/React.createElement("div", {
       style: S.budgetHead
-    }, /*#__PURE__*/React.createElement("span", null, c.icon, " ", c.label), editing ? /*#__PURE__*/React.createElement("span", {
+    }, /*#__PURE__*/React.createElement("span", null, c.icon, " ", catLabel(c)), editing ? /*#__PURE__*/React.createElement("span", {
       style: {
         display: "flex",
         alignItems: "center",
@@ -1593,24 +1648,24 @@ function Budgets({
       width: "auto"
     },
     onClick: save
-  }, "Save"), /*#__PURE__*/React.createElement("button", {
+  }, t("save")), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.ghostBtn,
       flex: 1,
       width: "auto"
     },
     onClick: () => setEditing(false)
-  }, "Cancel")) : /*#__PURE__*/React.createElement("button", {
+  }, t("cancel"))) : /*#__PURE__*/React.createElement("button", {
     style: S.ghostBtn,
     onClick: () => setEditing(true)
-  }, "Edit budgets (in EUR)"), /*#__PURE__*/React.createElement("h2", {
+  }, t("edit_budgets")), /*#__PURE__*/React.createElement("h2", {
     style: {
       ...S.pageTitle,
       marginTop: 28
     }
-  }, "Settings"), /*#__PURE__*/React.createElement("div", {
+  }, t("settings")), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, "Your name"), editName ? /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("input", {
+  }, t("your_name")), editName ? /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("input", {
     style: S.input,
     value: myName,
     maxLength: 16,
@@ -1630,7 +1685,7 @@ function Budgets({
       onSaveName(myName.trim() || "Me");
       setEditName(false);
     }
-  }, "Save"), /*#__PURE__*/React.createElement("button", {
+  }, t("save")), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.ghostBtn,
       flex: 1,
@@ -1640,14 +1695,14 @@ function Budgets({
       setMyName(profile.display_name);
       setEditName(false);
     }
-  }, "Cancel"))) : /*#__PURE__*/React.createElement("div", {
+  }, t("cancel")))) : /*#__PURE__*/React.createElement("div", {
     style: S.namesRow
   }, /*#__PURE__*/React.createElement("span", null, "You are shown as ", /*#__PURE__*/React.createElement("b", null, profile.display_name)), /*#__PURE__*/React.createElement("button", {
     style: S.miniBtn,
     onClick: () => setEditName(true)
-  }, "Edit")), /*#__PURE__*/React.createElement("div", {
+  }, t("edit"))), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, "Invite code (share with your partner)"), /*#__PURE__*/React.createElement("div", {
+  }, t("invite_share")), /*#__PURE__*/React.createElement("div", {
     style: S.namesRow
   }, /*#__PURE__*/React.createElement("span", {
     style: {
@@ -1660,9 +1715,9 @@ function Budgets({
     onClick: () => {
       navigator.clipboard && navigator.clipboard.writeText(household.invite_code);
     }
-  }, "Copy")), /*#__PURE__*/React.createElement("div", {
+  }, t("copy"))), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, "Exchange rates (manual override)"), editRates ? /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+  }, t("fx_rates")), editRates ? /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     style: S.rateEditRow
   }, /*#__PURE__*/React.createElement("span", null, "1 € = $"), /*#__PURE__*/React.createElement("input", {
     style: {
@@ -1700,16 +1755,16 @@ function Budgets({
       width: "auto"
     },
     onClick: saveR
-  }, "Save"), /*#__PURE__*/React.createElement("button", {
+  }, t("save")), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.ghostBtn,
       flex: 1,
       width: "auto"
     },
     onClick: () => setEditRates(false)
-  }, "Cancel"))) : /*#__PURE__*/React.createElement("div", {
+  }, t("cancel")))) : /*#__PURE__*/React.createElement("div", {
     style: S.namesRow
-  }, /*#__PURE__*/React.createElement("span", null, "1€ = $", rates.usdPerEur.toFixed(2), " · COP ", Math.round(rates.copPerEur).toLocaleString("en-US")), /*#__PURE__*/React.createElement("button", {
+  }, /*#__PURE__*/React.createElement("span", null, "1€ = $", rates.usdPerEur.toFixed(2), " · COP ", Math.round(rates.copPerEur).toLocaleString(numLocale())), /*#__PURE__*/React.createElement("button", {
     style: S.miniBtn,
     onClick: () => {
       setRateDraft({
@@ -1718,9 +1773,9 @@ function Budgets({
       });
       setEditRates(true);
     }
-  }, "Edit")), /*#__PURE__*/React.createElement("div", {
+  }, t("edit"))), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, "Rate source"), editSource ? /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("input", {
+  }, t("rate_source")), editSource ? /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("input", {
     style: S.input,
     value: sourceDraft,
     maxLength: 40,
@@ -1751,14 +1806,14 @@ function Budgets({
       onSaveSource(sourceDraft.trim() || "wise.com");
       setEditSource(false);
     }
-  }, "Save"), /*#__PURE__*/React.createElement("button", {
+  }, t("save")), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.ghostBtn,
       flex: 1,
       width: "auto"
     },
     onClick: () => setEditSource(false)
-  }, "Cancel"))) : /*#__PURE__*/React.createElement("div", {
+  }, t("cancel")))) : /*#__PURE__*/React.createElement("div", {
     style: S.namesRow
   }, /*#__PURE__*/React.createElement("span", null, "🌐 ", household.rate_source || "wise.com"), /*#__PURE__*/React.createElement("button", {
     style: S.miniBtn,
@@ -1766,9 +1821,9 @@ function Budgets({
       setSourceDraft(household.rate_source || "wise.com");
       setEditSource(true);
     }
-  }, "Edit")), /*#__PURE__*/React.createElement("div", {
+  }, t("edit"))), /*#__PURE__*/React.createElement("div", {
     style: S.privacyNote
-  }, "Each expense locks in the rate at the moment you save it, so past totals never shift. Everyone in your household sees the same data in real time."), /*#__PURE__*/React.createElement(ImportExpenses, {
+  }, t("privacy_note")), /*#__PURE__*/React.createElement(ImportExpenses, {
     people: people,
     rates: rates,
     onImport: onImportExpenses
@@ -1780,7 +1835,7 @@ function Budgets({
       borderColor: "var(--danger)"
     },
     onClick: onSignOut
-  }, "Sign out"));
+  }, t("sign_out")));
 }
 
 // ---------- CSV import ----------
@@ -1835,13 +1890,15 @@ function ImportExpenses({
           };
         });
         if (invalid.length) {
-          setErr(`Ongeldige rij(en) in CSV: regel ${invalid.slice(0, 10).join(", ")}${invalid.length > 10 ? "…" : ""}`);
+          setErr(t("csv_invalid_rows", {
+            lines: invalid.slice(0, 10).join(", ") + (invalid.length > 10 ? "…" : "")
+          }));
           setRows(null);
           return;
         }
         setRows(clean);
       } catch (e2) {
-        setErr("Kon CSV niet lezen: " + e2.message);
+        setErr(t("csv_read_error") + e2.message);
         setRows(null);
       }
     };
@@ -1877,7 +1934,7 @@ function ImportExpenses({
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, "Import expenses (CSV)"), /*#__PURE__*/React.createElement("input", {
+  }, t("import_csv")), /*#__PURE__*/React.createElement("input", {
     ref: fileInputRef,
     type: "file",
     accept: ".csv",
@@ -1886,7 +1943,7 @@ function ImportExpenses({
     style: S.errBox
   }, err), rows && /*#__PURE__*/React.createElement("div", {
     style: S.privacyNote
-  }, rows.length, " rijen in ", fileName, " · totaal ~", fmt(totalEur, "EUR"), " · ", Object.entries(byCategory).map(([c, n]) => `${catById(c).label}: ${n}`).join(", ")), rows && /*#__PURE__*/React.createElement("button", {
+  }, rows.length, t("rows_in"), fileName, t("total_approx"), fmt(totalEur, "EUR"), " · ", Object.entries(byCategory).map(([c, n]) => `${catLabel(c)}: ${n}`).join(", ")), rows && /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.primaryBtn,
       marginTop: 8,
@@ -1894,7 +1951,12 @@ function ImportExpenses({
     },
     disabled: busy,
     onClick: runImport
-  }, busy ? progress ? `Importeren… ${progress.done}/${progress.total}` : "Importeren…" : `Importeer ${rows.length} uitgaven`));
+  }, busy ? progress ? t("importing", {
+    done: progress.done,
+    total: progress.total
+  }) : t("importing_short") : t("import_n", {
+    n: rows.length
+  })));
 }
 
 // ---------- Grocery list ----------
@@ -1948,7 +2010,7 @@ function GroceryList({
       created_by: user.id
     });
     if (error) {
-      setErr("Opslaan mislukt: " + error.message);
+      setErr(t("grocery_save_failed") + error.message);
       setItems(cur => cur.filter(i => i.id !== tmpId));
       setText(name);
       return;
@@ -1976,13 +2038,15 @@ function GroceryList({
   const remaining = items.filter(i => !i.done).length;
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", {
     style: S.pageTitle
-  }, "Grocery list", items.length > 0 && /*#__PURE__*/React.createElement("span", {
+  }, t("grocery_list"), items.length > 0 && /*#__PURE__*/React.createElement("span", {
     style: {
       fontWeight: 400,
       fontSize: 14,
       color: "var(--muted)"
     }
-  }, " · ", remaining, " to get")), /*#__PURE__*/React.createElement("div", {
+  }, " · ", t("to_get", {
+    n: remaining
+  }))), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 8
@@ -1992,7 +2056,7 @@ function GroceryList({
       ...S.input,
       flex: 1
     },
-    placeholder: "e.g. milk, arepas, coffee…",
+    placeholder: t("grocery_ph"),
     value: text,
     maxLength: 80,
     onChange: e => setText(e.target.value),
@@ -2007,15 +2071,15 @@ function GroceryList({
       padding: "0 20px"
     },
     onClick: add
-  }, "Add")), err && /*#__PURE__*/React.createElement("div", {
+  }, t("add"))), err && /*#__PURE__*/React.createElement("div", {
     style: S.errBox
-  }, err, /*#__PURE__*/React.createElement("br", null), err.includes("does not exist") && "De groceries-tabel bestaat nog niet — voer supabase/groceries.sql uit in de Supabase SQL Editor."), /*#__PURE__*/React.createElement("div", {
+  }, err, /*#__PURE__*/React.createElement("br", null), err.includes("does not exist") && t("groceries_missing_table")), /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 14
     }
   }, items.length === 0 && /*#__PURE__*/React.createElement("div", {
     style: S.empty
-  }, "The list is empty.", /*#__PURE__*/React.createElement("br", null), "Add what you need to buy above."), items.map(item => /*#__PURE__*/React.createElement("div", {
+  }, t("list_empty"), /*#__PURE__*/React.createElement("br", null), t("list_empty_hint")), items.map(item => /*#__PURE__*/React.createElement("div", {
     key: item.id,
     style: {
       ...S.expRow,
@@ -2066,7 +2130,7 @@ function GroceryList({
       background: "var(--danger)"
     },
     onClick: clearAll
-  }, "Yes, clear everything"), /*#__PURE__*/React.createElement("button", {
+  }, t("clear_confirm")), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.ghostBtn,
       marginTop: 0,
@@ -2074,7 +2138,7 @@ function GroceryList({
       width: "auto"
     },
     onClick: () => setConfirmClear(false)
-  }, "Cancel")) : /*#__PURE__*/React.createElement("button", {
+  }, t("cancel"))) : /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.ghostBtn,
       marginTop: 16,
@@ -2082,7 +2146,7 @@ function GroceryList({
       borderColor: "var(--danger)"
     },
     onClick: () => setConfirmClear(true)
-  }, "Clear whole list")));
+  }, t("clear_list"))));
 }
 function Bar({
   spent,
