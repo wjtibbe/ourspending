@@ -6,27 +6,109 @@
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="theme-color" content="#F3F6F1" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#121714" media="(prefers-color-scheme: dark)" />
   <title>OurSpending</title>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <style>
-    :root {
-      --bg: #F3F6F1; --card: #FFFFFF; --ink: #182A20; --muted: #6B7A70; --line: #E0E8DD;
-      --green: #1F6B4E; --green-deep: #14503A; --blue: #33608D; --ochre: #A6641C;
-      --warn: #C97A1F; --danger: #B3372E;
+    /* ---- Semantic design tokens: light theme (default) ---- */
+    :root, :root[data-theme="light"] {
+      --bg: #F3F6F1;            /* app background */
+      --card: #FFFFFF;          /* surface */
+      --elevated: #FFFFFF;      /* elevated surface: modals, dropdowns */
+      --overlay: rgba(24, 42, 32, 0.45);
+      --ink: #182A20;           /* primary text */
+      --muted: #6B7A70;         /* secondary text */
+      --line: #E0E8DD;          /* border */
+      --green: #1F6B4E;         /* primary / accent + success */
+      --green-deep: #14503A;    /* accent pressed */
+      --blue: #33608D;          /* person A */
+      --ochre: #A6641C;         /* person B */
+      --warn: #C97A1F;          /* warning */
+      --danger: #B3372E;        /* error */
+      --on-accent: #FFFFFF;     /* text on accent-filled surfaces */
+      --tint-green: #E9F2EC;    /* soft success/selected background */
+      --tint-danger: #FBEFE7;   /* soft error background */
+      --toast-bg: #182A20;
+      --toast-ink: #FFFFFF;
+      --shadow-modal: 0 12px 40px rgba(24, 42, 32, 0.22);
+      --shadow-photo: 0 8px 24px rgba(0, 0, 0, 0.15);
     }
+
+    /* ---- Dark theme: re-tuned hues, not inverted ---- */
+    :root[data-theme="dark"] {
+      --bg: #121714;
+      --card: #1B221E;
+      --elevated: #232B27;
+      --overlay: rgba(0, 0, 0, 0.6);
+      --ink: #E8EFE9;
+      --muted: #9BAAA1;
+      --line: #2E3833;
+      --green: #5FBF92;
+      --green-deep: #3E9E73;
+      --blue: #79ABDD;
+      --ochre: #E0A263;
+      --warn: #E6A552;
+      --danger: #F08A7E;
+      --on-accent: #0E1512;
+      --tint-green: #1E3128;
+      --tint-danger: #3A2320;
+      --toast-bg: #E8EFE9;
+      --toast-ink: #121714;
+      --shadow-modal: 0 12px 40px rgba(0, 0, 0, 0.5);
+      --shadow-photo: 0 8px 24px rgba(0, 0, 0, 0.45);
+    }
+
+    /* System preference applies only when the user has not chosen explicitly.
+       The pre-paint script below stamps data-theme, so this is the fallback. */
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme]) {
+        --bg: #121714; --card: #1B221E; --elevated: #232B27;
+        --overlay: rgba(0, 0, 0, 0.6);
+        --ink: #E8EFE9; --muted: #9BAAA1; --line: #2E3833;
+        --green: #5FBF92; --green-deep: #3E9E73; --blue: #79ABDD; --ochre: #E0A263;
+        --warn: #E6A552; --danger: #F08A7E;
+        --on-accent: #0E1512; --tint-green: #1E3128; --tint-danger: #3A2320;
+        --toast-bg: #E8EFE9; --toast-ink: #121714;
+        --shadow-modal: 0 12px 40px rgba(0, 0, 0, 0.5);
+        --shadow-photo: 0 8px 24px rgba(0, 0, 0, 0.45);
+      }
+    }
+
     * { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; background: var(--bg); }
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; -webkit-font-smoothing: antialiased; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      color: var(--ink);
+    }
     #root { min-height: 100vh; }
-    .auth-photo { width: 260px; max-width: 30vw; height: auto; border-radius: 18px; object-fit: cover; box-shadow: 0 8px 24px rgba(0,0,0,0.15); }
+    /* Native form controls (date pickers, selects) follow the theme too */
+    :root[data-theme="dark"] { color-scheme: dark; }
+    :root[data-theme="light"] { color-scheme: light; }
+    input, textarea, select, button { font-family: inherit; }
+    .auth-photo { width: 260px; max-width: 30vw; height: auto; border-radius: 18px; object-fit: cover; box-shadow: var(--shadow-photo); }
     @media (max-width: 900px) { .auth-photo { display: none; } }
   </style>
+  <script>
+    // Pre-paint theme resolution: avoids a light flash before React mounts.
+    (function () {
+      try {
+        var saved = localStorage.getItem("ourspending_theme");
+        if (saved === "light" || saved === "dark") {
+          document.documentElement.setAttribute("data-theme", saved);
+        }
+        // No explicit choice -> leave unset so prefers-color-scheme decides.
+      } catch (e) { /* private mode */ }
+    })();
+  </script>
 </head>
 <body>
   <div id="root"></div>
   <script src="i18n.js"></script>
+  <script src="theme.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

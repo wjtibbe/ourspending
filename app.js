@@ -562,6 +562,11 @@ function Dashboard({
     window.I18N.set(l);
     setLangState(l);
   };
+  const [themeMode, setThemeModeState] = useState(window.THEME.mode);
+  const changeTheme = m => {
+    window.THEME.set(m);
+    setThemeModeState(m);
+  };
   const [toast, setToast] = useState(null);
   const [ratesLoading, setRatesLoading] = useState(false);
   const hhId = profile.household_id;
@@ -833,6 +838,8 @@ function Dashboard({
   }, tab === "overview" && /*#__PURE__*/React.createElement(Overview, {
     lang: lang,
     onSetLang: changeLang,
+    themeMode: themeMode,
+    onSetTheme: changeTheme,
     people: people,
     month: month,
     setMonth: setMonth,
@@ -877,10 +884,19 @@ function Dashboard({
     onSaveRates: saveRates,
     onSaveSource: saveSource,
     onImportExpenses: importExpenses,
+    hhId: hhId,
+    user: user,
+    showToast: showToast,
     onSignOut: () => db.auth.signOut()
   }), tab === "groceries" && /*#__PURE__*/React.createElement(GroceryList, {
     hhId: hhId,
     user: user
+  }), tab === "calendar" && /*#__PURE__*/React.createElement(Calendar, {
+    hhId: hhId,
+    user: user,
+    profile: profile,
+    people: people,
+    showToast: showToast
   })), toast && /*#__PURE__*/React.createElement("div", {
     style: S.toast
   }, toast), /*#__PURE__*/React.createElement("nav", {
@@ -907,6 +923,11 @@ function Dashboard({
     onClick: () => setTab("groceries"),
     icon: "🛒",
     label: t("tab_list")
+  }), /*#__PURE__*/React.createElement(TabBtn, {
+    active: tab === "calendar",
+    onClick: () => setTab("calendar"),
+    icon: "📅",
+    label: t("tab_calendar")
   }), /*#__PURE__*/React.createElement(TabBtn, {
     active: tab === "budgets",
     onClick: () => setTab("budgets"),
@@ -948,6 +969,8 @@ const kindInitials = (e, people) => initialsOf(e.kind === "shared" ? people[e.pa
 function Overview({
   lang,
   onSetLang,
+  themeMode,
+  onSetTheme,
   people,
   month,
   setMonth,
@@ -1012,7 +1035,19 @@ function Overview({
       gap: 6,
       marginBottom: 8
     }
-  }, window.I18N.languages.map(l => /*#__PURE__*/React.createElement("button", {
+  }, /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.chip,
+      minWidth: 40
+    },
+    title: t("theme_switch", {
+      mode: t("theme_" + themeMode)
+    }),
+    "aria-label": t("theme_switch", {
+      mode: t("theme_" + themeMode)
+    }),
+    onClick: () => onSetTheme(themeMode === "light" ? "dark" : themeMode === "dark" ? "system" : "light")
+  }, themeMode === "light" ? "\u2600\uFE0F" : themeMode === "dark" ? "\uD83C\uDF19" : "\uD83D\uDCF1"), window.I18N.languages.map(l => /*#__PURE__*/React.createElement("button", {
     key: l,
     style: {
       ...S.chip,
@@ -1240,7 +1275,7 @@ function Overview({
         height: 18,
         borderRadius: "50%",
         background: kindDot(e),
-        color: "#fff",
+        color: "var(--on-accent)",
         fontSize: 9,
         fontWeight: 700,
         flexShrink: 0
@@ -1529,6 +1564,9 @@ function Budgets({
   onSaveRates,
   onSaveSource,
   onImportExpenses,
+  hhId,
+  user,
+  showToast,
   onSignOut
 }) {
   const [draft, setDraft] = useState(() => {
@@ -1827,6 +1865,11 @@ function Budgets({
     people: people,
     rates: rates,
     onImport: onImportExpenses
+  }), /*#__PURE__*/React.createElement(CalendarSync, {
+    hhId: hhId,
+    user: user,
+    people: people,
+    showToast: showToast
   }), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.ghostBtn,
@@ -2093,7 +2136,7 @@ function GroceryList({
       borderRadius: "50%",
       border: item.done ? "2px solid var(--green)" : "2px solid var(--line)",
       background: item.done ? "var(--green)" : "transparent",
-      color: "#fff",
+      color: "var(--on-accent)",
       fontSize: 14,
       fontWeight: 700,
       display: "flex",
@@ -2148,6 +2191,893 @@ function GroceryList({
     onClick: () => setConfirmClear(true)
   }, t("clear_list"))));
 }
+// ---------- Calendar helpers ----------
+const startOfDay = d => {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  return x;
+};
+const endOfDay = d => {
+  const x = new Date(d);
+  x.setHours(23, 59, 59, 999);
+  return x;
+};
+const addDays = (d, n) => {
+  const x = new Date(d);
+  x.setDate(x.getDate() + n);
+  return x;
+};
+const addMonthsD = (d, n) => {
+  const x = new Date(d);
+  x.setDate(1);
+  x.setMonth(x.getMonth() + n);
+  return x;
+};
+const ymdLocal = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const hhmmLocal = d => `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+// Weeks run Monday -> Sunday.
+const startOfWeek = d => {
+  const x = startOfDay(d);
+  return addDays(x, -((x.getDay() + 6) % 7));
+};
+const toLocalInput = d => `${ymdLocal(d)}T${hhmmLocal(d)}`;
+const fromLocalInput = v => new Date(v);
+const sameYmd = (a, b) => ymdLocal(a) === ymdLocal(b);
+const eventColor = e => e.kind === "shared" ? "var(--green)" : e.kind === "p0" ? "var(--blue)" : "var(--ochre)";
+const ownerName = (e, people) => e.kind === "shared" ? t("shared") : e.kind === "p0" ? people[0] : people[1];
+
+// Expands recurring events into concrete occurrences inside [from, to].
+// Guarded so a malformed rule can never loop away.
+function expandEvents(rows, from, to) {
+  const out = [];
+  rows.forEach(e => {
+    const s = new Date(e.starts_at);
+    const en = new Date(e.ends_at);
+    const dur = Math.max(0, en.getTime() - s.getTime());
+    if (e.recurrence === "none") {
+      if (en >= from && s <= to) out.push({
+        ...e,
+        _start: s,
+        _end: en
+      });
+      return;
+    }
+    const until = e.recurrence_until ? endOfDay(new Date(e.recurrence_until + "T00:00:00")) : null;
+    let cur = new Date(s);
+    let guard = 0;
+    while (cur <= to && guard++ < 500) {
+      if (until && cur > until) break;
+      const cEnd = new Date(cur.getTime() + dur);
+      if (cEnd >= from) out.push({
+        ...e,
+        _start: new Date(cur),
+        _end: cEnd,
+        _recurring: true
+      });
+      if (e.recurrence === "daily") cur = addDays(cur, 1);else if (e.recurrence === "weekly") cur = addDays(cur, 7);else if (e.recurrence === "biweekly") cur = addDays(cur, 14);else if (e.recurrence === "monthly") {
+        const n = new Date(cur);
+        n.setMonth(n.getMonth() + 1);
+        cur = n;
+      } else if (e.recurrence === "yearly") {
+        const n = new Date(cur);
+        n.setFullYear(n.getFullYear() + 1);
+        cur = n;
+      } else break;
+    }
+  });
+  return out.sort((a, b) => a._start - b._start);
+}
+const eventsOnDay = (list, day) => list.filter(e => {
+  const ds = startOfDay(day);
+  const de = endOfDay(day);
+  return e._start <= de && e._end >= ds;
+});
+
+// ---------- Calendar ----------
+function Calendar({
+  hhId,
+  user,
+  profile,
+  people,
+  showToast
+}) {
+  const [view, setView] = useState("month");
+  const [cursor, setCursor] = useState(() => new Date());
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState(null);
+  const [modal, setModal] = useState(null);
+  const mySlot = profile && (profile.slot === 0 || profile.slot === 1) ? profile.slot : 0;
+
+  // Visible range for the current view.
+  let from, to;
+  if (view === "month") {
+    from = startOfWeek(new Date(cursor.getFullYear(), cursor.getMonth(), 1));
+    to = endOfDay(addDays(from, 41));
+  } else if (view === "week") {
+    from = startOfWeek(cursor);
+    to = endOfDay(addDays(from, 6));
+  } else {
+    from = startOfDay(cursor);
+    to = endOfDay(cursor);
+  }
+  const fromIso = from.toISOString();
+  const toIso = to.toISOString();
+  const load = useCallback(async () => {
+    setLoading(true);
+    // Fetch anything overlapping the range, plus every recurring series
+    // (its parent row may start long before the visible window).
+    const {
+      data,
+      error
+    } = await db.from("calendar_events").select("*").eq("household_id", hhId).or(`recurrence.neq.none,and(ends_at.gte.${fromIso},starts_at.lte.${toIso})`).order("starts_at");
+    setLoading(false);
+    if (error) {
+      setErr(error.message);
+      return;
+    }
+    setErr(null);
+    setRows(data || []);
+  }, [hhId, fromIso, toIso]);
+  useEffect(() => {
+    load();
+  }, [load]);
+  useEffect(() => {
+    const ch = db.channel("cal-" + hhId).on("postgres_changes", {
+      event: "*",
+      schema: "public",
+      table: "calendar_events",
+      filter: `household_id=eq.${hhId}`
+    }, load).subscribe();
+    return () => db.removeChannel(ch);
+  }, [hhId, load]);
+  const events = expandEvents(rows, from, to);
+  const canEdit = e => e.created_by === user.id || e.kind === "shared";
+  const saveEvent = async form => {
+    const payload = {
+      household_id: hhId,
+      title: form.title.trim(),
+      description: form.description.trim() || null,
+      location: form.location.trim() || null,
+      starts_at: form.startsAt,
+      ends_at: form.endsAt,
+      all_day: form.allDay,
+      kind: form.kind,
+      recurrence: form.recurrence,
+      recurrence_until: form.recurrenceUntil || null
+    };
+    if (form.id) {
+      const {
+        error
+      } = await db.from("calendar_events").update(payload).eq("id", form.id);
+      if (error) throw new Error(error.message);
+      showToast(t("event_updated"));
+    } else {
+      payload.created_by = user.id;
+      const {
+        error
+      } = await db.from("calendar_events").insert(payload);
+      if (error) throw new Error(error.message);
+      showToast(t("event_saved"));
+    }
+    setModal(null);
+    load();
+  };
+  const deleteEvent = async id => {
+    const {
+      error
+    } = await db.from("calendar_events").delete().eq("id", id);
+    if (error) {
+      showToast(t("save_failed") + error.message);
+      return;
+    }
+    showToast(t("event_deleted"));
+    setModal(null);
+    load();
+  };
+  const shift = n => {
+    if (view === "month") setCursor(addMonthsD(cursor, n));else if (view === "week") setCursor(addDays(cursor, 7 * n));else setCursor(addDays(cursor, n));
+  };
+  const headerLabel = () => {
+    if (view === "month") return `${monthName(cursor.getMonth())} ${cursor.getFullYear()}`;
+    if (view === "week") {
+      const ws = startOfWeek(cursor);
+      const we = addDays(ws, 6);
+      return `${ws.getDate()} ${monthName(ws.getMonth()).slice(0, 3)} – ${we.getDate()} ${monthName(we.getMonth()).slice(0, 3)}`;
+    }
+    return `${window.I18N.weekdays()[(cursor.getDay() + 6) % 7]} ${cursor.getDate()} ${monthName(cursor.getMonth())}`;
+  };
+  const openNew = day => {
+    const base = day ? new Date(day) : new Date();
+    if (!day) base.setMinutes(0, 0, 0);else base.setHours(9, 0, 0, 0);
+    const end = new Date(base.getTime() + 60 * 60 * 1000);
+    setModal({
+      mode: "edit",
+      form: {
+        id: null,
+        title: "",
+        description: "",
+        location: "",
+        startsAt: base.toISOString(),
+        endsAt: end.toISOString(),
+        allDay: false,
+        kind: "shared",
+        recurrence: "none",
+        recurrenceUntil: ""
+      }
+    });
+  };
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: S.calNav
+  }, /*#__PURE__*/React.createElement("button", {
+    style: S.iconBtn,
+    onClick: () => shift(-1),
+    "aria-label": "previous"
+  }, "‹"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 600,
+      fontSize: 16,
+      textAlign: "center",
+      flex: 1
+    }
+  }, headerLabel()), /*#__PURE__*/React.createElement("button", {
+    style: S.iconBtn,
+    onClick: () => shift(1),
+    "aria-label": "next"
+  }, "›")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...S.chipRow,
+      justifyContent: "space-between"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6
+    }
+  }, ["month", "week", "day"].map(v => /*#__PURE__*/React.createElement("button", {
+    key: v,
+    style: {
+      ...S.chip,
+      ...(view === v ? S.chipOn : {})
+    },
+    onClick: () => setView(v)
+  }, t("view_" + v)))), /*#__PURE__*/React.createElement("button", {
+    style: S.chip,
+    onClick: () => setCursor(new Date())
+  }, t("today"))), err && /*#__PURE__*/React.createElement("div", {
+    style: S.errBox
+  }, t("events_load_failed"), err, /*#__PURE__*/React.createElement("br", null), (err.includes("does not exist") || err.includes("schema cache")) && t("calendar_missing_table")), loading && !rows.length ? /*#__PURE__*/React.createElement("div", {
+    style: S.empty
+  }, t("loading_events")) : view === "month" ? /*#__PURE__*/React.createElement(MonthGrid, {
+    from: from,
+    cursor: cursor,
+    events: events,
+    people: people,
+    onDay: d => {
+      setCursor(d);
+      setView("day");
+    },
+    onEvent: e => setModal({
+      mode: "view",
+      event: e
+    })
+  }) : /*#__PURE__*/React.createElement(AgendaView, {
+    view: view,
+    from: from,
+    events: events,
+    people: people,
+    onEvent: e => setModal({
+      mode: "view",
+      event: e
+    })
+  }), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.primaryBtn,
+      marginTop: 16
+    },
+    onClick: () => openNew(view === "day" ? cursor : null)
+  }, "＋ " + t("add_event")), modal && modal.mode === "view" && /*#__PURE__*/React.createElement(EventDetail, {
+    event: modal.event,
+    people: people,
+    canEdit: canEdit(modal.event),
+    onClose: () => setModal(null),
+    onEdit: () => setModal({
+      mode: "edit",
+      form: {
+        id: modal.event.id,
+        title: modal.event.title,
+        description: modal.event.description || "",
+        location: modal.event.location || "",
+        startsAt: modal.event.starts_at,
+        endsAt: modal.event.ends_at,
+        allDay: modal.event.all_day,
+        kind: modal.event.kind,
+        recurrence: modal.event.recurrence,
+        recurrenceUntil: modal.event.recurrence_until || ""
+      }
+    }),
+    onDelete: () => deleteEvent(modal.event.id)
+  }), modal && modal.mode === "edit" && /*#__PURE__*/React.createElement(EventForm, {
+    initial: modal.form,
+    people: people,
+    mySlot: mySlot,
+    onCancel: () => setModal(null),
+    onSave: saveEvent
+  }));
+}
+
+// ---------- Month grid ----------
+function MonthGrid({
+  from,
+  cursor,
+  events,
+  people,
+  onDay,
+  onEvent
+}) {
+  const today = new Date();
+  const cells = [];
+  for (let i = 0; i < 42; i++) cells.push(addDays(from, i));
+  return /*#__PURE__*/React.createElement("div", {
+    style: S.calCard
+  }, /*#__PURE__*/React.createElement("div", {
+    style: S.calWeekHead
+  }, window.I18N.weekdays().map(w => /*#__PURE__*/React.createElement("div", {
+    key: w,
+    style: S.calWeekDay
+  }, w))), /*#__PURE__*/React.createElement("div", {
+    style: S.calGrid
+  }, cells.map((d, i) => {
+    const inMonth = d.getMonth() === cursor.getMonth();
+    const isToday = sameYmd(d, today);
+    const dayEvents = eventsOnDay(events, d);
+    return /*#__PURE__*/React.createElement("button", {
+      key: i,
+      style: {
+        ...S.calCell,
+        opacity: inMonth ? 1 : 0.38
+      },
+      onClick: () => onDay(d)
+    }, /*#__PURE__*/React.createElement("span", {
+      style: isToday ? S.calDayNumToday : S.calDayNum
+    }, d.getDate()), /*#__PURE__*/React.createElement("span", {
+      style: S.calChips
+    }, dayEvents.slice(0, 2).map((e, j) => /*#__PURE__*/React.createElement("span", {
+      key: j,
+      style: {
+        ...S.calChip,
+        background: eventColor(e)
+      },
+      onClick: ev => {
+        ev.stopPropagation();
+        onEvent(e);
+      }
+    }, e.all_day ? e.title : `${hhmmLocal(e._start)} ${e.title}`)), dayEvents.length > 2 && /*#__PURE__*/React.createElement("span", {
+      style: S.calMore
+    }, "+", dayEvents.length - 2)));
+  })));
+}
+
+// ---------- Week / day agenda ----------
+function AgendaView({
+  view,
+  from,
+  events,
+  people,
+  onEvent
+}) {
+  const days = [];
+  const count = view === "week" ? 7 : 1;
+  for (let i = 0; i < count; i++) days.push(addDays(from, i));
+  const today = new Date();
+  const anyEvents = events.length > 0;
+  if (!anyEvents) return /*#__PURE__*/React.createElement("div", {
+    style: S.empty
+  }, view === "week" ? t("no_events_week") : t("no_events_day"));
+  return /*#__PURE__*/React.createElement("div", null, days.map((d, i) => {
+    const dayEvents = eventsOnDay(events, d);
+    if (view === "week" && !dayEvents.length) return null;
+    return /*#__PURE__*/React.createElement("div", {
+      key: i,
+      style: {
+        marginBottom: 10
+      }
+    }, view === "week" && /*#__PURE__*/React.createElement("div", {
+      style: S.dayLabel
+    }, window.I18N.weekdays()[(d.getDay() + 6) % 7], " ", d.getDate(), sameYmd(d, today) ? " · " + t("today") : ""), dayEvents.length === 0 ? /*#__PURE__*/React.createElement("div", {
+      style: S.empty
+    }, t("no_events_day")) : dayEvents.map((e, j) => /*#__PURE__*/React.createElement("button", {
+      key: j,
+      style: S.calRow,
+      onClick: () => onEvent(e)
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        ...S.calRowBar,
+        background: eventColor(e)
+      }
+    }), /*#__PURE__*/React.createElement("span", {
+      style: {
+        flex: 1,
+        minWidth: 0,
+        textAlign: "left"
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: S.calRowTitle
+    }, e.title), /*#__PURE__*/React.createElement("span", {
+      style: S.calRowSub
+    }, e.all_day ? t("all_day") : `${hhmmLocal(e._start)} – ${hhmmLocal(e._end)}`, " · ", ownerName(e, people), e.location ? " · " + e.location : "")))));
+  }));
+}
+
+// ---------- Event detail modal ----------
+function EventDetail({
+  event,
+  people,
+  canEdit,
+  onClose,
+  onEdit,
+  onDelete
+}) {
+  const [confirm, setConfirm] = useState(false);
+  const owner = ownerName(event, people);
+  return /*#__PURE__*/React.createElement("div", {
+    style: S.modalWrap,
+    onClick: onClose
+  }, /*#__PURE__*/React.createElement("div", {
+    style: S.modalCard,
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      width: 12,
+      height: 12,
+      borderRadius: 4,
+      background: eventColor(event),
+      flexShrink: 0
+    }
+  }), /*#__PURE__*/React.createElement("h2", {
+    style: {
+      ...S.pageTitle,
+      margin: 0,
+      flex: 1
+    }
+  }, event.title)), /*#__PURE__*/React.createElement("div", {
+    style: S.modalMeta
+  }, event.all_day ? `${ymdLocal(event._start)} · ${t("all_day")}` : `${ymdLocal(event._start)} · ${hhmmLocal(event._start)} – ${hhmmLocal(event._end)}`), event.location && /*#__PURE__*/React.createElement("div", {
+    style: S.modalMeta
+  }, "📍 ", event.location), /*#__PURE__*/React.createElement("div", {
+    style: S.modalMeta
+  }, "👤 ", owner, event._recurring ? " · " + t("recurring_badge") : ""), event.description && /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...S.modalMeta,
+      whiteSpace: "pre-wrap",
+      marginTop: 10,
+      color: "var(--ink)"
+    }
+  }, event.description), !canEdit && /*#__PURE__*/React.createElement("div", {
+    style: S.privacyNote
+  }, t("readonly_event", {
+    name: event.kind === "p0" ? people[0] : people[1]
+  })), confirm ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      marginTop: 16
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.primaryBtn,
+      marginTop: 0,
+      flex: 1,
+      width: "auto",
+      background: "var(--danger)"
+    },
+    onClick: onDelete
+  }, t("delete_event")), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.ghostBtn,
+      marginTop: 0,
+      flex: 1,
+      width: "auto"
+    },
+    onClick: () => setConfirm(false)
+  }, t("cancel"))) : /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      marginTop: 16
+    }
+  }, canEdit && /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.primaryBtn,
+      marginTop: 0,
+      flex: 1,
+      width: "auto"
+    },
+    onClick: onEdit
+  }, t("edit")), canEdit && /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.ghostBtn,
+      marginTop: 0,
+      flex: 1,
+      width: "auto",
+      color: "var(--danger)",
+      borderColor: "var(--danger)"
+    },
+    onClick: () => setConfirm(true)
+  }, t("delete")), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.ghostBtn,
+      marginTop: 0,
+      flex: canEdit ? 0 : 1,
+      width: "auto"
+    },
+    onClick: onClose
+  }, t("close")))));
+}
+
+// ---------- Event create/edit form ----------
+function EventForm({
+  initial,
+  people,
+  mySlot,
+  onCancel,
+  onSave
+}) {
+  const [f, setF] = useState(() => ({
+    ...initial,
+    startsAt: toLocalInput(new Date(initial.startsAt)),
+    endsAt: toLocalInput(new Date(initial.endsAt))
+  }));
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const set = (k, v) => setF(cur => ({
+    ...cur,
+    [k]: v
+  }));
+  const submit = async () => {
+    if (!f.title.trim()) return setErr(t("event_title_required"));
+    const s = fromLocalInput(f.allDay ? f.startsAt.slice(0, 10) + "T00:00" : f.startsAt);
+    const e = f.allDay ? endOfDay(fromLocalInput(f.endsAt.slice(0, 10) + "T00:00")) : fromLocalInput(f.endsAt);
+    if (isNaN(s) || isNaN(e)) return setErr(t("event_end_before_start"));
+    if (e < s) return setErr(t("event_end_before_start"));
+    setErr(null);
+    setBusy(true);
+    try {
+      await onSave({
+        ...f,
+        title: f.title,
+        startsAt: s.toISOString(),
+        endsAt: e.toISOString()
+      });
+    } catch (e2) {
+      setErr(t("save_failed") + (e2.message || String(e2)));
+      setBusy(false);
+    }
+  };
+  const dtType = f.allDay ? "date" : "datetime-local";
+  const dtVal = v => f.allDay ? v.slice(0, 10) : v;
+  return /*#__PURE__*/React.createElement("div", {
+    style: S.modalWrap,
+    onClick: onCancel
+  }, /*#__PURE__*/React.createElement("div", {
+    style: S.modalCard,
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("h2", {
+    style: {
+      ...S.pageTitle,
+      marginTop: 0
+    }
+  }, f.id ? t("edit_event") : t("new_event")), /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("event_title")), /*#__PURE__*/React.createElement("input", {
+    style: S.input,
+    value: f.title,
+    maxLength: 120,
+    placeholder: t("event_title_ph"),
+    onChange: e => set("title", e.target.value)
+  }), /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("belongs_to")), /*#__PURE__*/React.createElement("div", {
+    style: S.segWide
+  }, /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.segBtn,
+      ...(f.kind === "shared" ? S.segOn : {})
+    },
+    onClick: () => set("kind", "shared")
+  }, t("shared")), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.segBtn,
+      ...(f.kind === "p0" ? S.segOnA : {})
+    },
+    onClick: () => set("kind", "p0")
+  }, people[0]), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.segBtn,
+      ...(f.kind === "p1" ? S.segOnB : {})
+    },
+    onClick: () => set("kind", "p1")
+  }, people[1])), /*#__PURE__*/React.createElement("label", {
+    style: S.switchRow
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: f.allDay,
+    onChange: e => set("allDay", e.target.checked)
+  }), /*#__PURE__*/React.createElement("span", null, t("all_day"))), /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("starts")), /*#__PURE__*/React.createElement("input", {
+    type: dtType,
+    style: S.input,
+    value: dtVal(f.startsAt),
+    onChange: e => set("startsAt", f.allDay ? e.target.value + "T00:00" : e.target.value)
+  }), /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("ends")), /*#__PURE__*/React.createElement("input", {
+    type: dtType,
+    style: S.input,
+    value: dtVal(f.endsAt),
+    onChange: e => set("endsAt", f.allDay ? e.target.value + "T00:00" : e.target.value)
+  }), /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("event_location")), /*#__PURE__*/React.createElement("input", {
+    style: S.input,
+    value: f.location,
+    maxLength: 120,
+    placeholder: t("event_location_ph"),
+    onChange: e => set("location", e.target.value)
+  }), /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("event_desc")), /*#__PURE__*/React.createElement("textarea", {
+    style: {
+      ...S.input,
+      minHeight: 70,
+      resize: "vertical"
+    },
+    value: f.description,
+    maxLength: 500,
+    placeholder: t("event_desc_ph"),
+    onChange: e => set("description", e.target.value)
+  }), /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("repeats")), /*#__PURE__*/React.createElement("select", {
+    style: S.input,
+    value: f.recurrence,
+    onChange: e => set("recurrence", e.target.value)
+  }, ["none", "daily", "weekly", "biweekly", "monthly", "yearly"].map(r => /*#__PURE__*/React.createElement("option", {
+    key: r,
+    value: r
+  }, t("repeat_" + r)))), f.recurrence !== "none" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("repeat_until")), /*#__PURE__*/React.createElement("input", {
+    type: "date",
+    style: S.input,
+    value: f.recurrenceUntil,
+    onChange: e => set("recurrenceUntil", e.target.value)
+  })), err && /*#__PURE__*/React.createElement("div", {
+    style: S.errBox
+  }, err), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.primaryBtn,
+      opacity: busy ? 0.6 : 1
+    },
+    disabled: busy,
+    onClick: submit
+  }, busy ? t("saving") : t("save_event")), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.ghostBtn,
+      marginTop: 8
+    },
+    onClick: onCancel
+  }, t("cancel"))));
+}
+
+// ---------- ICS export (RFC 5545) ----------
+const icsEscape = v => String(v == null ? "" : v).replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\r?\n/g, "\\n");
+const icsFold = line => {
+  // RFC 5545 caps content lines at 75 octets; continuations start with a space.
+  const out = [];
+  let s = line;
+  while (s.length > 73) {
+    out.push(s.slice(0, 73));
+    s = " " + s.slice(73);
+  }
+  out.push(s);
+  return out.join("\r\n");
+};
+const icsStamp = d => d.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+const icsDay = d => ymdLocal(d).replace(/-/g, "");
+const icsRule = e => {
+  const map = {
+    daily: "FREQ=DAILY",
+    weekly: "FREQ=WEEKLY",
+    biweekly: "FREQ=WEEKLY;INTERVAL=2",
+    monthly: "FREQ=MONTHLY",
+    yearly: "FREQ=YEARLY"
+  };
+  const base = map[e.recurrence];
+  if (!base) return null;
+  if (!e.recurrence_until) return base;
+  return `${base};UNTIL=${icsDay(new Date(e.recurrence_until + "T00:00:00"))}T235959Z`;
+};
+function buildIcs(rows, people) {
+  const lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//OurSpending//Shared Calendar//EN", "CALSCALE:GREGORIAN", "METHOD:PUBLISH", "X-WR-CALNAME:OurSpending"];
+  rows.forEach(e => {
+    const s = new Date(e.starts_at);
+    const en = new Date(e.ends_at);
+    lines.push("BEGIN:VEVENT");
+    lines.push(`UID:${e.id}@ourspending`);
+    lines.push(`DTSTAMP:${icsStamp(new Date())}`);
+    if (e.all_day) {
+      lines.push(`DTSTART;VALUE=DATE:${icsDay(s)}`);
+      lines.push(`DTEND;VALUE=DATE:${icsDay(addDays(en, 1))}`);
+    } else {
+      lines.push(`DTSTART:${icsStamp(s)}`);
+      lines.push(`DTEND:${icsStamp(en)}`);
+    }
+    lines.push(icsFold(`SUMMARY:${icsEscape(e.title)}`));
+    if (e.description) lines.push(icsFold(`DESCRIPTION:${icsEscape(e.description)}`));
+    if (e.location) lines.push(icsFold(`LOCATION:${icsEscape(e.location)}`));
+    const owner = e.kind === "shared" ? "Shared" : e.kind === "p0" ? people[0] : people[1];
+    lines.push(icsFold(`CATEGORIES:${icsEscape(owner)}`));
+    const rule = icsRule(e);
+    if (rule) lines.push(`RRULE:${rule}`);
+    lines.push("END:VEVENT");
+  });
+  lines.push("END:VCALENDAR");
+  return lines.join("\r\n");
+}
+
+// ---------- Calendar connections (Settings) ----------
+// Providers needing OAuth are listed but stay disabled until server-side
+// credentials exist — see supabase/CALENDAR_SETUP.md. Nothing is faked.
+const OAUTH_PROVIDERS = ["google", "apple", "outlook"];
+function CalendarSync({
+  hhId,
+  user,
+  people,
+  showToast
+}) {
+  const [conns, setConns] = useState([]);
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [info, setInfo] = useState(null);
+  const [confirmId, setConfirmId] = useState(null);
+  const load = useCallback(async () => {
+    const {
+      data,
+      error
+    } = await db.from("calendar_connections").select("*").eq("user_id", user.id);
+    if (error) {
+      setErr(error.message);
+      return;
+    }
+    setErr(null);
+    setConns(data || []);
+  }, [user.id]);
+  useEffect(() => {
+    load();
+  }, [load]);
+  const exportIcs = async () => {
+    setBusy(true);
+    setInfo(null);
+    try {
+      const {
+        data,
+        error
+      } = await db.from("calendar_events").select("*").eq("household_id", hhId).order("starts_at");
+      if (error) throw new Error(error.message);
+      if (!data || !data.length) {
+        showToast(t("ics_nothing"));
+        return;
+      }
+      const blob = new Blob([buildIcs(data, people)], {
+        type: "text/calendar;charset=utf-8"
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "ourspending.ics";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      showToast(t("ics_downloaded"));
+    } catch (e2) {
+      setErr(e2.message || String(e2));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const disconnect = async id => {
+    setConfirmId(null);
+    const {
+      error
+    } = await db.from("calendar_connections").delete().eq("id", id);
+    if (error) {
+      setErr(error.message);
+      return;
+    }
+    showToast(t("connection_removed"));
+    load();
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 20,
+      paddingTop: 16,
+      borderTop: "1px solid var(--line)"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("calendar_sync")), err && /*#__PURE__*/React.createElement("div", {
+    style: S.errBox
+  }, err), conns.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 10
+    }
+  }, conns.map(c => /*#__PURE__*/React.createElement("div", {
+    key: c.id,
+    style: S.syncRow
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1,
+      minWidth: 0
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: S.expTitle
+  }, t("provider_" + c.provider)), /*#__PURE__*/React.createElement("div", {
+    style: S.expSub
+  }, t("sync_status_" + c.sync_status), c.last_synced_at ? " · " + t("last_synced") + timeAgo(c.last_synced_at) : "")), confirmId === c.id ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 4
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.miniBtn,
+      ...S.miniDanger
+    },
+    onClick: () => disconnect(c.id)
+  }, t("disconnect")), /*#__PURE__*/React.createElement("button", {
+    style: S.miniBtn,
+    onClick: () => setConfirmId(null)
+  }, t("no"))) : /*#__PURE__*/React.createElement("button", {
+    style: S.miniBtn,
+    onClick: () => setConfirmId(c.id)
+  }, t("disconnect"))))), conns.length === 0 && /*#__PURE__*/React.createElement("div", {
+    style: S.privacyNote
+  }, t("no_connections")), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.ghostBtn,
+      marginTop: 8,
+      opacity: busy ? 0.6 : 1
+    },
+    disabled: busy,
+    onClick: exportIcs
+  }, "📅 " + t("export_ics")), /*#__PURE__*/React.createElement("div", {
+    style: S.privacyNote
+  }, t("export_ics_hint")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...S.chipRow,
+      marginTop: 10
+    }
+  }, OAUTH_PROVIDERS.map(p => /*#__PURE__*/React.createElement("button", {
+    key: p,
+    style: {
+      ...S.chip,
+      opacity: 0.65
+    },
+    onClick: () => setInfo(p)
+  }, t("provider_" + p), " · ", t("setup_required")))), info && /*#__PURE__*/React.createElement("div", {
+    style: S.okBox
+  }, t("provider_" + info), ": ", t("setup_required_hint")));
+}
+
 function Bar({
   spent,
   budget
@@ -2250,7 +3180,7 @@ const S = {
   },
   curOn: {
     background: "var(--green)",
-    color: "#fff"
+    color: "var(--on-accent)"
   },
   ratesLine: {
     display: "flex",
@@ -2349,7 +3279,7 @@ const S = {
   chipOn: {
     background: "var(--green)",
     borderColor: "var(--green)",
-    color: "#fff"
+    color: "var(--on-accent)"
   },
   dayLabel: {
     fontSize: 12,
@@ -2406,7 +3336,7 @@ const S = {
   miniDanger: {
     background: "var(--danger)",
     borderColor: "var(--danger)",
-    color: "#fff"
+    color: "var(--on-accent)"
   },
   empty: {
     textAlign: "center",
@@ -2468,15 +3398,15 @@ const S = {
   },
   segOn: {
     background: "var(--green)",
-    color: "#fff"
+    color: "var(--on-accent)"
   },
   segOnA: {
     background: "var(--blue)",
-    color: "#fff"
+    color: "var(--on-accent)"
   },
   segOnB: {
     background: "var(--ochre)",
-    color: "#fff"
+    color: "var(--on-accent)"
   },
   typeHint: {
     fontSize: 12,
@@ -2513,7 +3443,7 @@ const S = {
   },
   catOn: {
     borderColor: "var(--green)",
-    background: "#E9F2EC",
+    background: "var(--tint-green)",
     fontWeight: 700
   },
   primaryBtn: {
@@ -2523,7 +3453,7 @@ const S = {
     border: "none",
     borderRadius: 14,
     background: "var(--green-deep)",
-    color: "#fff",
+    color: "var(--on-accent)",
     fontSize: 16,
     fontWeight: 700,
     cursor: "pointer"
@@ -2601,7 +3531,7 @@ const S = {
     color: "var(--danger)",
     fontSize: 13,
     marginTop: 12,
-    background: "#FBEFE7",
+    background: "var(--tint-danger)",
     padding: "8px 10px",
     borderRadius: 10
   },
@@ -2609,17 +3539,182 @@ const S = {
     color: "var(--green)",
     fontSize: 13,
     marginTop: 12,
-    background: "#E9F2EC",
+    background: "var(--tint-green)",
     padding: "8px 10px",
     borderRadius: 10
+  },
+  calNav: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    margin: "4px 0 10px"
+  },
+  calCard: {
+    background: "var(--card)",
+    border: "1px solid var(--line)",
+    borderRadius: 14,
+    padding: 6,
+    overflow: "hidden"
+  },
+  calWeekHead: {
+    display: "flex"
+  },
+  calWeekDay: {
+    flex: 1,
+    textAlign: "center",
+    fontSize: 10,
+    fontWeight: 700,
+    color: "var(--muted)",
+    padding: "2px 0 4px",
+    minWidth: 0
+  },
+  calGrid: {
+    display: "flex",
+    flexWrap: "wrap"
+  },
+  calCell: {
+    width: "14.2857%",
+    minHeight: 62,
+    border: "none",
+    background: "transparent",
+    borderTop: "1px solid var(--line)",
+    padding: "3px 2px",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "stretch",
+    gap: 2,
+    cursor: "pointer",
+    minWidth: 0,
+    overflow: "hidden",
+    font: "inherit",
+    color: "var(--ink)"
+  },
+  calDayNum: {
+    fontSize: 11,
+    color: "var(--muted)",
+    textAlign: "left",
+    paddingLeft: 2
+  },
+  calDayNumToday: {
+    fontSize: 11,
+    fontWeight: 800,
+    color: "var(--on-accent)",
+    background: "var(--green)",
+    borderRadius: "50%",
+    width: 18,
+    height: 18,
+    lineHeight: "18px",
+    textAlign: "center",
+    alignSelf: "flex-start"
+  },
+  calChips: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 2,
+    minWidth: 0
+  },
+  calChip: {
+    fontSize: 9,
+    lineHeight: 1.3,
+    color: "var(--on-accent)",
+    borderRadius: 4,
+    padding: "1px 3px",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+    textAlign: "left"
+  },
+  calMore: {
+    fontSize: 9,
+    color: "var(--muted)",
+    paddingLeft: 2,
+    textAlign: "left"
+  },
+  calRow: {
+    display: "flex",
+    alignItems: "stretch",
+    gap: 10,
+    width: "100%",
+    background: "var(--card)",
+    border: "1px solid var(--line)",
+    borderRadius: 12,
+    padding: 10,
+    marginBottom: 6,
+    cursor: "pointer",
+    font: "inherit",
+    color: "var(--ink)",
+    textAlign: "left"
+  },
+  calRowBar: {
+    width: 4,
+    borderRadius: 3,
+    flexShrink: 0
+  },
+  calRowTitle: {
+    display: "block",
+    fontSize: 15,
+    fontWeight: 600,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap"
+  },
+  calRowSub: {
+    display: "block",
+    fontSize: 12,
+    color: "var(--muted)",
+    marginTop: 2
+  },
+  modalWrap: {
+    position: "fixed",
+    inset: 0,
+    background: "var(--overlay)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 16,
+    zIndex: 50
+  },
+  modalCard: {
+    background: "var(--elevated)",
+    border: "1px solid var(--line)",
+    borderRadius: 18,
+    padding: 20,
+    width: "100%",
+    maxWidth: 440,
+    maxHeight: "88vh",
+    overflowY: "auto",
+    boxShadow: "var(--shadow-modal)"
+  },
+  modalMeta: {
+    fontSize: 13,
+    color: "var(--muted)",
+    marginTop: 6
+  },
+  switchRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    marginTop: 12,
+    fontSize: 14,
+    cursor: "pointer"
+  },
+  syncRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    background: "var(--card)",
+    border: "1px solid var(--line)",
+    borderRadius: 12,
+    padding: 10,
+    marginBottom: 6
   },
   toast: {
     position: "fixed",
     bottom: 92,
     left: "50%",
     transform: "translateX(-50%)",
-    background: "var(--ink)",
-    color: "#fff",
+    background: "var(--toast-bg)",
+    color: "var(--toast-ink)",
     padding: "10px 16px",
     borderRadius: 12,
     fontSize: 13,
@@ -2663,7 +3758,7 @@ const S = {
     fontSize: 20,
     lineHeight: 1,
     background: "var(--green-deep)",
-    color: "#fff",
+    color: "var(--on-accent)",
     width: 34,
     height: 34,
     borderRadius: 12,
