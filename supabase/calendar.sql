@@ -24,9 +24,12 @@ create table if not exists public.calendar_events (
   -- who the event belongs to; drives the colour coding in the UI
   kind text not null default 'shared' check (kind in ('shared', 'p0', 'p1')),
 
-  -- lightweight recurrence (expanded client-side over the visible range)
+  -- lightweight recurrence (expanded client-side over the visible range).
+  -- "weekday" = Monday-Friday only (conceptually BYDAY=MO,TU,WE,TH,FR) -
+  -- see expandEvents() in app.js, which is where Saturday/Sunday are
+  -- actually excluded, and icsRule() for the .ics export mapping.
   recurrence text not null default 'none'
-    check (recurrence in ('none', 'daily', 'weekly', 'biweekly', 'monthly', 'yearly')),
+    check (recurrence in ('none', 'daily', 'weekday', 'weekly', 'biweekly', 'monthly', 'yearly')),
   recurrence_until date,
 
   -- external calendar sync scaffolding (null for locally created events)
