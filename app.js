@@ -819,6 +819,14 @@ function Dashboard({
     loadAll();
   };
   const saveColor = async (who, hex) => {
+    // Apply locally first so the swatch (and every screen using it) updates
+    // the instant you click, instead of waiting on a round trip.
+    if (who === "shared") {
+      setHousehold(h => h ? { ...h, shared_color: hex } : h);
+    } else {
+      const slot = who === "p0" ? 0 : 1;
+      setMembers(ms => ms.map(m => m.slot === slot ? { ...m, color: hex } : m));
+    }
     if (who === "shared") {
       await db.from("households").update({
         shared_color: hex
