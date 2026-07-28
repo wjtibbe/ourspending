@@ -636,7 +636,8 @@ function Dashboard({
     }, {
       data: bud
     }, {
-      data: mem
+      data: mem,
+      error: memErr
     }] = await Promise.all([db.from("households").select("*").eq("id", hhId).single(), db.from("expenses").select("*").eq("household_id", hhId).order("spent_on", {
       ascending: false
     }), db.from("budgets").select("*").eq("household_id", hhId), db.from("profiles").select("id, display_name, slot, color").eq("household_id", hhId)]);
@@ -648,6 +649,7 @@ function Dashboard({
       setBudgets(b);
     }
     if (mem) setMembers(mem);
+    else if (memErr) showToast(t("load_failed") + memErr.message);
   }, [hhId]);
   useEffect(() => {
     loadAll();
@@ -827,18 +829,23 @@ function Dashboard({
       const slot = who === "p0" ? 0 : 1;
       setMembers(ms => ms.map(m => m.slot === slot ? { ...m, color: hex } : m));
     }
+    let error;
     if (who === "shared") {
-      await db.from("households").update({
+      ({ error } = await db.from("households").update({
         shared_color: hex
-      }).eq("id", hhId);
+      }).eq("id", hhId));
     } else {
       const slot = who === "p0" ? 0 : 1;
       const member = members.find(m => m.slot === slot);
-      if (member) await db.from("profiles").update({
+      if (member) ({ error } = await db.from("profiles").update({
         color: hex
-      }).eq("id", member.id);
+      }).eq("id", member.id));
     }
-    showToast(t("color_saved"));
+    if (error) {
+      showToast(t("save_failed") + error.message);
+    } else {
+      showToast(t("color_saved"));
+    }
     loadAll();
   };
   if (!household) return /*#__PURE__*/React.createElement("div", {
