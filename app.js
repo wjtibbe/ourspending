@@ -6,6 +6,18 @@ const {
   useCallback,
   useRef
 } = React;
+// Shared pure logic (calendar recurrence, colors, nav layout) - lib.js,
+// loaded before this file (see index.html) so it stays independently
+// testable (test.js) without dragging React/Supabase into a Node test run.
+const {
+  RECURRENCE_OPTIONS,
+  recurrenceLabel,
+  colorForKind,
+  eventOccursOn,
+  COLOR_PALETTE,
+  resolveColors,
+  NAV_GRID_TEMPLATE_COLUMNS
+} = window.OSLib;
 
 // ============================================================
 //  CONFIG — your Supabase project
@@ -508,6 +520,8 @@ function Dashboard({
   const [expenses, setExpenses] = useState([]);
   const [budgets, setBudgets] = useState({});
   const [members, setMembers] = useState([]);
+  const [events, setEvents] = useState([]);
+  const [editingEvent, setEditingEvent] = useState(null);
   const [tab, setTab] = useState("overview");
   const [displayCur, setDisplayCur] = useState("COP");
   const [month, setMonth] = useState(() => {
@@ -545,6 +559,10 @@ function Dashboard({
   members.forEach(m => {
     if (m.slot === 0 || m.slot === 1) people[m.slot] = m.display_name;
   });
+  // Configured person/shared colors (Part 2) - falls back to the app's
+  // original defaults for any household/member that hasn't set one yet
+  // (or if the color columns from the migration don't exist yet).
+  const colors = resolveColors(household, members);
   const loadAll = useCallback(async () => {
     const [{
       data: hh
@@ -554,9 +572,15 @@ function Dashboard({
       data: bud
     }, {
       data: mem
+    }, {
+      data: evt
     }] = await Promise.all([db.from("households").select("*").eq("id", hhId).single(), db.from("expenses").select("*").eq("household_id", hhId).order("spent_on", {
       ascending: false
-    }), db.from("budgets").select("*").eq("household_id", hhId), db.from("profiles").select("display_name, slot").eq("household_id", hhId)]);
+    }), db.from("budgets").select("*").eq("household_id", hhId), db.from("profiles").select("id, display_name, slot, color").eq("household_id", hhId),
+    // Tolerates the `events` table not existing yet (before the Part 1
+    // migration is run) - `evt` just stays undefined and the calendar
+    // renders empty, same as every other query here already degrades on error.
+    db.from("events").select("*").eq("household_id", hhId).order("event_date")]);
     if (hh) setHousehold(hh);
     if (exp) setExpenses(exp);
     if (bud) {
@@ -565,6 +589,7 @@ function Dashboard({
       setBudgets(b);
     }
     if (mem) setMembers(mem);
+    if (evt) setEvents(evt);
   }, [hhId]);
   useEffect(() => {
     loadAll();
@@ -587,6 +612,16 @@ function Dashboard({
       schema: "public",
       table: "households",
       filter: `id=eq.${hhId}`
+    }, loadAll).on("postgres_changes", {
+      event: "*",
+      schema: "public",
+      table: "events",
+      filter: `household_id=eq.${hhId}`
+    }, loadAll).on("postgres_changes", {
+      event: "*",
+      schema: "public",
+      table: "profiles",
+      filter: `household_id=eq.${hhId}`
     }, loadAll).subscribe();
     return () => db.removeChannel(ch);
   }, [hhId, loadAll]);
@@ -730,6 +765,74 @@ function Dashboard({
     showToast("Rate source saved");
     loadAll();
   };
+  // Persists a chosen color (Part 2). "shared" lives on the household row;
+  // "p0"/"p1" live on that member's own profile row - editing a partner's
+  // color from Settings updates THEIR profile row directly (by slot), not
+  // just the current user's own, since Settings shows both identities.
+  const saveColor = async (who, hex) => {
+    if (who === "shared") {
+      await db.from("households").update({
+        shared_color: hex
+      }).eq("id", hhId);
+    } else {
+      const slot = who === "p0" ? 0 : 1;
+      const member = members.find(m => m.slot === slot);
+      if (!member) return;
+      await db.from("profiles").update({
+        color: hex
+      }).eq("id", member.id);
+    }
+    showToast("Color saved");
+    loadAll();
+  };
+  // ---------- Calendar events (Part 1) ----------
+  const addEvent = async ev => {
+    const {
+      error
+    } = await db.from("events").insert({
+      household_id: hhId,
+      title: ev.title,
+      event_date: ev.eventDate,
+      recurrence: ev.recurrence,
+      kind: ev.kind,
+      note: ev.note || null,
+      created_by: user.id
+    });
+    if (error) {
+      showToast("Save failed: " + error.message);
+      return;
+    }
+    showToast("Event saved");
+    setEditingEvent(null);
+    loadAll();
+  };
+  const updateEvent = async (id, ev) => {
+    const {
+      error
+    } = await db.from("events").update({
+      title: ev.title,
+      event_date: ev.eventDate,
+      recurrence: ev.recurrence,
+      kind: ev.kind,
+      note: ev.note || null
+    }).eq("id", id);
+    if (error) {
+      showToast("Save failed: " + error.message);
+      return;
+    }
+    showToast("Event updated");
+    setEditingEvent(null);
+    loadAll();
+  };
+  const deleteEvent = async id => {
+    // Whole-series delete: recurring occurrences are computed from this one
+    // row (see generateOccurrencesInRange), so deleting it removes the
+    // entire series, not a single occurrence - this app does not yet
+    // support detaching/editing a single occurrence of a series.
+    await db.from("events").delete().eq("id", id);
+    setEditingEvent(null);
+    loadAll();
+  };
   if (!household) return /*#__PURE__*/React.createElement("div", {
     style: {
       padding: 60,
@@ -788,6 +891,7 @@ function Dashboard({
     }
   }, tab === "overview" && /*#__PURE__*/React.createElement(Overview, {
     people: people,
+    colors: colors,
     month: month,
     setMonth: setMonth,
     rangeMode: rangeMode,
@@ -802,6 +906,19 @@ function Dashboard({
       setEditingExpense(exp);
       setTab("add");
     }
+  }), tab === "calendar" && /*#__PURE__*/React.createElement(Calendar, {
+    people: people,
+    colors: colors,
+    month: month,
+    setMonth: setMonth,
+    events: events,
+    editingEvent: editingEvent,
+    onStartCreate: () => setEditingEvent({}),
+    onStartEdit: ev => setEditingEvent(ev),
+    onCancelEdit: () => setEditingEvent(null),
+    onAdd: addEvent,
+    onUpdate: updateEvent,
+    onDelete: deleteEvent
   }), tab === "add" && /*#__PURE__*/React.createElement(AddExpense, {
     key: editingExpense ? editingExpense.id : "new",
     editingExpense: editingExpense,
@@ -811,6 +928,7 @@ function Dashboard({
       setTab("overview");
     },
     people: people,
+    colors: colors,
     rates: rates,
     saving: false,
     onAdd: addExpense,
@@ -818,15 +936,21 @@ function Dashboard({
     onUpdateRates: () => updateRates(false)
   }), tab === "budgets" && /*#__PURE__*/React.createElement(Budgets, {
     people: people,
-    profile: profile,
-    household: household,
     month: month,
     monthExpenses: monthExpenses,
     budgets: budgets,
     rates: rates,
     disp: disp,
     displayCur: displayCur,
-    onSaveBudgets: saveBudgets,
+    onSaveBudgets: saveBudgets
+  }), tab === "settings" && /*#__PURE__*/React.createElement(Settings, {
+    people: people,
+    members: members,
+    colors: colors,
+    onSaveColor: saveColor,
+    profile: profile,
+    household: household,
+    rates: rates,
     onSaveName: saveMyName,
     onSaveRates: saveRates,
     onSaveSource: saveSource,
@@ -845,6 +969,11 @@ function Dashboard({
     icon: "📒",
     label: "Overview"
   }), /*#__PURE__*/React.createElement(TabBtn, {
+    active: tab === "calendar",
+    onClick: () => setTab("calendar"),
+    icon: "📅",
+    label: "Calendar"
+  }), /*#__PURE__*/React.createElement(TabBtn, {
     active: tab === "add",
     onClick: () => {
       setEditingExpense(null);
@@ -858,6 +987,11 @@ function Dashboard({
     onClick: () => setTab("budgets"),
     icon: "🎯",
     label: "Budgets"
+  }), /*#__PURE__*/React.createElement(TabBtn, {
+    active: tab === "settings",
+    onClick: () => setTab("settings"),
+    icon: "⚙️",
+    label: "Settings"
   })));
 }
 function TabBtn({
@@ -872,16 +1006,17 @@ function TabBtn({
       ...S.tabBtn,
       ...(active ? S.tabActive : {})
     },
-    onClick: onClick
+    onClick: onClick,
+    "aria-current": active ? "page" : undefined,
+    "aria-label": label
   }, /*#__PURE__*/React.createElement("span", {
-    style: big ? S.tabIconBig : S.tabIcon
+    style: big ? S.tabIconBig : S.tabIcon,
+    "aria-hidden": "true"
   }, icon), /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 11
-    }
+    style: S.tabLabel
   }, label));
 }
-const kindDot = e => e.kind === "shared" ? "var(--green)" : e.kind === "p0" ? "var(--blue)" : "var(--ochre)";
+const kindDot = (e, colors) => colorForKind(e.kind, colors);
 const kindText = (e, people) => e.kind === "shared" ? `Shared · paid by ${people[e.payer]}` : e.kind === "p0" ? `${people[0]} · private` : `${people[1]} · private`;
 const initialsOf = name => (name || "").trim().split(/[\s-]+/).filter(Boolean).map(w => w[0]).join("").slice(0, 2).toUpperCase();
 const kindInitials = (e, people) => initialsOf(e.kind === "shared" ? people[e.payer] : e.kind === "p0" ? people[0] : people[1]);
@@ -889,6 +1024,7 @@ const kindInitials = (e, people) => initialsOf(e.kind === "shared" ? people[e.pa
 // ---------- Overview ----------
 function Overview({
   people,
+  colors,
   month,
   setMonth,
   rangeMode,
@@ -1014,19 +1150,19 @@ function Overview({
   }, /*#__PURE__*/React.createElement("div", {
     style: {
       height: "100%",
-      background: "var(--green)",
+      background: colors.shared,
       width: pct(sharedTotal) + "%"
     }
   }), /*#__PURE__*/React.createElement("div", {
     style: {
       height: "100%",
-      background: "var(--blue)",
+      background: colors.p0,
       width: pct(priv[0]) + "%"
     }
   }), /*#__PURE__*/React.createElement("div", {
     style: {
       height: "100%",
-      background: "var(--ochre)",
+      background: colors.p1,
       width: pct(priv[1]) + "%"
     }
   })), /*#__PURE__*/React.createElement("div", {
@@ -1034,17 +1170,17 @@ function Overview({
   }, /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("i", {
     style: {
       ...S.dot,
-      background: "var(--green)"
+      background: colors.shared
     }
   }), "Shared ", disp(sharedTotal)), /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("i", {
     style: {
       ...S.dot,
-      background: "var(--blue)"
+      background: colors.p0
     }
   }), people[0], " ", disp(priv[0])), /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("i", {
     style: {
       ...S.dot,
-      background: "var(--ochre)"
+      background: colors.p1
     }
   }), people[1], " ", disp(priv[1]))), sharedTotal > 0 && /*#__PURE__*/React.createElement("div", {
     style: S.sharedPaid
@@ -1146,7 +1282,7 @@ function Overview({
         width: 18,
         height: 18,
         borderRadius: "50%",
-        background: kindDot(e),
+        background: kindDot(e, colors),
         color: "#fff",
         fontSize: 9,
         fontWeight: 700,
@@ -1156,7 +1292,7 @@ function Overview({
       style: {
         fontSize: 12,
         fontWeight: 600,
-        color: kindDot(e)
+        color: kindDot(e, colors)
       }
     }, kindText(e, people)))), /*#__PURE__*/React.createElement("div", {
       style: {
@@ -1204,6 +1340,7 @@ function Overview({
 // ---------- Add expense ----------
 function AddExpense({
   people,
+  colors,
   rates,
   onAdd,
   saving,
@@ -1284,19 +1421,28 @@ function AddExpense({
   }, /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.segBtn,
-      ...(kind === "shared" ? S.segOn : {})
+      ...(kind === "shared" ? {
+        background: colors.shared,
+        color: "#fff"
+      } : {})
     },
     onClick: () => setKind("shared")
   }, "Shared"), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.segBtn,
-      ...(kind === "p0" ? S.segOnA : {})
+      ...(kind === "p0" ? {
+        background: colors.p0,
+        color: "#fff"
+      } : {})
     },
     onClick: () => setKind("p0")
   }, people[0]), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.segBtn,
-      ...(kind === "p1" ? S.segOnB : {})
+      ...(kind === "p1" ? {
+        background: colors.p1,
+        color: "#fff"
+      } : {})
     },
     onClick: () => setKind("p1")
   }, people[1])), /*#__PURE__*/React.createElement("div", {
@@ -1309,7 +1455,10 @@ function AddExpense({
     key: i,
     style: {
       ...S.segBtn,
-      ...(payer === i ? i === 0 ? S.segOnA : S.segOnB : {})
+      ...(payer === i ? {
+        background: i === 0 ? colors.p0 : colors.p1,
+        color: "#fff"
+      } : {})
     },
     onClick: () => setPayer(i)
   }, p)))), /*#__PURE__*/React.createElement("div", {
@@ -1360,23 +1509,271 @@ function AddExpense({
   }, "Cancel"));
 }
 
-// ---------- Budgets & settings ----------
+// ---------- Calendar (Part 1: events + recurrence, incl. "Every weekday") ----------
+function Calendar({
+  people,
+  colors,
+  month,
+  setMonth,
+  events,
+  editingEvent,
+  onStartCreate,
+  onStartEdit,
+  onCancelEdit,
+  onAdd,
+  onUpdate,
+  onDelete
+}) {
+  const [selectedDay, setSelectedDay] = useState(null);
+  const shift = d => {
+    let m = month.m + d,
+      y = month.y;
+    if (m < 0) {
+      m = 11;
+      y--;
+    }
+    if (m > 11) {
+      m = 0;
+      y++;
+    }
+    setMonth({
+      y,
+      m
+    });
+  };
+  const pad = n => String(n).padStart(2, "0");
+  const dstr = (y, m, d) => `${y}-${pad(m + 1)}-${pad(d)}`;
+  const daysInMonth = new Date(month.y, month.m + 1, 0).getDate();
+  const firstDow = new Date(month.y, month.m, 1).getDay(); // 0=Sun..6=Sat
+  const leading = (firstDow + 6) % 7; // Monday-first blank count
+  const cells = [];
+  for (let i = 0; i < leading; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) cells.push(dstr(month.y, month.m, d));
+  const today = todayStr();
+  const eventsOn = dateStr => events.filter(e => eventOccursOn(e, dateStr));
+  const dayEvents = selectedDay ? eventsOn(selectedDay) : [];
+  return React.createElement("div", null, React.createElement("div", {
+    style: S.calNav
+  }, React.createElement("button", {
+    style: S.iconBtn,
+    onClick: () => shift(-1)
+  }, "‹"), React.createElement("div", {
+    style: {
+      fontWeight: 600,
+      fontSize: 16
+    }
+  }, MONTH_NAMES[month.m], " ", month.y), React.createElement("button", {
+    style: S.iconBtn,
+    onClick: () => shift(1)
+  }, "›")), !editingEvent && React.createElement("button", {
+    style: S.ghostBtn,
+    onClick: () => onStartCreate()
+  }, "+ New event"), editingEvent && React.createElement(EventForm, {
+    event: editingEvent,
+    people: people,
+    colors: colors,
+    defaultDate: selectedDay || today,
+    onCancel: onCancelEdit,
+    onSave: ev => editingEvent.id ? onUpdate(editingEvent.id, ev) : onAdd(ev),
+    onDelete: editingEvent.id ? () => onDelete(editingEvent.id) : null
+  }), React.createElement("div", {
+    style: S.calGrid
+  }, ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map(w => React.createElement("div", {
+    key: w,
+    style: S.calWeekday
+  }, w)), cells.map((dateStr, i) => {
+    if (!dateStr) return React.createElement("div", {
+      key: "b" + i
+    });
+    const dayNum = Number(dateStr.slice(-2));
+    const occ = eventsOn(dateStr);
+    const isToday = dateStr === today;
+    const isSelected = dateStr === selectedDay;
+    return React.createElement("button", {
+      key: dateStr,
+      style: {
+        ...S.calCell,
+        ...(isToday ? S.calCellToday : {}),
+        ...(isSelected ? S.calCellSelected : {})
+      },
+      onClick: () => setSelectedDay(isSelected ? null : dateStr)
+    }, React.createElement("span", null, dayNum), React.createElement("div", {
+      style: S.calDots
+    }, occ.slice(0, 4).map((e, idx) => React.createElement("i", {
+      key: e.id + "-" + idx,
+      style: {
+        ...S.calDot,
+        background: isSelected ? "#fff" : colorForKind(e.kind, colors)
+      }
+    }))));
+  })), selectedDay && React.createElement("div", null, React.createElement("div", {
+    style: S.dayLabel
+  }, "Events on ", selectedDay), dayEvents.length === 0 && React.createElement("div", {
+    style: S.empty
+  }, "No events this day."), dayEvents.map(e => React.createElement("div", {
+    key: e.id,
+    style: S.calEventRow
+  }, React.createElement("i", {
+    style: {
+      ...S.dot,
+      background: colorForKind(e.kind, colors)
+    }
+  }), React.createElement("div", {
+    style: {
+      flex: 1,
+      minWidth: 0
+    }
+  }, React.createElement("div", {
+    style: S.expTitle
+  }, e.title), React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "var(--muted)"
+    }
+  }, recurrenceLabel(e.recurrence))), React.createElement("button", {
+    style: S.miniBtn,
+    onClick: () => onStartEdit(e)
+  }, "Edit")))));
+}
+
+/**
+ * Create/edit form for one event (whole series - see the module doc on
+ * `deleteEvent` for why this app doesn't yet support detaching a single
+ * occurrence). Mirrors AddExpense's create/edit-in-one-component pattern:
+ * `event.id` present means edit, absent means create.
+ */
+function EventForm({
+  event,
+  people,
+  colors,
+  defaultDate,
+  onCancel,
+  onSave,
+  onDelete
+}) {
+  const [title, setTitle] = useState(event.title || "");
+  const [eventDate, setEventDate] = useState(event.event_date || defaultDate);
+  const [recurrence, setRecurrence] = useState(event.recurrence || "none");
+  const [kind, setKind] = useState(event.kind || "shared");
+  const [err, setErr] = useState(null);
+  const submit = () => {
+    if (!title.trim()) return setErr("Enter a title.");
+    if (!eventDate) return setErr("Pick a date.");
+    setErr(null);
+    onSave({
+      title: title.trim(),
+      eventDate,
+      recurrence,
+      kind
+    });
+  };
+  return React.createElement("div", {
+    style: {
+      ...S.hero,
+      padding: 14,
+      marginBottom: 14
+    }
+  }, React.createElement("div", {
+    style: S.fieldLabel
+  }, "Title"), React.createElement("input", {
+    style: S.input,
+    value: title,
+    maxLength: 60,
+    placeholder: "e.g. Gym, Rent due…",
+    onChange: e => setTitle(e.target.value)
+  }), React.createElement("div", {
+    style: S.fieldLabel
+  }, "Date"), React.createElement("input", {
+    type: "date",
+    style: S.input,
+    value: eventDate,
+    onChange: e => setEventDate(e.target.value)
+  }), React.createElement("div", {
+    style: S.fieldLabel
+  }, "Repeat"), React.createElement("div", {
+    style: S.chipRow
+  }, RECURRENCE_OPTIONS.map(opt => React.createElement("button", {
+    key: opt.id,
+    style: {
+      ...S.chip,
+      ...(recurrence === opt.id ? S.chipOn : {})
+    },
+    onClick: () => setRecurrence(opt.id)
+  }, opt.label))), React.createElement("div", {
+    style: S.fieldLabel
+  }, "For"), React.createElement("div", {
+    style: S.segWide
+  }, React.createElement("button", {
+    style: {
+      ...S.segBtn,
+      ...(kind === "shared" ? {
+        background: colors.shared,
+        color: "#fff"
+      } : {})
+    },
+    onClick: () => setKind("shared")
+  }, "Shared"), React.createElement("button", {
+    style: {
+      ...S.segBtn,
+      ...(kind === "p0" ? {
+        background: colors.p0,
+        color: "#fff"
+      } : {})
+    },
+    onClick: () => setKind("p0")
+  }, people[0]), React.createElement("button", {
+    style: {
+      ...S.segBtn,
+      ...(kind === "p1" ? {
+        background: colors.p1,
+        color: "#fff"
+      } : {})
+    },
+    onClick: () => setKind("p1")
+  }, people[1])), err && React.createElement("div", {
+    style: S.errBox
+  }, err), React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      marginTop: 14
+    }
+  }, React.createElement("button", {
+    style: {
+      ...S.primaryBtn,
+      marginTop: 0,
+      flex: 1,
+      width: "auto"
+    },
+    onClick: submit
+  }, event.id ? "Save changes" : "Save event"), React.createElement("button", {
+    style: {
+      ...S.ghostBtn,
+      marginTop: 0,
+      flex: 1,
+      width: "auto"
+    },
+    onClick: onCancel
+  }, "Cancel")), onDelete && React.createElement("button", {
+    style: {
+      ...S.ghostBtn,
+      color: "var(--danger)",
+      borderColor: "var(--danger)"
+    },
+    onClick: onDelete
+  }, "Delete event"));
+}
+
+// ---------- Budgets ----------
 function Budgets({
   people,
-  profile,
-  household,
   month,
   monthExpenses,
   budgets,
   rates,
   disp,
   displayCur,
-  onSaveBudgets,
-  onSaveName,
-  onSaveRates,
-  onSaveSource,
-  onImportExpenses,
-  onSignOut
+  onSaveBudgets
 }) {
   const [draft, setDraft] = useState(() => {
     const d = {};
@@ -1384,15 +1781,6 @@ function Budgets({
     return d;
   });
   const [editing, setEditing] = useState(false);
-  const [myName, setMyName] = useState(profile.display_name);
-  const [editName, setEditName] = useState(false);
-  const [rateDraft, setRateDraft] = useState({
-    usd: String(rates.usdPerEur),
-    cop: String(rates.copPerEur)
-  });
-  const [editRates, setEditRates] = useState(false);
-  const [sourceDraft, setSourceDraft] = useState(household.rate_source || "wise.com");
-  const [editSource, setEditSource] = useState(false);
   const spentByCat = {};
   monthExpenses.forEach(e => {
     spentByCat[e.category] = (spentByCat[e.category] || 0) + Number(e.amount_eur);
@@ -1407,16 +1795,6 @@ function Budgets({
     });
     onSaveBudgets(b);
     setEditing(false);
-  };
-  const saveR = () => {
-    const usd = parseFloat(String(rateDraft.usd).replace(",", "."));
-    const cop = parseFloat(String(rateDraft.cop).replace(",", "."));
-    if (!(usd > 0) || !(cop > 0)) return;
-    onSaveRates({
-      usdPerEur: usd,
-      copPerEur: cop
-    });
-    setEditRates(false);
   };
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", {
     style: S.pageTitle
@@ -1503,12 +1881,100 @@ function Budgets({
   }, "Cancel")) : /*#__PURE__*/React.createElement("button", {
     style: S.ghostBtn,
     onClick: () => setEditing(true)
-  }, "Edit budgets (in EUR)"), /*#__PURE__*/React.createElement("h2", {
-    style: {
-      ...S.pageTitle,
-      marginTop: 28
-    }
+  }, "Edit budgets (in EUR)"));
+}
+
+// ---------- Settings (incl. colors) ----------
+function Settings({
+  people,
+  members,
+  colors,
+  onSaveColor,
+  profile,
+  household,
+  rates,
+  onSaveName,
+  onSaveRates,
+  onSaveSource,
+  onImportExpenses,
+  onSignOut
+}) {
+  const [myName, setMyName] = useState(profile.display_name);
+  const [editName, setEditName] = useState(false);
+  const [rateDraft, setRateDraft] = useState({
+    usd: String(rates.usdPerEur),
+    cop: String(rates.copPerEur)
+  });
+  const [editRates, setEditRates] = useState(false);
+  const [sourceDraft, setSourceDraft] = useState(household.rate_source || "wise.com");
+  const [editSource, setEditSource] = useState(false);
+  const [pickerFor, setPickerFor] = useState(null); // "shared" | "p0" | "p1" | null
+  const saveR = () => {
+    const usd = parseFloat(String(rateDraft.usd).replace(",", "."));
+    const cop = parseFloat(String(rateDraft.cop).replace(",", "."));
+    if (!(usd > 0) || !(cop > 0)) return;
+    onSaveRates({
+      usdPerEur: usd,
+      copPerEur: cop
+    });
+    setEditRates(false);
+  };
+  const identities = [{
+    key: "shared",
+    label: "Shared"
+  }, {
+    key: "p0",
+    label: people[0]
+  }, {
+    key: "p1",
+    label: people[1]
+  }];
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", {
+    style: S.pageTitle
   }, "Settings"), /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, "Colors"), /*#__PURE__*/React.createElement("div", {
+    style: S.colorPreviewRow
+  }, identities.map(id => /*#__PURE__*/React.createElement("span", {
+    key: id.key,
+    style: S.colorPreviewItem
+  }, /*#__PURE__*/React.createElement("i", {
+    style: {
+      ...S.dot,
+      width: 12,
+      height: 12,
+      background: colors[id.key]
+    }
+  }), id.label))), identities.map(id => /*#__PURE__*/React.createElement("div", {
+    key: id.key,
+    style: S.colorRow
+  }, /*#__PURE__*/React.createElement("span", {
+    style: S.colorRowLabel
+  }, /*#__PURE__*/React.createElement("i", {
+    style: {
+      ...S.dot,
+      width: 12,
+      height: 12,
+      background: colors[id.key]
+    }
+  }), id.label), /*#__PURE__*/React.createElement("button", {
+    style: S.miniBtn,
+    onClick: () => setPickerFor(pickerFor === id.key ? null : id.key)
+  }, pickerFor === id.key ? "Close" : "Change"))), pickerFor && /*#__PURE__*/React.createElement("div", {
+    style: S.colorPalette
+  }, COLOR_PALETTE.map(hex => /*#__PURE__*/React.createElement("button", {
+    key: hex,
+    "aria-label": "Use color " + hex,
+    style: {
+      ...S.colorSwatch,
+      background: hex,
+      ...(colors[pickerFor] === hex ? S.colorSwatchOn : {})
+    },
+    onClick: () => {
+      onSaveColor(pickerFor, hex);
+      setPickerFor(null);
+    }
+  }))), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
   }, "Your name"), editName ? /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("input", {
     style: S.input,
@@ -2231,6 +2697,118 @@ const S = {
     fontSize: 14,
     flexWrap: "wrap"
   },
+  colorPreviewRow: {
+    display: "flex",
+    gap: 14,
+    flexWrap: "wrap",
+    fontSize: 13,
+    fontWeight: 600,
+    margin: "2px 0 12px"
+  },
+  colorPreviewItem: {
+    display: "flex",
+    alignItems: "center"
+  },
+  colorRow: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    background: "var(--card)",
+    border: "1px solid var(--line)",
+    borderRadius: 12,
+    padding: "10px 12px",
+    marginBottom: 6,
+    fontSize: 14
+  },
+  colorRowLabel: {
+    display: "flex",
+    alignItems: "center",
+    fontWeight: 600
+  },
+  colorPalette: {
+    display: "grid",
+    gridTemplateColumns: "repeat(6, 1fr)",
+    gap: 8,
+    background: "var(--bg)",
+    border: "1px solid var(--line)",
+    borderRadius: 12,
+    padding: 10,
+    marginBottom: 10
+  },
+  colorSwatch: {
+    width: 30,
+    height: 30,
+    borderRadius: "50%",
+    border: "2px solid transparent",
+    cursor: "pointer",
+    padding: 0
+  },
+  colorSwatchOn: {
+    borderColor: "var(--ink)",
+    boxShadow: "0 0 0 2px var(--card)"
+  },
+  calNav: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    margin: "4px 0 12px"
+  },
+  calGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(7, 1fr)",
+    gap: 4,
+    marginBottom: 14
+  },
+  calWeekday: {
+    textAlign: "center",
+    fontSize: 11,
+    color: "var(--muted)",
+    fontWeight: 600
+  },
+  calCell: {
+    aspectRatio: "1",
+    border: "1px solid var(--line)",
+    background: "var(--card)",
+    borderRadius: 10,
+    padding: "4px 2px",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: 2,
+    cursor: "pointer",
+    fontSize: 12,
+    color: "var(--ink)"
+  },
+  calCellToday: {
+    borderColor: "var(--green)",
+    borderWidth: 2
+  },
+  calCellSelected: {
+    background: "var(--green)",
+    color: "#fff"
+  },
+  calDots: {
+    display: "flex",
+    gap: 2,
+    flexWrap: "wrap",
+    justifyContent: "center",
+    minHeight: 6
+  },
+  calDot: {
+    width: 5,
+    height: 5,
+    borderRadius: "50%"
+  },
+  calEventRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    background: "var(--card)",
+    border: "1px solid var(--line)",
+    borderRadius: 14,
+    padding: "10px 12px",
+    marginBottom: 6
+  },
   rateEditRow: {
     display: "flex",
     alignItems: "center",
@@ -2281,13 +2859,21 @@ const S = {
     right: 0,
     maxWidth: 480,
     margin: "0 auto",
-    display: "flex",
+    // A true 5-position grid (2 destinations | + | 2 destinations) - see
+    // NAV_GRID_TEMPLATE_COLUMNS in lib.js for why every side column uses
+    // minmax(0,1fr) rather than a bare 1fr: it keeps all four side columns
+    // EXACTLY equal width (so the center "+" stays truly centered) even when
+    // one label is longer than the others, instead of a fragile
+    // margin-based approximation.
+    display: "grid",
+    gridTemplateColumns: NAV_GRID_TEMPLATE_COLUMNS,
+    alignItems: "center",
     background: "var(--card)",
     borderTop: "1px solid var(--line)",
     padding: "6px 8px calc(8px + env(safe-area-inset-bottom))"
   },
   tabBtn: {
-    flex: 1,
+    minWidth: 0,
     border: "none",
     background: "none",
     cursor: "pointer",
@@ -2307,17 +2893,28 @@ const S = {
     fontSize: 20,
     lineHeight: 1
   },
+  tabLabel: {
+    fontSize: 11,
+    maxWidth: "100%",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap"
+  },
+  // Slightly more prominent than a regular tab (its own filled, rounder
+  // icon) without being oversized - the + keeps doing exactly what it did
+  // before, just now laid out as the true center grid column.
   tabIconBig: {
-    fontSize: 20,
+    fontSize: 22,
     lineHeight: 1,
     background: "var(--green-deep)",
     color: "#fff",
-    width: 34,
-    height: 34,
-    borderRadius: 12,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
     display: "flex",
     alignItems: "center",
-    justifyContent: "center"
+    justifyContent: "center",
+    boxShadow: "0 2px 8px rgba(20,80,58,0.35)"
   }
 };
 ReactDOM.createRoot(document.getElementById("root")).render(/*#__PURE__*/React.createElement(App, null));
