@@ -6,6 +6,7 @@
 -- household with no category rows behaves exactly as before (all built-ins on).
 --
 -- Run once: Supabase dashboard -> SQL Editor -> New query -> paste -> Run.
+-- Then run supabase/verify_rls.sql, which proves the guarantees below.
 
 -- ============================================================
 --  1. Per-user preferences on profiles
@@ -30,29 +31,69 @@ alter table public.households
   add column if not exists shared_color text;
 
 -- ============================================================
---  2. One household per user, one member per slot
+--  2. Household membership is assigned ONLY by trusted functions
 -- ============================================================
--- profiles.household_id is single-valued, so a user is structurally incapable
--- of belonging to two households. What we still need to block is silently
--- hopping from one household to another.
-create or replace function public.enforce_single_household()
-returns trigger language plpgsql as $$
+-- Membership (household_id + slot) decides which household's data you can
+-- read, so it must never be writable through an ordinary profile update or
+-- insert. Two independent layers enforce that:
+--
+--   Layer 1 (privileges) — column-level GRANTs below mean the `authenticated`
+--   role simply has no UPDATE/INSERT right on household_id or slot. This is
+--   checked before RLS and cannot be re-opened by a policy mistake.
+--
+--   Layer 2 (trigger) — the guard below refuses any change to household_id or
+--   slot unless a transaction-local flag is set, and only create_household()
+--   and join_household() set it. This still holds if a future migration
+--   re-grants the columns by accident.
+--
+-- SECURITY DEFINER functions run as the function owner (postgres), which keeps
+-- full column privileges and owns the table, so they are unaffected by both
+-- layers and remain the only way in.
+
+create or replace function public.guard_household_assignment()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
 begin
-  if tg_op = 'UPDATE'
-     and old.household_id is not null
-     and new.household_id is not null
-     and new.household_id <> old.household_id then
-    raise exception 'already_in_household'
-      using hint = 'Leave the current household before joining another one.';
+  -- Trusted path: create_household() / join_household() set this flag, scoped
+  -- to their own transaction. PostgREST clients cannot call set_config(),
+  -- because it lives in pg_catalog and is not exposed over the API.
+  if coalesce(current_setting('app.household_assign', true), '') = 'on' then
+    return new;
   end if;
+
+  if tg_op = 'INSERT' then
+    -- Closes the sign-up hole: a brand-new user creating their own profile row
+    -- must not be able to pre-set membership and land inside someone else's
+    -- household without ever presenting an invite code.
+    if new.household_id is not null or new.slot is not null then
+      raise exception 'household_assignment_forbidden'
+        using hint = 'Use create_household() or join_household().';
+    end if;
+    return new;
+  end if;
+
+  -- Closes the null -> any-UUID hole, and also pins slot: silently swapping
+  -- slot 0/1 would re-attribute every past private expense of both members.
+  if new.household_id is distinct from old.household_id
+     or new.slot is distinct from old.slot then
+    raise exception 'household_assignment_forbidden'
+      using hint = 'Use create_household() or join_household().';
+  end if;
+
   return new;
 end;
 $$;
 
-drop trigger if exists profiles_single_household on public.profiles;
-create trigger profiles_single_household
-  before update on public.profiles
-  for each row execute function public.enforce_single_household();
+drop trigger if exists profiles_single_household on public.profiles;   -- superseded
+drop trigger if exists profiles_guard_household on public.profiles;
+create trigger profiles_guard_household
+  before insert or update on public.profiles
+  for each row execute function public.guard_household_assignment();
+
+-- The earlier, weaker guard is no longer referenced by any trigger.
+drop function if exists public.enforce_single_household();
 
 -- Two members must never occupy the same slot (that would merge their
 -- private expenses). Created only if current data allows it.
@@ -107,6 +148,12 @@ create index if not exists household_categories_household_idx
 
 alter table public.household_categories enable row level security;
 
+-- Explicit table grants: a newly created table only inherits privileges if the
+-- project has ALTER DEFAULT PRIVILEGES configured. Granting here makes the
+-- migration self-contained. RLS still decides which rows are visible.
+grant select, insert, update, delete on public.household_categories to authenticated;
+grant all on public.household_categories to service_role;
+
 drop trigger if exists household_categories_touch on public.household_categories;
 create trigger household_categories_touch
   before update on public.household_categories
@@ -119,7 +166,7 @@ create trigger household_categories_touch
 -- SELECT policy just to look up an invite code. All guards live server-side.
 create or replace function public.create_household(p_name text)
 returns uuid
-language plpgsql security definer set search_path = public as $$
+language plpgsql security definer set search_path = public, pg_temp as $$
 declare
   v_id uuid;
   v_current uuid;
@@ -132,19 +179,23 @@ begin
   insert into households (name) values (coalesce(nullif(btrim(p_name), ''), 'Our household'))
   returning id into v_id;
 
-  -- Works whether or not the column already has a default.
+  -- 12 hex chars (48 bits). Works whether or not the column has a default.
   update households
-     set invite_code = encode(gen_random_bytes(4), 'hex')
+     set invite_code = encode(gen_random_bytes(6), 'hex')
    where id = v_id and (invite_code is null or btrim(invite_code) = '');
 
+  -- Open the guarded path for this transaction only.
+  perform set_config('app.household_assign', 'on', true);
   update profiles set household_id = v_id, slot = 0 where id = auth.uid();
+  perform set_config('app.household_assign', 'off', true);
+
   return v_id;
 end;
 $$;
 
 create or replace function public.join_household(p_code text)
 returns uuid
-language plpgsql security definer set search_path = public as $$
+language plpgsql security definer set search_path = public, pg_temp as $$
 declare
   v_id uuid;
   v_current uuid;
@@ -155,11 +206,19 @@ begin
   select household_id into v_current from profiles where id = auth.uid();
   if v_current is not null then raise exception 'already_in_household'; end if;
 
+  if p_code is null or length(btrim(p_code)) < 4 then
+    raise exception 'invalid_code';
+  end if;
+
   select id into v_id from households
    where lower(btrim(invite_code)) = lower(btrim(p_code));
   if v_id is null then raise exception 'invalid_code'; end if;
 
   -- Expenses model members as slot 0 / slot 1, so a household holds two people.
+  -- Lock the household row so two people racing the same code cannot both be
+  -- handed the last free slot.
+  perform 1 from households where id = v_id for update;
+
   select min(s) into v_slot
     from (select generate_series(0, 1) as s) g
    where not exists (
@@ -167,7 +226,10 @@ begin
    );
   if v_slot is null then raise exception 'household_full'; end if;
 
+  perform set_config('app.household_assign', 'on', true);
   update profiles set household_id = v_id, slot = v_slot where id = auth.uid();
+  perform set_config('app.household_assign', 'off', true);
+
   return v_id;
 end;
 $$;
@@ -178,15 +240,35 @@ grant execute on function public.create_household(text) to authenticated;
 grant execute on function public.join_household(text) to authenticated;
 
 -- ============================================================
---  5. Row Level Security — canonical, household-scoped
+--  5. Column-level privileges (layer 1 of the membership guard)
+-- ============================================================
+-- The client only ever writes these columns; see the app's profile and
+-- household update calls. Everything else — household_id, slot, invite_code,
+-- id, created_at — is withheld from the API roles entirely.
+revoke insert, update on public.profiles from authenticated, anon;
+grant insert (id, display_name, preferred_currency, color) on public.profiles to authenticated;
+grant update (display_name, preferred_currency, color)     on public.profiles to authenticated;
+
+-- Members configure their household's rates, source, name and shared colour.
+-- invite_code is deliberately excluded: rotating it is not a feature, and a
+-- writable invite code is an easy way to lock a partner out or to squat a
+-- guessable code.
+revoke insert, update on public.households from authenticated, anon;
+grant update (name, shared_color, usd_per_eur, cop_per_eur, rates_updated_at, rate_source)
+  on public.households to authenticated;
+-- No INSERT grant: households are created exclusively by create_household().
+
+-- ============================================================
+--  6. Row Level Security — canonical, household-scoped
 -- ============================================================
 -- Legacy policies are cleared first so no forgotten over-permissive rule can
 -- survive (policies are OR'd, so an old broad policy would silently widen
 -- access). This changes access rules only; it never touches data.
 create or replace function public.my_household()
-returns uuid language sql stable security definer set search_path = public as $$
+returns uuid language sql stable security definer set search_path = public, pg_temp as $$
   select household_id from public.profiles where id = auth.uid()
 $$;
+revoke all on function public.my_household() from public, anon;
 grant execute on function public.my_household() to authenticated;
 
 do $$
@@ -215,11 +297,14 @@ create policy "profiles: read self or household" on public.profiles
     or (household_id is not null and household_id = public.my_household())
   );
 
-create policy "profiles: insert self" on public.profiles
-  for insert with check (id = auth.uid());
+-- Belt and braces alongside the column grants and the trigger: a profile is
+-- always born without membership.
+create policy "profiles: insert self without membership" on public.profiles
+  for insert with check (
+    id = auth.uid() and household_id is null and slot is null
+  );
 
--- You may only ever edit your own row (display name, currency, colour, and the
--- household_id written by the create/join functions).
+-- You may only ever edit your own row, and only the columns granted above.
 create policy "profiles: update self" on public.profiles
   for update using (id = auth.uid()) with check (id = auth.uid());
 
@@ -227,10 +312,9 @@ create policy "profiles: update self" on public.profiles
 create policy "households: read own" on public.households
   for select using (id = public.my_household());
 
--- Direct inserts are not needed (create_household does it), but allowing an
--- authenticated user to create a household keeps the flow resilient.
-create policy "households: insert authenticated" on public.households
-  for insert with check (auth.uid() is not null);
+-- No INSERT policy on purpose: create_household() is the only entry point,
+-- and it runs as owner. A direct insert policy would let any signed-in user
+-- create unlimited orphan households they cannot even read.
 
 create policy "households: update own" on public.households
   for update using (id = public.my_household())
@@ -280,10 +364,15 @@ begin
 end $$;
 
 -- ============================================================
---  6. Verification (read-only — safe to run any time)
+--  7. Verification (read-only — safe to run any time)
 -- ============================================================
 -- select tablename, policyname, cmd from pg_policies
 --  where schemaname = 'public' order by tablename, policyname;
 --
--- select id, display_name, slot, household_id, preferred_currency, color
---   from public.profiles order by household_id, slot;
+-- Which columns may the API roles actually write?
+-- select grantee, table_name, column_name, privilege_type
+--   from information_schema.column_privileges
+--  where table_schema = 'public'
+--    and table_name in ('profiles','households')
+--    and grantee in ('authenticated','anon')
+--  order by grantee, table_name, privilege_type, column_name;
