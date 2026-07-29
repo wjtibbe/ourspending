@@ -18,12 +18,58 @@ const db = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const t = (k, v) => window.I18N.t(k, v);
 const monthName = m => window.I18N.months()[m];
 const numLocale = () => window.I18N.lang === "es" ? "es-CO" : "en-US";
-const catLabel = c => t("cat_" + (c && c.id ? c.id : c));
+// Household-scoped registries. Populated by Dashboard once the household's
+// configuration is loaded; until then the built-in defaults apply, which is
+// exactly the pre-multi-household behaviour.
+let CAT_REGISTRY = null;
+let COLOR_REGISTRY = null;
+const setCatRegistry = r => {
+  CAT_REGISTRY = r;
+};
+const setColorRegistry = r => {
+  COLOR_REGISTRY = r;
+};
+// Resolves any category id, including custom and deactivated ones, so
+// historical expenses always stay readable.
+const catEntry = id => {
+  if (CAT_REGISTRY && CAT_REGISTRY.byId[id]) return CAT_REGISTRY.byId[id];
+  return BUILTIN_CATEGORIES.find(c => c.id === id) || null;
+};
+const catLabel = c => {
+  const id = c && c.id ? c.id : c;
+  const e = catEntry(id);
+  if (e && e.custom) return e.label;
+  if (!e) return String(id);
+  return t("cat_" + id);
+};
+// Categories offered for new expenses: active ones only.
+const activeCategories = () => CAT_REGISTRY ? CAT_REGISTRY.active : BUILTIN_CATEGORIES;
+// Budgets keep showing any category that still has a budget configured, even
+// after it was deactivated, so nothing silently disappears.
+const budgetCategories = budgets => {
+  const list = activeCategories().slice();
+  const seen = new Set(list.map(c => c.id));
+  Object.keys(budgets || {}).forEach(id => {
+    if (!seen.has(id)) {
+      const e = catEntry(id);
+      if (e) list.push(e);
+    }
+  });
+  return list;
+};
+const isKnownCategory = id => !!catEntry(id);
+// Slot/shared colours come from the household + profiles, never from a name.
+const slotColor = slot => {
+  const fallback = slot === 0 ? "var(--blue)" : "var(--ochre)";
+  if (!COLOR_REGISTRY) return fallback;
+  return COLOR_REGISTRY.members[slot] || fallback;
+};
+const sharedColor = () => COLOR_REGISTRY && COLOR_REGISTRY.shared || "var(--green)";
 
 // ============================================================
 //  CONSTANTS
 // ============================================================
-const CATEGORIES = [{
+const BUILTIN_CATEGORIES = [{
   id: "groceries",
   label: "Groceries",
   icon: "🛒"
@@ -105,7 +151,7 @@ const todayStr = () => {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 };
-const catById = id => CATEGORIES.find(c => c.id === id) || CATEGORIES[CATEGORIES.length - 1];
+const catById = id => catEntry(id) || BUILTIN_CATEGORIES[BUILTIN_CATEGORIES.length - 1];
 // Downscale a receipt photo to a small JPEG and return raw base64 (no data: prefix).
 const resizeReceiptImage = file => new Promise((resolve, reject) => {
   const reader = new FileReader();
@@ -221,11 +267,18 @@ function Auth() {
           error
         } = await db.auth.signUp({
           email: email.trim(),
-          password: pw
+          password: pw,
+          options: {
+            data: {
+              display_name: name.trim()
+            }
+          }
         });
         if (error) throw error;
-        // store intended name for profile bootstrap
-        localStorage.setItem("pending_name", name.trim());
+        // Metadata is the source of truth; localStorage is a same-device fallback.
+        try {
+          localStorage.setItem("pending_name", name.trim());
+        } catch (e2) {/* private mode */}
         if (!data.session) {
           setMsg(t("account_created"));
           setMode("signin");
@@ -340,7 +393,12 @@ function Home({
       data: prof
     } = await db.from("profiles").select("*").eq("id", user.id).maybeSingle();
     if (!prof) {
-      const pendingName = localStorage.getItem("pending_name") || (user.email ? user.email.split("@")[0] : "Me");
+      let stored = null;
+      try {
+        stored = localStorage.getItem("pending_name");
+      } catch (e2) {/* private mode */}
+      const meta = user.user_metadata || {};
+      const pendingName = (meta.display_name || meta.full_name || meta.name || stored || (user.email ? user.email.split("@")[0] : "") || "").trim() || t("member_one");
       const {
         data: created,
         error
@@ -353,7 +411,9 @@ function Home({
         setLoading(false);
         return;
       }
-      localStorage.removeItem("pending_name");
+      try {
+        localStorage.removeItem("pending_name");
+      } catch (e2) {/* private mode */}
       prof = created;
     }
     setProfile(prof);
@@ -377,10 +437,21 @@ function Home({
   }, "Error: ", err, " ", /*#__PURE__*/React.createElement("button", {
     onClick: loadProfile
   }, t("retry")));
-  if (!profile.household_id) return /*#__PURE__*/React.createElement(Onboard, {
+  if (!profile.household_id) return /*#__PURE__*/React.createElement(NoHousehold, {
     user: user,
     profile: profile,
-    onDone: loadProfile
+    lang: window.I18N.lang,
+    onSetLang: l => {
+      window.I18N.set(l);
+      loadProfile();
+    },
+    themeMode: window.THEME.mode,
+    onSetTheme: m => {
+      window.THEME.set(m);
+      loadProfile();
+    },
+    onReload: loadProfile,
+    onSignOut: () => db.auth.signOut()
   });
   return /*#__PURE__*/React.createElement(Dashboard, {
     user: user,
@@ -392,14 +463,26 @@ function Home({
 // ============================================================
 //  ONBOARD — create or join a household
 // ============================================================
+// Maps the database guards raised by create_household / join_household onto
+// translated messages, with a readable fallback for anything unexpected.
+function householdError(e) {
+  const raw = (e && (e.message || e.hint || "")) + "";
+  if (raw.includes("already_in_household")) return t("err_already_household");
+  if (raw.includes("invalid_code")) return t("no_household_code");
+  if (raw.includes("household_full")) return t("err_household_full");
+  if (raw.includes("not_authenticated")) return t("err_not_authenticated");
+  if (raw.includes("Failed to fetch") || raw.includes("NetworkError")) return t("err_network");
+  return raw || t("something_wrong");
+}
 function Onboard({
   user,
   profile,
-  onDone
+  onDone,
+  onSkip,
+  embedded
 }) {
   const [tab, setTab] = useState("create"); // create | join
   const [hhName, setHhName] = useState("Our household");
-  const [slot, setSlot] = useState(0);
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
@@ -408,22 +491,14 @@ function Onboard({
     setErr(null);
     try {
       const {
-        data: hh,
         error
-      } = await db.from("households").insert({
-        name: hhName.trim() || "Our household"
-      }).select().single();
+      } = await db.rpc("create_household", {
+        p_name: hhName.trim()
+      });
       if (error) throw error;
-      const {
-        error: e2
-      } = await db.from("profiles").update({
-        household_id: hh.id,
-        slot
-      }).eq("id", user.id);
-      if (e2) throw e2;
       onDone();
     } catch (e) {
-      setErr(e.message);
+      setErr(householdError(e));
     } finally {
       setBusy(false);
     }
@@ -433,21 +508,14 @@ function Onboard({
     setErr(null);
     try {
       const {
-        data: hh,
         error
-      } = await db.from("households").select("id").eq("invite_code", code.trim().toLowerCase()).maybeSingle();
+      } = await db.rpc("join_household", {
+        p_code: code.trim()
+      });
       if (error) throw error;
-      if (!hh) throw new Error(t("no_household_code"));
-      const {
-        error: e2
-      } = await db.from("profiles").update({
-        household_id: hh.id,
-        slot
-      }).eq("id", user.id);
-      if (e2) throw e2;
       onDone();
     } catch (e) {
-      setErr(e.message);
+      setErr(householdError(e));
     } finally {
       setBusy(false);
     }
@@ -482,21 +550,9 @@ function Onboard({
     onClick: () => setTab("join")
   }, t("join"))), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, t("you_are")), /*#__PURE__*/React.createElement("div", {
-    style: S.segWide
-  }, /*#__PURE__*/React.createElement("button", {
-    style: {
-      ...S.segBtn,
-      ...(slot === 0 ? S.segOnA : {})
-    },
-    onClick: () => setSlot(0)
-  }, "Willem-Jan"), /*#__PURE__*/React.createElement("button", {
-    style: {
-      ...S.segBtn,
-      ...(slot === 1 ? S.segOnB : {})
-    },
-    onClick: () => setSlot(1)
-  }, "Steffania")), tab === "create" ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+  }, t("welcome_name", {
+    name: profile && profile.display_name || ""
+  })), tab === "create" ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
   }, t("household_name")), /*#__PURE__*/React.createElement("input", {
     style: S.input,
@@ -527,7 +583,13 @@ function Onboard({
     },
     disabled: busy,
     onClick: join
-  }, busy ? t("joining") : t("join_household")))));
+  }, busy ? t("joining") : t("join_household"))), onSkip && /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.ghostBtn,
+      marginTop: 10
+    },
+    onClick: onSkip
+  }, t("do_this_later"))));
 }
 
 // ============================================================
@@ -543,7 +605,8 @@ function Dashboard({
   const [budgets, setBudgets] = useState({});
   const [members, setMembers] = useState([]);
   const [tab, setTab] = useState("overview");
-  const [displayCur, setDisplayCur] = useState("COP");
+  // Start in the user's saved preference so the UI never flashes EUR first.
+  const [displayCur, setDisplayCur] = useState(() => CURRENCIES.includes(profile.preferred_currency) ? profile.preferred_currency : "EUR");
   const [month, setMonth] = useState(() => {
     const d = new Date();
     return {
@@ -562,6 +625,13 @@ function Dashboard({
     window.I18N.set(l);
     setLangState(l);
   };
+  const prefCurRef = useRef(profile.preferred_currency);
+  useEffect(() => {
+    if (profile.preferred_currency !== prefCurRef.current) {
+      prefCurRef.current = profile.preferred_currency;
+      if (CURRENCIES.includes(profile.preferred_currency)) setDisplayCur(profile.preferred_currency);
+    }
+  }, [profile.preferred_currency]);
   const [themeMode, setThemeModeState] = useState(window.THEME.mode);
   const changeTheme = m => {
     window.THEME.set(m);
@@ -584,11 +654,25 @@ function Dashboard({
     updatedAt: null
   };
 
-  // people names from members (slot 0 / slot 1), fallback defaults
-  const people = ["Willem-Jan", "Steffania"];
+  // Member names come from the household's profiles, keyed by slot.
+  // Identity is never inferred from a display name.
+  const people = [t("member_one"), t("member_two")];
   members.forEach(m => {
-    if (m.slot === 0 || m.slot === 1) people[m.slot] = m.display_name;
+    if ((m.slot === 0 || m.slot === 1) && m.display_name) people[m.slot] = m.display_name;
   });
+  const [catRows, setCatRows] = useState([]);
+  const loadCategories = useCallback(async () => {
+    const {
+      data,
+      error
+    } = await db.from("household_categories").select("*").eq("household_id", hhId).order("sort_order");
+    // A missing table or an empty result both mean "all built-ins active",
+    // which is the pre-migration behaviour.
+    if (!error && data) setCatRows(data);
+  }, [hhId]);
+  useEffect(() => {
+    loadCategories();
+  }, [loadCategories]);
   const loadAll = useCallback(async () => {
     const [{
       data: hh
@@ -600,7 +684,7 @@ function Dashboard({
       data: mem
     }] = await Promise.all([db.from("households").select("*").eq("id", hhId).single(), db.from("expenses").select("*").eq("household_id", hhId).order("spent_on", {
       ascending: false
-    }), db.from("budgets").select("*").eq("household_id", hhId), db.from("profiles").select("display_name, slot").eq("household_id", hhId)]);
+    }), db.from("budgets").select("*").eq("household_id", hhId), db.from("profiles").select("id, display_name, slot, color").eq("household_id", hhId)]);
     if (hh) setHousehold(hh);
     if (exp) setExpenses(exp);
     if (bud) {
@@ -639,6 +723,51 @@ function Dashboard({
   useEffect(() => {
     if (household && ratesAreStale(rates) && RATES_ENABLED) updateRates(true);
   }, [household]);
+  // Publish the household's categories + colours to the module-level registries
+  // so every component (including historical rows) resolves them consistently.
+  const categories = (() => {
+    const byId = {};
+    const active = [];
+    const all = [];
+    const configured = {};
+    catRows.forEach(r => configured[r.category_key] = r);
+    BUILTIN_CATEGORIES.forEach(c => {
+      const row = configured[c.id];
+      const entry = {
+        ...c,
+        custom: false,
+        active: row ? row.active : true,
+        rowId: row ? row.id : null
+      };
+      byId[c.id] = entry;
+      all.push(entry);
+      if (entry.active) active.push(entry);
+    });
+    catRows.filter(r => r.is_custom).forEach(r => {
+      const entry = {
+        id: r.category_key,
+        label: r.label,
+        icon: r.icon || "🏷️",
+        custom: true,
+        active: r.active && !r.archived_at,
+        rowId: r.id
+      };
+      byId[entry.id] = entry;
+      all.push(entry);
+      if (entry.active) active.push(entry);
+    });
+    return {
+      byId,
+      active,
+      all,
+      rows: catRows
+    };
+  })();
+  setCatRegistry(categories);
+  setColorRegistry({
+    shared: household && household.shared_color || null,
+    members: [members.find(m => m.slot === 0) && members.find(m => m.slot === 0).color || null, members.find(m => m.slot === 1) && members.find(m => m.slot === 1).color || null]
+  });
   const disp = eur => fmt(ceilCur(fromEUR(eur, displayCur, rates), displayCur), displayCur);
   const monthExpenses = expenses.filter(e => {
     if (rangeMode) return e.spent_on >= range.from && e.spent_on <= range.to;
@@ -756,13 +885,6 @@ function Dashboard({
     showToast(t("budgets_saved"));
     loadAll();
   };
-  const saveMyName = async nm => {
-    await db.from("profiles").update({
-      display_name: nm
-    }).eq("id", user.id);
-    showToast(t("name_saved"));
-    loadAll();
-  };
   const saveRates = async r => {
     await db.from("households").update({
       usd_per_eur: r.usdPerEur,
@@ -818,10 +940,17 @@ function Dashboard({
     onClick: loadAll,
     title: t("refresh")
   }, "⟳"), /*#__PURE__*/React.createElement("button", {
-    style: S.iconBtn,
-    onClick: () => db.auth.signOut(),
-    title: t("sign_out")
-  }, "⎋"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...S.iconBtn,
+      ...(tab === "settings" ? {
+        borderColor: "var(--green)",
+        color: "var(--green)"
+      } : {})
+    },
+    onClick: () => setTab("settings"),
+    title: t("settings"),
+    "aria-label": t("settings")
+  }, "⚙"))), /*#__PURE__*/React.createElement("div", {
     style: S.ratesLine
   }, /*#__PURE__*/React.createElement("span", null, "1€ = $", rates.usdPerEur.toFixed(2), " · COP ", Math.round(rates.copPerEur).toLocaleString(numLocale()), /*#__PURE__*/React.createElement("span", {
     style: {
@@ -865,32 +994,49 @@ function Dashboard({
     },
     people: people,
     rates: rates,
+    defaultCurrency: CURRENCIES.includes(profile.preferred_currency) ? profile.preferred_currency : "EUR",
     saving: false,
     onAdd: addExpense,
     ratesLoading: ratesLoading,
     onUpdateRates: () => updateRates(false)
   }), tab === "budgets" && /*#__PURE__*/React.createElement(Budgets, {
     people: people,
-    profile: profile,
-    household: household,
     month: month,
     monthExpenses: monthExpenses,
     budgets: budgets,
     rates: rates,
     disp: disp,
     displayCur: displayCur,
-    onSaveBudgets: saveBudgets,
-    onSaveName: saveMyName,
-    onSaveRates: saveRates,
-    onSaveSource: saveSource,
-    onImportExpenses: importExpenses,
-    hhId: hhId,
-    user: user,
-    showToast: showToast,
-    onSignOut: () => db.auth.signOut()
+    onSaveBudgets: saveBudgets
   }), tab === "groceries" && /*#__PURE__*/React.createElement(GroceryList, {
     hhId: hhId,
     user: user
+  }), tab === "settings" && /*#__PURE__*/React.createElement(SettingsPage, {
+    user: user,
+    profile: profile,
+    household: household,
+    people: people,
+    members: members,
+    hhId: hhId,
+    rates: rates,
+    disp: disp,
+    displayCur: displayCur,
+    lang: lang,
+    onSetLang: changeLang,
+    themeMode: themeMode,
+    onSetTheme: changeTheme,
+    categories: categories,
+    onReloadCategories: loadCategories,
+    onSaveRates: saveRates,
+    onSaveSource: saveSource,
+    onImportExpenses: importExpenses,
+    onProfileChanged: () => {
+      reloadProfile();
+      loadAll();
+    },
+    onHouseholdChanged: loadAll,
+    showToast: showToast,
+    onSignOut: () => db.auth.signOut()
   }), tab === "calendar" && /*#__PURE__*/React.createElement(Calendar, {
     hhId: hhId,
     user: user,
@@ -956,7 +1102,7 @@ function TabBtn({
     }
   }, label));
 }
-const kindDot = e => e.kind === "shared" ? "var(--green)" : e.kind === "p0" ? "var(--blue)" : "var(--ochre)";
+const kindDot = e => e.kind === "shared" ? sharedColor() : slotColor(e.kind === "p0" ? 0 : 1);
 const kindText = (e, people) => e.kind === "shared" ? t("kind_shared_paid", {
   name: people[e.payer]
 }) : t("kind_private", {
@@ -1333,6 +1479,7 @@ function Overview({
 function AddExpense({
   people,
   rates,
+  defaultCurrency,
   onAdd,
   saving,
   ratesLoading,
@@ -1342,10 +1489,14 @@ function AddExpense({
   onCancelEdit
 }) {
   const [amount, setAmount] = useState(editingExpense ? String(editingExpense.amount_orig) : "");
-  const [currency, setCurrency] = useState(editingExpense ? editingExpense.currency : "COP");
+  const [currency, setCurrency] = useState(editingExpense ? editingExpense.currency : defaultCurrency);
   const [kind, setKind] = useState(editingExpense ? editingExpense.kind : "shared");
   const [payer, setPayer] = useState(editingExpense ? editingExpense.payer : 0);
-  const [category, setCategory] = useState(editingExpense ? editingExpense.category : "groceries");
+  const [category, setCategory] = useState(() => {
+    if (editingExpense) return editingExpense.category;
+    const act = activeCategories();
+    return act.length ? act[0].id : "other";
+  });
   const [date, setDate] = useState(editingExpense ? editingExpense.spent_on : todayStr());
   const [note, setNote] = useState(editingExpense ? editingExpense.note || "" : "");
   const [err, setErr] = useState(null);
@@ -1376,7 +1527,7 @@ function AddExpense({
       if (!(data.amount > 0)) throw new Error(t("scan_no_total"));
       setAmount(String(data.amount));
       if (CURRENCIES.includes(data.currency)) setCurrency(data.currency);
-      if (data.category && CATEGORIES.some(c => c.id === data.category)) setCategory(data.category);
+      if (data.category && isKnownCategory(data.category)) setCategory(data.category);
       setDate(todayStr());
       if (data.merchant) setNote(String(data.merchant).slice(0, 60));
       setScanned(true);
@@ -1502,9 +1653,11 @@ function AddExpense({
     onClick: () => setPayer(i)
   }, p)))), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, t("category")), /*#__PURE__*/React.createElement("div", {
+  }, t("category")), activeCategories().length === 0 && /*#__PURE__*/React.createElement("div", {
+    style: S.empty
+  }, t("no_active_categories")), /*#__PURE__*/React.createElement("div", {
     style: S.catGrid
-  }, CATEGORIES.map(c => /*#__PURE__*/React.createElement("button", {
+  }, activeCategories().map(c => /*#__PURE__*/React.createElement("button", {
     key: c.id,
     style: {
       ...S.catBtn,
@@ -1551,8 +1704,6 @@ function AddExpense({
 // ---------- Budgets & settings ----------
 function Budgets({
   people,
-  profile,
-  household,
   month,
   monthExpenses,
   budgets,
@@ -1560,30 +1711,13 @@ function Budgets({
   disp,
   displayCur,
   onSaveBudgets,
-  onSaveName,
-  onSaveRates,
-  onSaveSource,
-  onImportExpenses,
-  hhId,
-  user,
-  showToast,
-  onSignOut
 }) {
   const [draft, setDraft] = useState(() => {
     const d = {};
-    CATEGORIES.forEach(c => d[c.id] = budgets[c.id] != null ? String(budgets[c.id]) : "");
+    budgetCategories(budgets).forEach(c => d[c.id] = budgets[c.id] != null ? String(budgets[c.id]) : "");
     return d;
   });
   const [editing, setEditing] = useState(false);
-  const [myName, setMyName] = useState(profile.display_name);
-  const [editName, setEditName] = useState(false);
-  const [rateDraft, setRateDraft] = useState({
-    usd: String(rates.usdPerEur),
-    cop: String(rates.copPerEur)
-  });
-  const [editRates, setEditRates] = useState(false);
-  const [sourceDraft, setSourceDraft] = useState(household.rate_source || "wise.com");
-  const [editSource, setEditSource] = useState(false);
   const spentByCat = {};
   monthExpenses.forEach(e => {
     spentByCat[e.category] = (spentByCat[e.category] || 0) + Number(e.amount_eur);
@@ -1592,22 +1726,12 @@ function Budgets({
   const totalSpent = monthExpenses.reduce((s, e) => s + Number(e.amount_eur), 0);
   const save = () => {
     const b = {};
-    CATEGORIES.forEach(c => {
+    budgetCategories(budgets).forEach(c => {
       const v = parseFloat(String(draft[c.id]).replace(",", "."));
       if (v > 0) b[c.id] = v;
     });
     onSaveBudgets(b);
     setEditing(false);
-  };
-  const saveR = () => {
-    const usd = parseFloat(String(rateDraft.usd).replace(",", "."));
-    const cop = parseFloat(String(rateDraft.cop).replace(",", "."));
-    if (!(usd > 0) || !(cop > 0)) return;
-    onSaveRates({
-      usdPerEur: usd,
-      copPerEur: cop
-    });
-    setEditRates(false);
   };
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", {
     style: S.pageTitle
@@ -1641,7 +1765,7 @@ function Budgets({
   }, t("of_word"), disp(totalBudget))), /*#__PURE__*/React.createElement(Bar, {
     spent: totalSpent,
     budget: totalBudget
-  })), CATEGORIES.map(c => {
+  })), budgetCategories(budgets).map(c => {
     const b = budgets[c.id];
     const sp = spentByCat[c.id] || 0;
     return /*#__PURE__*/React.createElement("div", {
@@ -1696,71 +1820,291 @@ function Budgets({
   }, t("cancel"))) : /*#__PURE__*/React.createElement("button", {
     style: S.ghostBtn,
     onClick: () => setEditing(true)
-  }, t("edit_budgets")), /*#__PURE__*/React.createElement("h2", {
+  }, t("edit_budgets")));
+}
+
+// ---------- Settings ----------
+const CURRENCY_CHOICES = ["EUR", "USD", "COP"];
+// Palette offered for member/shared colours. Values are concrete hex so they
+// survive light/dark theme switches and round-trip through the database.
+const COLOR_CHOICES = ["#1F6B4E", "#33608D", "#A6641C", "#7A4E9E", "#B3372E", "#0E7C7B", "#C97A1F", "#4A5D23"];
+function ColorPicker({
+  value,
+  fallback,
+  onPick
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 8,
+      marginTop: 6
+    }
+  }, COLOR_CHOICES.map(c => /*#__PURE__*/React.createElement("button", {
+    key: c,
+    "aria-label": c,
+    style: {
+      width: 30,
+      height: 30,
+      borderRadius: "50%",
+      background: c,
+      cursor: "pointer",
+      border: (value || fallback) === c ? "3px solid var(--ink)" : "1px solid var(--line)",
+      padding: 0
+    },
+    onClick: () => onPick(c)
+  })));
+}
+function SettingsPage({
+  user,
+  profile,
+  household,
+  people,
+  members,
+  hhId,
+  rates,
+  disp,
+  displayCur,
+  lang,
+  onSetLang,
+  themeMode,
+  onSetTheme,
+  categories,
+  onReloadCategories,
+  onSaveRates,
+  onSaveSource,
+  onImportExpenses,
+  onProfileChanged,
+  onHouseholdChanged,
+  showToast,
+  onSignOut
+}) {
+  const [name, setName] = useState(profile.display_name || "");
+  const [savingName, setSavingName] = useState(false);
+  const [rateDraft, setRateDraft] = useState({
+    usd: String(rates.usdPerEur),
+    cop: String(rates.copPerEur)
+  });
+  const [editRates, setEditRates] = useState(false);
+  const [sourceDraft, setSourceDraft] = useState(household && household.rate_source || "wise.com");
+  const [editSource, setEditSource] = useState(false);
+  const [err, setErr] = useState(null);
+  const mySlot = profile.slot === 0 || profile.slot === 1 ? profile.slot : null;
+
+  // --- profile ---
+  const saveName = async () => {
+    const v = name.trim();
+    if (v.length < 2 || v.length > 40) {
+      setErr(t("name_invalid"));
+      return;
+    }
+    setSavingName(true);
+    setErr(null);
+    const {
+      error
+    } = await db.from("profiles").update({
+      display_name: v
+    }).eq("id", user.id);
+    setSavingName(false);
+    if (error) {
+      setErr(t("save_failed") + error.message);
+      return;
+    }
+    showToast(t("name_saved"));
+    onProfileChanged();
+  };
+  const saveCurrency = async cur => {
+    const {
+      error
+    } = await db.from("profiles").update({
+      preferred_currency: cur
+    }).eq("id", user.id);
+    if (error) {
+      setErr(t("save_failed") + error.message);
+      return;
+    }
+    showToast(t("currency_saved"));
+    onProfileChanged();
+  };
+  const saveMyColor = async c => {
+    const {
+      error
+    } = await db.from("profiles").update({
+      color: c
+    }).eq("id", user.id);
+    if (error) {
+      setErr(t("color_save_failed") + error.message);
+      return;
+    }
+    showToast(t("color_saved"));
+    onProfileChanged();
+  };
+  const saveSharedColor = async c => {
+    const {
+      error
+    } = await db.from("households").update({
+      shared_color: c
+    }).eq("id", hhId);
+    if (error) {
+      setErr(t("color_save_failed") + error.message);
+      return;
+    }
+    showToast(t("color_saved"));
+    onHouseholdChanged();
+  };
+  const copyCode = () => {
+    if (!household || !household.invite_code) return;
+    navigator.clipboard.writeText(household.invite_code).then(() => showToast(t("copied")), () => setErr(t("copy_failed")));
+  };
+  const saveR = () => {
+    const usd = parseFloat(String(rateDraft.usd).replace(",", "."));
+    const cop = parseFloat(String(rateDraft.cop).replace(",", "."));
+    if (!(usd > 0) || !(cop > 0)) {
+      setErr(t("rates_invalid"));
+      return;
+    }
+    setErr(null);
+    onSaveRates({
+      usdPerEur: usd,
+      copPerEur: cop
+    });
+    setEditRates(false);
+  };
+  const section = title => /*#__PURE__*/React.createElement("h2", {
     style: {
       ...S.pageTitle,
-      marginTop: 28
+      marginTop: 26
     }
-  }, t("settings")), /*#__PURE__*/React.createElement("div", {
+  }, title);
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", {
+    style: S.pageTitle
+  }, t("settings")), err && /*#__PURE__*/React.createElement("div", {
+    style: S.errBox
+  }, err),
+  // ===== PROFILE =====
+  section(t("sec_profile")), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, t("your_name")), editName ? /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("input", {
-    style: S.input,
-    value: myName,
-    maxLength: 16,
-    onChange: e => setMyName(e.target.value)
-  }), /*#__PURE__*/React.createElement("div", {
+  }, t("display_name")), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 8
     }
-  }, /*#__PURE__*/React.createElement("button", {
+  }, /*#__PURE__*/React.createElement("input", {
+    style: {
+      ...S.input,
+      flex: 1
+    },
+    value: name,
+    maxLength: 40,
+    onChange: e => setName(e.target.value)
+  }), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.primaryBtn,
-      flex: 1,
-      width: "auto"
+      marginTop: 0,
+      width: "auto",
+      padding: "0 18px",
+      opacity: savingName || name.trim() === (profile.display_name || "") ? 0.6 : 1
     },
-    onClick: () => {
-      onSaveName(myName.trim() || "Me");
-      setEditName(false);
-    }
-  }, t("save")), /*#__PURE__*/React.createElement("button", {
-    style: {
-      ...S.ghostBtn,
-      flex: 1,
-      width: "auto"
-    },
-    onClick: () => {
-      setMyName(profile.display_name);
-      setEditName(false);
-    }
-  }, t("cancel")))) : /*#__PURE__*/React.createElement("div", {
-    style: S.namesRow
-  }, /*#__PURE__*/React.createElement("span", null, "You are shown as ", /*#__PURE__*/React.createElement("b", null, profile.display_name)), /*#__PURE__*/React.createElement("button", {
-    style: S.miniBtn,
-    onClick: () => setEditName(true)
-  }, t("edit"))), /*#__PURE__*/React.createElement("div", {
+    disabled: savingName || name.trim() === (profile.display_name || ""),
+    onClick: saveName
+  }, t("save"))), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, t("invite_share")), /*#__PURE__*/React.createElement("div", {
+  }, t("default_currency")), /*#__PURE__*/React.createElement("div", {
+    style: S.segWide
+  }, CURRENCY_CHOICES.map(c => /*#__PURE__*/React.createElement("button", {
+    key: c,
+    style: {
+      ...S.segBtn,
+      ...(profile.preferred_currency === c ? S.segOn : {})
+    },
+    onClick: () => saveCurrency(c)
+  }, c === "COP" ? "COP" : SYMBOL[c] + " " + c))), /*#__PURE__*/React.createElement("div", {
+    style: S.privacyNote
+  }, t("default_currency_hint")), mySlot != null && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("my_colour")), /*#__PURE__*/React.createElement(ColorPicker, {
+    value: profile.color,
+    fallback: mySlot === 0 ? "#33608D" : "#A6641C",
+    onPick: saveMyColor
+  })), /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("language")), /*#__PURE__*/React.createElement("div", {
+    style: S.segWide
+  }, window.I18N.languages.map(l => /*#__PURE__*/React.createElement("button", {
+    key: l,
+    style: {
+      ...S.segBtn,
+      ...(lang === l ? S.segOn : {})
+    },
+    onClick: () => onSetLang(l)
+  }, l.toUpperCase()))), /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("appearance")), /*#__PURE__*/React.createElement("div", {
+    style: S.segWide
+  }, ["light", "dark", "system"].map(m => /*#__PURE__*/React.createElement("button", {
+    key: m,
+    style: {
+      ...S.segBtn,
+      ...(themeMode === m ? S.segOn : {})
+    },
+    onClick: () => onSetTheme(m)
+  }, t("theme_" + m)))),
+  // ===== HOUSEHOLD =====
+  section(t("sec_household")), household ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("household_name")), /*#__PURE__*/React.createElement("div", {
+    style: S.namesRow
+  }, /*#__PURE__*/React.createElement("span", null, household.name || "—")), /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("household_members")), members.map(m => /*#__PURE__*/React.createElement("div", {
+    key: m.id,
     style: S.namesRow
   }, /*#__PURE__*/React.createElement("span", {
     style: {
-      fontFamily: "monospace",
-      fontSize: 16,
-      letterSpacing: 1
+      display: "flex",
+      alignItems: "center",
+      gap: 8
     }
-  }, household.invite_code), /*#__PURE__*/React.createElement("button", {
-    style: S.miniBtn,
-    onClick: () => {
-      navigator.clipboard && navigator.clipboard.writeText(household.invite_code);
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      width: 14,
+      height: 14,
+      borderRadius: "50%",
+      background: m.color || (m.slot === 0 ? "#33608D" : "#A6641C"),
+      display: "inline-block"
     }
-  }, t("copy"))), /*#__PURE__*/React.createElement("div", {
+  }), m.display_name, m.id === user.id ? " · " + t("you") : ""))), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, t("fx_rates")), editRates ? /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
-    style: S.rateEditRow
+  }, t("shared_colour")), /*#__PURE__*/React.createElement(ColorPicker, {
+    value: household.shared_color,
+    fallback: "#1F6B4E",
+    onPick: saveSharedColor
+  }), /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("invite_share")), /*#__PURE__*/React.createElement("div", {
+    style: S.namesRow
+  }, /*#__PURE__*/React.createElement("code", null, household.invite_code || "—"), /*#__PURE__*/React.createElement("button", {
+    style: S.miniBtn,
+    onClick: copyCode
+  }, t("copy")))) : /*#__PURE__*/React.createElement("div", {
+    style: S.privacyNote
+  }, t("no_household_yet")),
+  // ===== CATEGORIES =====
+  household && /*#__PURE__*/React.createElement(React.Fragment, null, section(t("sec_categories")), /*#__PURE__*/React.createElement(CategorySettings, {
+    hhId: hhId,
+    user: user,
+    categories: categories,
+    onChanged: onReloadCategories,
+    showToast: showToast
+  })),
+  // ===== CURRENCY & RATES =====
+  household && /*#__PURE__*/React.createElement(React.Fragment, null, section(t("sec_rates")), editRates ? /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: S.namesRow
   }, /*#__PURE__*/React.createElement("span", null, "1 € = $"), /*#__PURE__*/React.createElement("input", {
     style: {
       ...S.input,
-      width: 120
+      width: 120,
+      marginTop: 0
     },
     inputMode: "decimal",
     value: rateDraft.usd,
@@ -1769,11 +2113,12 @@ function Budgets({
       usd: e.target.value
     })
   })), /*#__PURE__*/React.createElement("div", {
-    style: S.rateEditRow
+    style: S.namesRow
   }, /*#__PURE__*/React.createElement("span", null, "1 € = COP"), /*#__PURE__*/React.createElement("input", {
     style: {
       ...S.input,
-      width: 120
+      width: 120,
+      marginTop: 0
     },
     inputMode: "decimal",
     value: rateDraft.cop,
@@ -1784,11 +2129,13 @@ function Budgets({
   })), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
-      gap: 8
+      gap: 8,
+      marginTop: 10
     }
   }, /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.primaryBtn,
+      marginTop: 0,
       flex: 1,
       width: "auto"
     },
@@ -1796,6 +2143,7 @@ function Budgets({
   }, t("save")), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.ghostBtn,
+      marginTop: 0,
       flex: 1,
       width: "auto"
     },
@@ -1816,27 +2164,17 @@ function Budgets({
   }, t("rate_source")), editSource ? /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("input", {
     style: S.input,
     value: sourceDraft,
-    maxLength: 40,
     onChange: e => setSourceDraft(e.target.value)
   }), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
-      gap: 6,
-      marginTop: 8,
-      flexWrap: "wrap"
-    }
-  }, ["wise.com", "xe.com", "banrep.gov.co"].map(s => /*#__PURE__*/React.createElement("button", {
-    key: s,
-    style: S.miniBtn,
-    onClick: () => setSourceDraft(s)
-  }, s))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 8
+      gap: 8,
+      marginTop: 10
     }
   }, /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.primaryBtn,
+      marginTop: 0,
       flex: 1,
       width: "auto"
     },
@@ -1847,6 +2185,7 @@ function Budgets({
   }, t("save")), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.ghostBtn,
+      marginTop: 0,
       flex: 1,
       width: "auto"
     },
@@ -1870,10 +2209,340 @@ function Budgets({
     user: user,
     people: people,
     showToast: showToast
-  }), /*#__PURE__*/React.createElement("button", {
+  })), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.ghostBtn,
-      marginTop: 20,
+      marginTop: 24,
+      color: "var(--danger)",
+      borderColor: "var(--danger)"
+    },
+    onClick: onSignOut
+  }, t("sign_out")));
+}
+
+// ---------- Category settings ----------
+function CategorySettings({
+  hhId,
+  user,
+  categories,
+  onChanged,
+  showToast
+}) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const [adding, setAdding] = useState(false);
+  const [editId, setEditId] = useState(null);
+  const [form, setForm] = useState({
+    label: "",
+    icon: "🏷️"
+  });
+
+  // A household starts with no configuration rows, meaning "all built-ins on".
+  // The first change materialises rows for every built-in so the toggle state
+  // is explicit from then on. Historical expenses are never touched.
+  const seedIfNeeded = async () => {
+    if (categories.rows.length > 0) return;
+    const rows = BUILTIN_CATEGORIES.map((c, i) => ({
+      household_id: hhId,
+      category_key: c.id,
+      is_custom: false,
+      active: true,
+      sort_order: i,
+      created_by: user.id
+    }));
+    const {
+      error
+    } = await db.from("household_categories").insert(rows);
+    if (error) throw new Error(error.message);
+  };
+  const toggle = async cat => {
+    setBusy(true);
+    setErr(null);
+    try {
+      await seedIfNeeded();
+      const {
+        error
+      } = await db.from("household_categories").upsert({
+        household_id: hhId,
+        category_key: cat.id,
+        is_custom: !!cat.custom,
+        label: cat.custom ? cat.label : null,
+        icon: cat.custom ? cat.icon : null,
+        active: !cat.active,
+        created_by: user.id
+      }, {
+        onConflict: "household_id,category_key"
+      });
+      if (error) throw new Error(error.message);
+      onChanged();
+    } catch (e) {
+      setErr(t("category_save_failed") + (e.message || String(e)));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const submitCustom = async () => {
+    const label = form.label.trim();
+    if (label.length < 2 || label.length > 30) {
+      setErr(t("category_name_invalid"));
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    try {
+      await seedIfNeeded();
+      if (editId) {
+        const {
+          error
+        } = await db.from("household_categories").update({
+          label,
+          icon: form.icon || "🏷️"
+        }).eq("id", editId);
+        if (error) throw new Error(error.message);
+      } else {
+        const key = "custom_" + Math.random().toString(36).slice(2, 10);
+        const {
+          error
+        } = await db.from("household_categories").insert({
+          household_id: hhId,
+          category_key: key,
+          is_custom: true,
+          label,
+          icon: form.icon || "🏷️",
+          active: true,
+          sort_order: 100 + categories.rows.length,
+          created_by: user.id
+        });
+        if (error) throw new Error(error.message);
+      }
+      showToast(t("category_saved"));
+      setAdding(false);
+      setEditId(null);
+      setForm({
+        label: "",
+        icon: "🏷️"
+      });
+      onChanged();
+    } catch (e) {
+      setErr(t("category_save_failed") + (e.message || String(e)));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const all = categories.all;
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: S.privacyNote
+  }, t("categories_hint")), err && /*#__PURE__*/React.createElement("div", {
+    style: S.errBox
+  }, err), all.map(c => /*#__PURE__*/React.createElement("div", {
+    key: c.id,
+    style: S.namesRow
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      opacity: c.active ? 1 : 0.5
+    }
+  }, c.icon, " ", catLabel(c), c.custom ? " · " + t("custom_badge") : ""), /*#__PURE__*/React.createElement("span", {
+    style: {
+      display: "flex",
+      gap: 4
+    }
+  }, c.custom && /*#__PURE__*/React.createElement("button", {
+    style: S.miniBtn,
+    disabled: busy,
+    onClick: () => {
+      setEditId(c.rowId);
+      setForm({
+        label: c.label,
+        icon: c.icon
+      });
+      setAdding(true);
+    }
+  }, t("edit")), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.miniBtn,
+      ...(c.active ? S.chipOn : {})
+    },
+    disabled: busy,
+    onClick: () => toggle(c)
+  }, c.active ? t("on") : t("off"))))), adding ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("category_name")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    style: {
+      ...S.input,
+      width: 70,
+      textAlign: "center"
+    },
+    value: form.icon,
+    maxLength: 4,
+    onChange: e => setForm({
+      ...form,
+      icon: e.target.value
+    })
+  }), /*#__PURE__*/React.createElement("input", {
+    style: {
+      ...S.input,
+      flex: 1
+    },
+    value: form.label,
+    maxLength: 30,
+    placeholder: t("category_name_ph"),
+    onChange: e => setForm({
+      ...form,
+      label: e.target.value
+    })
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      marginTop: 10
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.primaryBtn,
+      marginTop: 0,
+      flex: 1,
+      width: "auto",
+      opacity: busy ? 0.6 : 1
+    },
+    disabled: busy,
+    onClick: submitCustom
+  }, t("save")), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.ghostBtn,
+      marginTop: 0,
+      flex: 1,
+      width: "auto"
+    },
+    onClick: () => {
+      setAdding(false);
+      setEditId(null);
+    }
+  }, t("cancel")))) : /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.ghostBtn,
+      marginTop: 10
+    },
+    onClick: () => {
+      setEditId(null);
+      setForm({
+        label: "",
+        icon: "🏷️"
+      });
+      setAdding(true);
+    }
+  }, "＋ " + t("add_category")));
+}
+
+// ---------- Shell for a signed-in user without a household ----------
+function NoHousehold({
+  user,
+  profile,
+  lang,
+  onSetLang,
+  themeMode,
+  onSetTheme,
+  onReload,
+  onSignOut
+}) {
+  const [showSetup, setShowSetup] = useState(true);
+  const [name, setName] = useState(profile.display_name || "");
+  const [err, setErr] = useState(null);
+  const saveName = async () => {
+    const v = name.trim();
+    if (v.length < 2 || v.length > 40) {
+      setErr(t("name_invalid"));
+      return;
+    }
+    const {
+      error
+    } = await db.from("profiles").update({
+      display_name: v
+    }).eq("id", user.id);
+    if (error) {
+      setErr(t("save_failed") + error.message);
+      return;
+    }
+    setErr(null);
+    onReload();
+  };
+  if (showSetup) return /*#__PURE__*/React.createElement(Onboard, {
+    user: user,
+    profile: profile,
+    onDone: onReload,
+    onSkip: () => setShowSetup(false)
+  });
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...S.appRoot,
+      padding: "16px"
+    }
+  }, /*#__PURE__*/React.createElement("h2", {
+    style: S.pageTitle
+  }, t("settings")), /*#__PURE__*/React.createElement("div", {
+    style: S.empty
+  }, t("no_household_yet")), err && /*#__PURE__*/React.createElement("div", {
+    style: S.errBox
+  }, err), /*#__PURE__*/React.createElement("button", {
+    style: S.primaryBtn,
+    onClick: () => setShowSetup(true)
+  }, t("set_up_household")), /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("display_name")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    style: {
+      ...S.input,
+      flex: 1
+    },
+    value: name,
+    maxLength: 40,
+    onChange: e => setName(e.target.value)
+  }), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.primaryBtn,
+      marginTop: 0,
+      width: "auto",
+      padding: "0 18px"
+    },
+    onClick: saveName
+  }, t("save"))), /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("language")), /*#__PURE__*/React.createElement("div", {
+    style: S.segWide
+  }, window.I18N.languages.map(l => /*#__PURE__*/React.createElement("button", {
+    key: l,
+    style: {
+      ...S.segBtn,
+      ...(lang === l ? S.segOn : {})
+    },
+    onClick: () => onSetLang(l)
+  }, l.toUpperCase()))), /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("appearance")), /*#__PURE__*/React.createElement("div", {
+    style: S.segWide
+  }, ["light", "dark", "system"].map(m => /*#__PURE__*/React.createElement("button", {
+    key: m,
+    style: {
+      ...S.segBtn,
+      ...(themeMode === m ? S.segOn : {})
+    },
+    onClick: () => onSetTheme(m)
+  }, t("theme_" + m)))), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.ghostBtn,
+      marginTop: 24,
       color: "var(--danger)",
       borderColor: "var(--danger)"
     },
@@ -1918,7 +2587,7 @@ function ImportExpenses({
         const invalid = [];
         const clean = parsed.map((r, i) => {
           const amount = parseFloat(r.amount);
-          const category = catById(r.category).id === r.category ? r.category : null;
+          const category = isKnownCategory(r.category) ? r.category : null;
           const kind = VALID_KINDS.includes(r.kind) ? r.kind : null;
           const currency = CURRENCIES.includes(r.currency) ? r.currency : null;
           if (!r.date || !(amount > 0) || !currency || !category || !kind) invalid.push(i + 2);
@@ -2223,7 +2892,7 @@ const startOfWeek = d => {
 const toLocalInput = d => `${ymdLocal(d)}T${hhmmLocal(d)}`;
 const fromLocalInput = v => new Date(v);
 const sameYmd = (a, b) => ymdLocal(a) === ymdLocal(b);
-const eventColor = e => e.kind === "shared" ? "var(--green)" : e.kind === "p0" ? "var(--blue)" : "var(--ochre)";
+const eventColor = e => e.kind === "shared" ? sharedColor() : slotColor(e.kind === "p0" ? 0 : 1);
 const ownerName = (e, people) => e.kind === "shared" ? t("shared") : e.kind === "p0" ? people[0] : people[1];
 
 // Expands recurring events into concrete occurrences inside [from, to].
