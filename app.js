@@ -27,19 +27,32 @@ const setCatRegistry = r => {
 };
 // Resolves any category id, including custom and deactivated ones, so
 // historical expenses always stay readable.
+const builtinEntry = c => ({
+  id: c.id,
+  icon: c.icon,
+  defaultIcon: c.icon,
+  label: null,
+  custom: false,
+  active: true,
+  rowId: null,
+  overridden: false
+});
 const catEntry = id => {
   if (CAT_REGISTRY && CAT_REGISTRY.byId[id]) return CAT_REGISTRY.byId[id];
-  return BUILTIN_CATEGORIES.find(c => c.id === id) || null;
+  const b = BUILTIN_CATEGORIES.find(c => c.id === id);
+  return b ? builtinEntry(b) : null;
 };
 const catLabel = c => {
   const id = c && c.id ? c.id : c;
   const e = catEntry(id);
-  if (e && e.custom) return e.label;
   if (!e) return String(id);
+  // A household-specific name (rename or custom category) wins; built-ins
+  // without an override fall back to the translated default.
+  if (e.label) return e.label;
   return t("cat_" + id);
 };
 // Categories offered for new expenses: active ones only.
-const activeCategories = () => CAT_REGISTRY ? CAT_REGISTRY.active : BUILTIN_CATEGORIES;
+const activeCategories = () => CAT_REGISTRY ? CAT_REGISTRY.active : BUILTIN_CATEGORIES.map(builtinEntry);
 // Budgets keep showing any category that still has a budget configured, even
 // after it was deactivated, so nothing silently disappears.
 const budgetCategories = budgets => {
@@ -763,11 +776,17 @@ function Dashboard({
     catRows.forEach(r => configured[r.category_key] = r);
     BUILTIN_CATEGORIES.forEach(c => {
       const row = configured[c.id];
+      // No row at all == the untouched default. A row exists only where this
+      // household deviates: renamed, re-iconed or switched off.
       const entry = {
-        ...c,
+        id: c.id,
+        icon: row && row.icon || c.icon,
+        defaultIcon: c.icon,
+        label: row && row.label || null,
         custom: false,
         active: row ? row.active : true,
-        rowId: row ? row.id : null
+        rowId: row ? row.id : null,
+        overridden: !!(row && (row.label || row.icon))
       };
       byId[c.id] = entry;
       all.push(entry);
@@ -778,9 +797,11 @@ function Dashboard({
         id: r.category_key,
         label: r.label,
         icon: r.icon || "🏷️",
+        defaultIcon: r.icon || "🏷️",
         custom: true,
         active: r.active && !r.archived_at,
-        rowId: r.id
+        rowId: r.id,
+        overridden: true
       };
       byId[entry.id] = entry;
       all.push(entry);
@@ -2283,6 +2304,11 @@ function SettingsPage({
 }
 
 // ---------- Category settings ----------
+// Storage model is sparse on purpose: a household_categories row exists only
+// where a household deviates from the built-in defaults (renamed, re-iconed,
+// switched off) or defines a category of its own. A household with no rows —
+// including every brand-new one — therefore starts with the full built-in set
+// active, and no default is ever duplicated per household.
 function CategorySettings({
   hhId,
   user,
@@ -2292,180 +2318,278 @@ function CategorySettings({
 }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
-  const [adding, setAdding] = useState(false);
-  const [editId, setEditId] = useState(null);
-  const [form, setForm] = useState({
-    label: "",
-    icon: "🏷️"
-  });
+  const [editing, setEditing] = useState(null);
 
-  // A household starts with no configuration rows, meaning "all built-ins on".
-  // The first change materialises rows for every built-in so the toggle state
-  // is explicit from then on. Historical expenses are never touched.
-  const seedIfNeeded = async () => {
-    if (categories.rows.length > 0) return;
-    const rows = BUILTIN_CATEGORIES.map((c, i) => ({
-      household_id: hhId,
-      category_key: c.id,
-      is_custom: false,
-      active: true,
-      sort_order: i,
-      created_by: user.id
-    }));
+  // Writes the household's deviation for one category. If a built-in ends up
+  // matching the default again, its row is removed rather than left behind, so
+  // the table keeps holding only real differences.
+  const writeOverride = async (cat, next) => {
+    const label = (next.label || "").trim() || null;
+    const icon = (next.icon || "").trim() || null;
+    const active = next.active !== false;
+    if (!cat.custom) {
+      const deviates = !!label || (!!icon && icon !== cat.defaultIcon) || !active;
+      if (!deviates) {
+        if (cat.rowId) {
+          const {
+            error
+          } = await db.from("household_categories").delete().eq("id", cat.rowId);
+          if (error) throw new Error(error.message);
+        }
+        return;
+      }
+    }
     const {
       error
-    } = await db.from("household_categories").insert(rows);
+    } = await db.from("household_categories").upsert({
+      household_id: hhId,
+      category_key: cat.id,
+      is_custom: !!cat.custom,
+      label,
+      icon,
+      active,
+      archived_at: active ? null : cat.custom ? new Date().toISOString() : null,
+      created_by: user.id
+    }, {
+      onConflict: "household_id,category_key"
+    });
     if (error) throw new Error(error.message);
   };
-  const toggle = async cat => {
+  const run = async (fn, okMsg) => {
     setBusy(true);
     setErr(null);
     try {
-      await seedIfNeeded();
+      await fn();
+      if (okMsg) showToast(okMsg);
+      setEditing(null);
+      onChanged();
+    } catch (e) {
+      setErr(t("category_save_failed") + (e.message || String(e)));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const toggle = cat => run(() => writeOverride(cat, {
+    label: cat.label,
+    icon: cat.custom ? cat.icon : cat.icon === cat.defaultIcon ? null : cat.icon,
+    active: !cat.active
+  }), cat.active ? t("category_disabled") : t("category_enabled"));
+
+  // "Remove" never risks history: a category that was ever booked against is
+  // archived instead of deleted, so old expenses keep resolving their label.
+  const removeCategory = cat => run(async () => {
+    const [exp, bud] = await Promise.all([db.from("expenses").select("id", {
+      count: "exact",
+      head: true
+    }).eq("household_id", hhId).eq("category", cat.id), db.from("budgets").select("id", {
+      count: "exact",
+      head: true
+    }).eq("household_id", hhId).eq("category", cat.id)]);
+    if (exp.error) throw new Error(exp.error.message);
+    if (bud.error) throw new Error(bud.error.message);
+    const used = (exp.count || 0) + (bud.count || 0) > 0;
+    if (cat.custom && !used && cat.rowId) {
       const {
         error
-      } = await db.from("household_categories").upsert({
-        household_id: hhId,
-        category_key: cat.id,
-        is_custom: !!cat.custom,
-        label: cat.custom ? cat.label : null,
-        icon: cat.custom ? cat.icon : null,
-        active: !cat.active,
-        created_by: user.id
-      }, {
-        onConflict: "household_id,category_key"
-      });
+      } = await db.from("household_categories").delete().eq("id", cat.rowId);
       if (error) throw new Error(error.message);
-      onChanged();
-    } catch (e) {
-      setErr(t("category_save_failed") + (e.message || String(e)));
-    } finally {
-      setBusy(false);
-    }
-  };
-  const submitCustom = async () => {
-    const label = form.label.trim();
-    if (label.length < 2 || label.length > 30) {
-      setErr(t("category_name_invalid"));
+      showToast(t("category_removed"));
       return;
     }
-    setBusy(true);
-    setErr(null);
-    try {
-      await seedIfNeeded();
-      if (editId) {
-        const {
-          error
-        } = await db.from("household_categories").update({
-          label,
-          icon: form.icon || "🏷️"
-        }).eq("id", editId);
-        if (error) throw new Error(error.message);
-      } else {
-        const key = "custom_" + Math.random().toString(36).slice(2, 10);
-        const {
-          error
-        } = await db.from("household_categories").insert({
-          household_id: hhId,
-          category_key: key,
-          is_custom: true,
-          label,
-          icon: form.icon || "🏷️",
-          active: true,
-          sort_order: 100 + categories.rows.length,
-          created_by: user.id
-        });
-        if (error) throw new Error(error.message);
-      }
-      showToast(t("category_saved"));
-      setAdding(false);
-      setEditId(null);
-      setForm({
-        label: "",
-        icon: "🏷️"
+    await writeOverride(cat, {
+      label: cat.label,
+      icon: cat.custom ? cat.icon : null,
+      active: false
+    });
+    showToast(used ? t("category_archived_used") : t("category_archived"));
+  });
+  const resetToDefault = cat => run(() => writeOverride(cat, {
+    label: null,
+    icon: null,
+    active: cat.active
+  }), t("category_reset"));
+  const saveEdit = form => run(async () => {
+    const label = form.label.trim();
+    if (label.length < 2 || label.length > 30) throw new Error(t("category_name_invalid"));
+    if (form.isNew) {
+      const key = "custom_" + Math.random().toString(36).slice(2, 10);
+      const {
+        error
+      } = await db.from("household_categories").insert({
+        household_id: hhId,
+        category_key: key,
+        is_custom: true,
+        label,
+        icon: form.icon.trim() || "🏷️",
+        active: form.active,
+        sort_order: 100 + categories.rows.length,
+        created_by: user.id
       });
-      onChanged();
-    } catch (e) {
-      setErr(t("category_save_failed") + (e.message || String(e)));
-    } finally {
-      setBusy(false);
+      if (error) throw new Error(error.message);
+    } else {
+      // A built-in keeps its stable key; only the household's display
+      // override changes, so historical expenses never need rewriting.
+      await writeOverride(form.cat, {
+        label: form.cat.custom ? label : label === t("cat_" + form.cat.id) ? null : label,
+        icon: form.icon.trim(),
+        active: form.active
+      });
     }
-  };
-  const all = categories.all;
+  }, t("category_saved"));
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     style: S.privacyNote
   }, t("categories_hint")), err && /*#__PURE__*/React.createElement("div", {
     style: S.errBox
-  }, err), all.map(c => /*#__PURE__*/React.createElement("div", {
+  }, err), categories.all.map(c => /*#__PURE__*/React.createElement("div", {
     key: c.id,
     style: S.namesRow
   }, /*#__PURE__*/React.createElement("span", {
     style: {
-      opacity: c.active ? 1 : 0.5
-    }
-  }, c.icon, " ", catLabel(c), c.custom ? " · " + t("custom_badge") : ""), /*#__PURE__*/React.createElement("span", {
-    style: {
+      opacity: c.active ? 1 : 0.5,
       display: "flex",
-      gap: 4
+      alignItems: "center",
+      gap: 8,
+      minWidth: 0
     }
-  }, c.custom && /*#__PURE__*/React.createElement("button", {
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 18
+    }
+  }, c.icon), /*#__PURE__*/React.createElement("span", {
+    style: {
+      overflow: "hidden",
+      textOverflow: "ellipsis",
+      whiteSpace: "nowrap"
+    }
+  }, catLabel(c)), !c.active && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: "var(--muted)"
+    }
+  }, "· " + t("inactive"))), /*#__PURE__*/React.createElement("button", {
     style: S.miniBtn,
     disabled: busy,
-    onClick: () => {
-      setEditId(c.rowId);
-      setForm({
-        label: c.label,
-        icon: c.icon
-      });
-      setAdding(true);
-    }
-  }, t("edit")), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setEditing({
+      cat: c,
+      isNew: false,
+      label: catLabel(c),
+      icon: c.icon,
+      active: c.active
+    })
+  }, t("edit")))), /*#__PURE__*/React.createElement("button", {
     style: {
-      ...S.miniBtn,
-      ...(c.active ? S.chipOn : {})
+      ...S.ghostBtn,
+      marginTop: 10
     },
     disabled: busy,
-    onClick: () => toggle(c)
-  }, c.active ? t("on") : t("off"))))), adding ? /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginTop: 10
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: S.fieldLabel
-  }, t("category_name")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 8
-    }
-  }, /*#__PURE__*/React.createElement("input", {
-    style: {
-      ...S.input,
-      width: 70,
-      textAlign: "center"
-    },
-    value: form.icon,
-    maxLength: 4,
-    onChange: e => setForm({
-      ...form,
-      icon: e.target.value
+    onClick: () => setEditing({
+      cat: null,
+      isNew: true,
+      label: "",
+      icon: "🏷️",
+      active: true
     })
-  }), /*#__PURE__*/React.createElement("input", {
+  }, "＋ " + t("add_category")), editing && /*#__PURE__*/React.createElement(CategoryEditor, {
+    form: editing,
+    busy: busy,
+    onChange: setEditing,
+    onCancel: () => setEditing(null),
+    onSave: () => saveEdit(editing),
+    onToggle: () => toggle(editing.cat),
+    onRemove: () => removeCategory(editing.cat),
+    onReset: () => resetToDefault(editing.cat)
+  }));
+}
+
+// ---------- Category edit modal ----------
+function CategoryEditor({
+  form,
+  busy,
+  onChange,
+  onCancel,
+  onSave,
+  onToggle,
+  onRemove,
+  onReset
+}) {
+  const [confirmRemove, setConfirmRemove] = useState(false);
+  const cat = form.cat;
+  const set = (k, v) => onChange({
+    ...form,
+    [k]: v
+  });
+  return /*#__PURE__*/React.createElement("div", {
+    style: S.modalWrap,
+    onClick: onCancel
+  }, /*#__PURE__*/React.createElement("div", {
+    style: S.modalCard,
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("h2", {
     style: {
-      ...S.input,
-      flex: 1
-    },
+      ...S.pageTitle,
+      marginTop: 0
+    }
+  }, form.isNew ? t("add_category") : t("edit_category")), /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("category_name")), /*#__PURE__*/React.createElement("input", {
+    style: S.input,
     value: form.label,
     maxLength: 30,
     placeholder: t("category_name_ph"),
-    onChange: e => setForm({
-      ...form,
-      label: e.target.value
-    })
-  })), /*#__PURE__*/React.createElement("div", {
+    onChange: e => set("label", e.target.value)
+  }), /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("category_icon")), /*#__PURE__*/React.createElement("input", {
+    style: {
+      ...S.input,
+      width: 90,
+      textAlign: "center",
+      fontSize: 20
+    },
+    value: form.icon,
+    maxLength: 4,
+    onChange: e => set("icon", e.target.value)
+  }), !form.isNew && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("status")), /*#__PURE__*/React.createElement("div", {
+    style: S.segWide
+  }, /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.segBtn,
+      ...(form.active ? S.segOn : {})
+    },
+    disabled: busy,
+    onClick: () => {
+      if (!form.active) onToggle();
+    }
+  }, t("active")), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.segBtn,
+      ...(!form.active ? S.segOn : {})
+    },
+    disabled: busy,
+    onClick: () => {
+      if (form.active) onToggle();
+    }
+  }, t("inactive")))), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.primaryBtn,
+      opacity: busy ? 0.6 : 1
+    },
+    disabled: busy,
+    onClick: onSave
+  }, busy ? t("saving") : t("save")), !form.isNew && cat && !cat.custom && cat.overridden && /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.ghostBtn,
+      marginTop: 8
+    },
+    disabled: busy,
+    onClick: onReset
+  }, t("reset_default")), !form.isNew && confirmRemove ? /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 8,
-      marginTop: 10
+      marginTop: 8
     }
   }, /*#__PURE__*/React.createElement("button", {
     style: {
@@ -2473,35 +2597,36 @@ function CategorySettings({
       marginTop: 0,
       flex: 1,
       width: "auto",
-      opacity: busy ? 0.6 : 1
+      background: "var(--danger)"
     },
     disabled: busy,
-    onClick: submitCustom
-  }, t("save")), /*#__PURE__*/React.createElement("button", {
+    onClick: onRemove
+  }, t("remove")), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.ghostBtn,
       marginTop: 0,
       flex: 1,
       width: "auto"
     },
-    onClick: () => {
-      setAdding(false);
-      setEditId(null);
-    }
-  }, t("cancel")))) : /*#__PURE__*/React.createElement("button", {
+    onClick: () => setConfirmRemove(false)
+  }, t("cancel"))) : !form.isNew && /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.ghostBtn,
-      marginTop: 10
+      marginTop: 8,
+      color: "var(--danger)",
+      borderColor: "var(--danger)"
     },
-    onClick: () => {
-      setEditId(null);
-      setForm({
-        label: "",
-        icon: "🏷️"
-      });
-      setAdding(true);
-    }
-  }, "＋ " + t("add_category")));
+    disabled: busy,
+    onClick: () => setConfirmRemove(true)
+  }, t("remove")), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.ghostBtn,
+      marginTop: 8
+    },
+    onClick: onCancel
+  }, t("cancel")), !form.isNew && /*#__PURE__*/React.createElement("div", {
+    style: S.privacyNote
+  }, t("category_remove_hint"))));
 }
 
 // ---------- Shell for a signed-in user without a household ----------

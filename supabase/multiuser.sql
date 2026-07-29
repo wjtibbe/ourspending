@@ -124,7 +124,21 @@ end $$;
 -- values keep resolving.
 --
 -- Backwards compatible by design: zero rows for a household == every built-in
--- category active, which is exactly the pre-migration behaviour.
+-- category active, which is exactly the pre-migration behaviour. That is also
+-- how a brand-new household starts: with the complete built-in set, without a
+-- single row being written.
+--
+-- Rows are sparse — one exists only where a household actually deviates:
+--   is_custom = false  -> an override of a built-in. label/icon override the
+--                         app's default for THIS household only; the built-in
+--                         definition is global and never mutated, and
+--                         category_key stays the stable key that historical
+--                         expenses reference. A row whose override is undone
+--                         is deleted rather than kept, so the table keeps
+--                         holding only real differences.
+--   is_custom = true   -> a category this household invented.
+-- active = false (plus archived_at for custom rows) is the archive state used
+-- when a category that has history is "removed".
 create table if not exists public.household_categories (
   id uuid primary key default gen_random_uuid(),
   household_id uuid not null references public.households(id) on delete cascade,
