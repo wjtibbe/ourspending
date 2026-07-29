@@ -22,12 +22,8 @@ const numLocale = () => window.I18N.lang === "es" ? "es-CO" : "en-US";
 // configuration is loaded; until then the built-in defaults apply, which is
 // exactly the pre-multi-household behaviour.
 let CAT_REGISTRY = null;
-let COLOR_REGISTRY = null;
 const setCatRegistry = r => {
   CAT_REGISTRY = r;
-};
-const setColorRegistry = r => {
-  COLOR_REGISTRY = r;
 };
 // Resolves any category id, including custom and deactivated ones, so
 // historical expenses always stay readable.
@@ -58,13 +54,6 @@ const budgetCategories = budgets => {
   return list;
 };
 const isKnownCategory = id => !!catEntry(id);
-// Slot/shared colours come from the household + profiles, never from a name.
-const slotColor = slot => {
-  const fallback = slot === 0 ? "var(--blue)" : "var(--ochre)";
-  if (!COLOR_REGISTRY) return fallback;
-  return COLOR_REGISTRY.members[slot] || fallback;
-};
-const sharedColor = () => COLOR_REGISTRY && COLOR_REGISTRY.shared || "var(--green)";
 
 // ============================================================
 //  CONSTANTS
@@ -132,6 +121,44 @@ const SYMBOL = {
   USD: "$",
   COP: "COP"
 };
+
+// ============================================================
+//  CONFIGURABLE PERSON/SHARED COLORS
+// ============================================================
+// The app's original hardcoded defaults (same hues as the --blue/--ochre/
+// --green CSS tokens) - kept as the fallback so an existing household sees
+// NO visual change until it deliberately picks a color in Settings.
+const DEFAULT_COLORS = {
+  shared: "#1F6B4E",
+  p0: "#33608D",
+  p1: "#A6641C"
+};
+// A curated, readable-with-white-text palette for the Settings color picker
+// - deliberately not a free-form input, so every choice stays legible
+// (incl. in dark mode, where labels/badges still render white-on-color)
+// and visually consistent with the rest of the app.
+const COLOR_PALETTE = ["#33608D", "#1F6B4E", "#A6641C", "#0E7490", "#4338CA", "#8E4585", "#BE185D", "#B91C1C", "#C2410C", "#92400E", "#15803D", "#525252"];
+const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+/** True only for a well-formed 6-digit hex color - anything else (null, "", "orange") is rejected rather than trusted. */
+const isValidColor = v => typeof v === "string" && HEX_COLOR_RE.test(v);
+/**
+ * Resolves the three colors the app actually uses (shared, person 0, person
+ * 1) from persisted household/member rows, falling back to the original
+ * defaults for anything missing/invalid - existing households (or a
+ * database that hasn't run the color-columns upgrade yet) render exactly as
+ * before.
+ */
+function resolveColors(household, members) {
+  const p0 = (members || []).find(m => m.slot === 0);
+  const p1 = (members || []).find(m => m.slot === 1);
+  return {
+    shared: isValidColor(household && household.shared_color) ? household.shared_color : DEFAULT_COLORS.shared,
+    p0: isValidColor(p0 && p0.color) ? p0.color : DEFAULT_COLORS.p0,
+    p1: isValidColor(p1 && p1.color) ? p1.color : DEFAULT_COLORS.p1
+  };
+}
+/** The single place that maps a "kind" ("shared"/"p0"/"p1" - the same tag expenses AND calendar events use) to its configured color, so a color chosen in Settings has one consistent meaning everywhere it's used. */
+const colorForKind = (kind, colors) => kind === "p0" ? colors.p0 : kind === "p1" ? colors.p1 : colors.shared;
 const perEur = (cur, r) => cur === "EUR" ? 1 : cur === "USD" ? r.usdPerEur : r.copPerEur;
 const toEUR = (a, cur, r) => a / perEur(cur, r);
 const fromEUR = (a, cur, r) => a * perEur(cur, r);
@@ -673,6 +700,7 @@ function Dashboard({
   useEffect(() => {
     loadCategories();
   }, [loadCategories]);
+  const colors = resolveColors(household, members);
   const loadAll = useCallback(async () => {
     const [{
       data: hh
@@ -681,7 +709,8 @@ function Dashboard({
     }, {
       data: bud
     }, {
-      data: mem
+      data: mem,
+      error: memErr
     }] = await Promise.all([db.from("households").select("*").eq("id", hhId).single(), db.from("expenses").select("*").eq("household_id", hhId).order("spent_on", {
       ascending: false
     }), db.from("budgets").select("*").eq("household_id", hhId), db.from("profiles").select("id, display_name, slot, color").eq("household_id", hhId)]);
@@ -693,6 +722,7 @@ function Dashboard({
       setBudgets(b);
     }
     if (mem) setMembers(mem);
+    else if (memErr) showToast(t("load_failed") + memErr.message);
   }, [hhId]);
   useEffect(() => {
     loadAll();
@@ -764,10 +794,6 @@ function Dashboard({
     };
   })();
   setCatRegistry(categories);
-  setColorRegistry({
-    shared: household && household.shared_color || null,
-    members: [members.find(m => m.slot === 0) && members.find(m => m.slot === 0).color || null, members.find(m => m.slot === 1) && members.find(m => m.slot === 1).color || null]
-  });
   const disp = eur => fmt(ceilCur(fromEUR(eur, displayCur, rates), displayCur), displayCur);
   const monthExpenses = expenses.filter(e => {
     if (rangeMode) return e.spent_on >= range.from && e.spent_on <= range.to;
@@ -901,6 +927,34 @@ function Dashboard({
     showToast(t("source_saved"));
     loadAll();
   };
+  const saveColor = async (who, hex) => {
+    // Apply locally first so the swatch (and every screen using it) updates
+    // the instant you click, instead of waiting on a round trip.
+    if (who === "shared") {
+      setHousehold(h => h ? { ...h, shared_color: hex } : h);
+    } else {
+      const slot = who === "p0" ? 0 : 1;
+      setMembers(ms => ms.map(m => m.slot === slot ? { ...m, color: hex } : m));
+    }
+    let error;
+    if (who === "shared") {
+      ({ error } = await db.from("households").update({
+        shared_color: hex
+      }).eq("id", hhId));
+    } else {
+      const slot = who === "p0" ? 0 : 1;
+      const member = members.find(m => m.slot === slot);
+      if (member) ({ error } = await db.from("profiles").update({
+        color: hex
+      }).eq("id", member.id));
+    }
+    if (error) {
+      showToast(t("save_failed") + error.message);
+    } else {
+      showToast(t("color_saved"));
+    }
+    loadAll();
+  };
   if (!household) return /*#__PURE__*/React.createElement("div", {
     style: {
       padding: 60,
@@ -970,6 +1024,7 @@ function Dashboard({
     themeMode: themeMode,
     onSetTheme: changeTheme,
     people: people,
+    colors: colors,
     month: month,
     setMonth: setMonth,
     rangeMode: rangeMode,
@@ -993,6 +1048,7 @@ function Dashboard({
       setTab("overview");
     },
     people: people,
+    colors: colors,
     rates: rates,
     defaultCurrency: CURRENCIES.includes(profile.preferred_currency) ? profile.preferred_currency : "EUR",
     saving: false,
@@ -1015,6 +1071,8 @@ function Dashboard({
     user: user,
     profile: profile,
     household: household,
+    colors: colors,
+    onSaveColor: saveColor,
     people: people,
     members: members,
     hhId: hhId,
@@ -1042,6 +1100,7 @@ function Dashboard({
     user: user,
     profile: profile,
     people: people,
+    colors: colors,
     showToast: showToast
   })), toast && /*#__PURE__*/React.createElement("div", {
     style: S.toast
@@ -1056,6 +1115,11 @@ function Dashboard({
     icon: "📒",
     label: t("tab_overview")
   }), /*#__PURE__*/React.createElement(TabBtn, {
+    active: tab === "groceries",
+    onClick: () => setTab("groceries"),
+    icon: "🛒",
+    label: t("tab_list")
+  }), /*#__PURE__*/React.createElement(TabBtn, {
     active: tab === "add",
     onClick: () => {
       setEditingExpense(null);
@@ -1064,11 +1128,6 @@ function Dashboard({
     icon: "＋",
     label: t("tab_add"),
     big: true
-  }), /*#__PURE__*/React.createElement(TabBtn, {
-    active: tab === "groceries",
-    onClick: () => setTab("groceries"),
-    icon: "🛒",
-    label: t("tab_list")
   }), /*#__PURE__*/React.createElement(TabBtn, {
     active: tab === "calendar",
     onClick: () => setTab("calendar"),
@@ -1093,16 +1152,16 @@ function TabBtn({
       ...S.tabBtn,
       ...(active ? S.tabActive : {})
     },
-    onClick: onClick
+    onClick: onClick,
+    "aria-current": active ? "page" : undefined,
+    "aria-label": label
   }, /*#__PURE__*/React.createElement("span", {
     style: big ? S.tabIconBig : S.tabIcon
   }, icon), /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 11
-    }
+    style: S.tabLabel
   }, label));
 }
-const kindDot = e => e.kind === "shared" ? sharedColor() : slotColor(e.kind === "p0" ? 0 : 1);
+const kindDot = (e, colors) => colorForKind(e.kind, colors);
 const kindText = (e, people) => e.kind === "shared" ? t("kind_shared_paid", {
   name: people[e.payer]
 }) : t("kind_private", {
@@ -1118,6 +1177,7 @@ function Overview({
   themeMode,
   onSetTheme,
   people,
+  colors,
   month,
   setMonth,
   rangeMode,
@@ -1280,19 +1340,19 @@ function Overview({
   }, /*#__PURE__*/React.createElement("div", {
     style: {
       height: "100%",
-      background: "var(--green)",
+      background: colors.shared,
       width: pct(sharedTotal) + "%"
     }
   }), /*#__PURE__*/React.createElement("div", {
     style: {
       height: "100%",
-      background: "var(--blue)",
+      background: colors.p0,
       width: pct(priv[0]) + "%"
     }
   }), /*#__PURE__*/React.createElement("div", {
     style: {
       height: "100%",
-      background: "var(--ochre)",
+      background: colors.p1,
       width: pct(priv[1]) + "%"
     }
   })), /*#__PURE__*/React.createElement("div", {
@@ -1300,17 +1360,17 @@ function Overview({
   }, /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("i", {
     style: {
       ...S.dot,
-      background: "var(--green)"
+      background: colors.shared
     }
   }), t("shared") + " ", disp(sharedTotal)), /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("i", {
     style: {
       ...S.dot,
-      background: "var(--blue)"
+      background: colors.p0
     }
   }), people[0], " ", disp(priv[0])), /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("i", {
     style: {
       ...S.dot,
-      background: "var(--ochre)"
+      background: colors.p1
     }
   }), people[1], " ", disp(priv[1]))), sharedTotal > 0 && /*#__PURE__*/React.createElement("div", {
     style: S.sharedPaid
@@ -1420,7 +1480,7 @@ function Overview({
         width: 18,
         height: 18,
         borderRadius: "50%",
-        background: kindDot(e),
+        background: kindDot(e, colors),
         color: "var(--on-accent)",
         fontSize: 9,
         fontWeight: 700,
@@ -1430,7 +1490,7 @@ function Overview({
       style: {
         fontSize: 12,
         fontWeight: 600,
-        color: kindDot(e)
+        color: kindDot(e, colors)
       }
     }, kindText(e, people)))), /*#__PURE__*/React.createElement("div", {
       style: {
@@ -1478,6 +1538,7 @@ function Overview({
 // ---------- Add expense ----------
 function AddExpense({
   people,
+  colors,
   rates,
   defaultCurrency,
   onAdd,
@@ -1621,19 +1682,28 @@ function AddExpense({
   }, /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.segBtn,
-      ...(kind === "shared" ? S.segOn : {})
+      ...(kind === "shared" ? {
+        background: colors.shared,
+        color: "var(--on-accent)"
+      } : {})
     },
     onClick: () => setKind("shared")
   }, t("shared")), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.segBtn,
-      ...(kind === "p0" ? S.segOnA : {})
+      ...(kind === "p0" ? {
+        background: colors.p0,
+        color: "var(--on-accent)"
+      } : {})
     },
     onClick: () => setKind("p0")
   }, people[0]), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.segBtn,
-      ...(kind === "p1" ? S.segOnB : {})
+      ...(kind === "p1" ? {
+        background: colors.p1,
+        color: "var(--on-accent)"
+      } : {})
     },
     onClick: () => setKind("p1")
   }, people[1])), /*#__PURE__*/React.createElement("div", {
@@ -1648,7 +1718,10 @@ function AddExpense({
     key: i,
     style: {
       ...S.segBtn,
-      ...(payer === i ? i === 0 ? S.segOnA : S.segOnB : {})
+      ...(payer === i ? {
+        background: i === 0 ? colors.p0 : colors.p1,
+        color: "var(--on-accent)"
+      } : {})
     },
     onClick: () => setPayer(i)
   }, p)))), /*#__PURE__*/React.createElement("div", {
@@ -1699,6 +1772,41 @@ function AddExpense({
     },
     onClick: onCancelEdit
   }, t("cancel")));
+}
+
+// ---------- Color swatch picker ----------
+function ColorSwatchRow({ label, value, onPick }) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: { marginBottom: 12 }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: S.namesRow
+  }, /*#__PURE__*/React.createElement("span", null, label), /*#__PURE__*/React.createElement("span", {
+    style: {
+      width: 20,
+      height: 20,
+      borderRadius: "50%",
+      background: value,
+      display: "inline-block",
+      border: "1px solid var(--line)"
+    }
+  })), /*#__PURE__*/React.createElement("div", {
+    style: { display: "flex", flexWrap: "wrap", gap: 8, marginTop: 6 }
+  }, COLOR_PALETTE.map(hex => /*#__PURE__*/React.createElement("button", {
+    key: hex,
+    type: "button",
+    onClick: () => onPick(hex),
+    "aria-label": hex,
+    "aria-pressed": value === hex,
+    style: {
+      width: 28,
+      height: 28,
+      borderRadius: "50%",
+      background: hex,
+      border: value === hex ? "3px solid var(--ink)" : "2px solid transparent",
+      padding: 0,
+      cursor: "pointer"
+    }
+  }))));
 }
 
 // ---------- Budgets & settings ----------
@@ -1827,38 +1935,12 @@ function Budgets({
 const CURRENCY_CHOICES = ["EUR", "USD", "COP"];
 // Palette offered for member/shared colours. Values are concrete hex so they
 // survive light/dark theme switches and round-trip through the database.
-const COLOR_CHOICES = ["#1F6B4E", "#33608D", "#A6641C", "#7A4E9E", "#B3372E", "#0E7C7B", "#C97A1F", "#4A5D23"];
-function ColorPicker({
-  value,
-  fallback,
-  onPick
-}) {
-  return /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      flexWrap: "wrap",
-      gap: 8,
-      marginTop: 6
-    }
-  }, COLOR_CHOICES.map(c => /*#__PURE__*/React.createElement("button", {
-    key: c,
-    "aria-label": c,
-    style: {
-      width: 30,
-      height: 30,
-      borderRadius: "50%",
-      background: c,
-      cursor: "pointer",
-      border: (value || fallback) === c ? "3px solid var(--ink)" : "1px solid var(--line)",
-      padding: 0
-    },
-    onClick: () => onPick(c)
-  })));
-}
 function SettingsPage({
   user,
   profile,
   household,
+  colors,
+  onSaveColor,
   people,
   members,
   hhId,
@@ -1925,32 +2007,6 @@ function SettingsPage({
     }
     showToast(t("currency_saved"));
     onProfileChanged();
-  };
-  const saveMyColor = async c => {
-    const {
-      error
-    } = await db.from("profiles").update({
-      color: c
-    }).eq("id", user.id);
-    if (error) {
-      setErr(t("color_save_failed") + error.message);
-      return;
-    }
-    showToast(t("color_saved"));
-    onProfileChanged();
-  };
-  const saveSharedColor = async c => {
-    const {
-      error
-    } = await db.from("households").update({
-      shared_color: c
-    }).eq("id", hhId);
-    if (error) {
-      setErr(t("color_save_failed") + error.message);
-      return;
-    }
-    showToast(t("color_saved"));
-    onHouseholdChanged();
   };
   const copyCode = () => {
     if (!household || !household.invite_code) return;
@@ -2020,13 +2076,11 @@ function SettingsPage({
     onClick: () => saveCurrency(c)
   }, c === "COP" ? "COP" : SYMBOL[c] + " " + c))), /*#__PURE__*/React.createElement("div", {
     style: S.privacyNote
-  }, t("default_currency_hint")), mySlot != null && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
-    style: S.fieldLabel
-  }, t("my_colour")), /*#__PURE__*/React.createElement(ColorPicker, {
-    value: profile.color,
-    fallback: mySlot === 0 ? "#33608D" : "#A6641C",
-    onPick: saveMyColor
-  })), /*#__PURE__*/React.createElement("div", {
+  }, t("default_currency_hint")), mySlot != null && /*#__PURE__*/React.createElement(ColorSwatchRow, {
+    label: t("my_colour"),
+    value: mySlot === 0 ? colors.p0 : colors.p1,
+    onPick: hex => onSaveColor(mySlot === 0 ? "p0" : "p1", hex)
+  }), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
   }, t("language")), /*#__PURE__*/React.createElement("div", {
     style: S.segWide
@@ -2070,15 +2124,23 @@ function SettingsPage({
       width: 14,
       height: 14,
       borderRadius: "50%",
-      background: m.color || (m.slot === 0 ? "#33608D" : "#A6641C"),
+      background: m.slot === 0 ? colors.p0 : colors.p1,
       display: "inline-block"
     }
   }), m.display_name, m.id === user.id ? " · " + t("you") : ""))), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
-  }, t("shared_colour")), /*#__PURE__*/React.createElement(ColorPicker, {
-    value: household.shared_color,
-    fallback: "#1F6B4E",
-    onPick: saveSharedColor
+  }, t("colors")), /*#__PURE__*/React.createElement(ColorSwatchRow, {
+    label: t("shared"),
+    value: colors.shared,
+    onPick: hex => onSaveColor("shared", hex)
+  }), /*#__PURE__*/React.createElement(ColorSwatchRow, {
+    label: people[0],
+    value: colors.p0,
+    onPick: hex => onSaveColor("p0", hex)
+  }), /*#__PURE__*/React.createElement(ColorSwatchRow, {
+    label: people[1],
+    value: colors.p1,
+    onPick: hex => onSaveColor("p1", hex)
   }), /*#__PURE__*/React.createElement("div", {
     style: S.fieldLabel
   }, t("invite_share")), /*#__PURE__*/React.createElement("div", {
@@ -2892,11 +2954,22 @@ const startOfWeek = d => {
 const toLocalInput = d => `${ymdLocal(d)}T${hhmmLocal(d)}`;
 const fromLocalInput = v => new Date(v);
 const sameYmd = (a, b) => ymdLocal(a) === ymdLocal(b);
-const eventColor = e => e.kind === "shared" ? sharedColor() : slotColor(e.kind === "p0" ? 0 : 1);
+const eventColor = (e, colors) => colorForKind(e.kind, colors);
 const ownerName = (e, people) => e.kind === "shared" ? t("shared") : e.kind === "p0" ? people[0] : people[1];
 
+// 0 = Sunday ... 6 = Saturday, same convention as Date#getDay().
+const isWeekendDate = d => {
+  const dow = d.getDay();
+  return dow === 0 || dow === 6;
+};
+
 // Expands recurring events into concrete occurrences inside [from, to].
-// Guarded so a malformed rule can never loop away.
+// Guarded so a malformed rule can never loop away. "weekday" is its own
+// recurrence rule (conceptually BYDAY=MO,TU,WE,TH,FR): it advances one day
+// at a time like "daily", but Saturday/Sunday are never emitted as
+// occurrences - this is a real exclusion in the rule itself, not "daily"
+// with weekends hidden afterwards, so every consumer (rendering, badges,
+// ICS export) sees the same skipped dates.
 function expandEvents(rows, from, to) {
   const out = [];
   rows.forEach(e => {
@@ -2917,13 +2990,14 @@ function expandEvents(rows, from, to) {
     while (cur <= to && guard++ < 500) {
       if (until && cur > until) break;
       const cEnd = new Date(cur.getTime() + dur);
-      if (cEnd >= from) out.push({
+      const skipsWeekend = e.recurrence === "weekday" && isWeekendDate(cur);
+      if (!skipsWeekend && cEnd >= from) out.push({
         ...e,
         _start: new Date(cur),
         _end: cEnd,
         _recurring: true
       });
-      if (e.recurrence === "daily") cur = addDays(cur, 1);else if (e.recurrence === "weekly") cur = addDays(cur, 7);else if (e.recurrence === "biweekly") cur = addDays(cur, 14);else if (e.recurrence === "monthly") {
+      if (e.recurrence === "daily" || e.recurrence === "weekday") cur = addDays(cur, 1);else if (e.recurrence === "weekly") cur = addDays(cur, 7);else if (e.recurrence === "biweekly") cur = addDays(cur, 14);else if (e.recurrence === "monthly") {
         const n = new Date(cur);
         n.setMonth(n.getMonth() + 1);
         cur = n;
@@ -2948,6 +3022,7 @@ function Calendar({
   user,
   profile,
   people,
+  colors,
   showToast
 }) {
   const [view, setView] = useState("month");
@@ -3122,6 +3197,7 @@ function Calendar({
     cursor: cursor,
     events: events,
     people: people,
+    colors: colors,
     onDay: d => {
       setCursor(d);
       setView("day");
@@ -3135,6 +3211,7 @@ function Calendar({
     from: from,
     events: events,
     people: people,
+    colors: colors,
     onEvent: e => setModal({
       mode: "view",
       event: e
@@ -3148,6 +3225,7 @@ function Calendar({
   }, "＋ " + t("add_event")), modal && modal.mode === "view" && /*#__PURE__*/React.createElement(EventDetail, {
     event: modal.event,
     people: people,
+    colors: colors,
     canEdit: canEdit(modal.event),
     onClose: () => setModal(null),
     onEdit: () => setModal({
@@ -3181,6 +3259,7 @@ function MonthGrid({
   cursor,
   events,
   people,
+  colors,
   onDay,
   onEvent
 }) {
@@ -3215,7 +3294,7 @@ function MonthGrid({
       key: j,
       style: {
         ...S.calChip,
-        background: eventColor(e)
+        background: eventColor(e, colors)
       },
       onClick: ev => {
         ev.stopPropagation();
@@ -3233,6 +3312,7 @@ function AgendaView({
   from,
   events,
   people,
+  colors,
   onEvent
 }) {
   const days = [];
@@ -3262,7 +3342,7 @@ function AgendaView({
     }, /*#__PURE__*/React.createElement("span", {
       style: {
         ...S.calRowBar,
-        background: eventColor(e)
+        background: eventColor(e, colors)
       }
     }), /*#__PURE__*/React.createElement("span", {
       style: {
@@ -3282,6 +3362,7 @@ function AgendaView({
 function EventDetail({
   event,
   people,
+  colors,
   canEdit,
   onClose,
   onEdit,
@@ -3306,7 +3387,7 @@ function EventDetail({
       width: 12,
       height: 12,
       borderRadius: 4,
-      background: eventColor(event),
+      background: eventColor(event, colors),
       flexShrink: 0
     }
   }), /*#__PURE__*/React.createElement("h2", {
@@ -3518,7 +3599,7 @@ function EventForm({
     style: S.input,
     value: f.recurrence,
     onChange: e => set("recurrence", e.target.value)
-  }, ["none", "daily", "weekly", "biweekly", "monthly", "yearly"].map(r => /*#__PURE__*/React.createElement("option", {
+  }, ["none", "daily", "weekday", "weekly", "biweekly", "monthly", "yearly"].map(r => /*#__PURE__*/React.createElement("option", {
     key: r,
     value: r
   }, t("repeat_" + r)))), f.recurrence !== "none" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
@@ -3564,6 +3645,7 @@ const icsDay = d => ymdLocal(d).replace(/-/g, "");
 const icsRule = e => {
   const map = {
     daily: "FREQ=DAILY",
+    weekday: "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
     weekly: "FREQ=WEEKLY",
     biweekly: "FREQ=WEEKLY;INTERVAL=2",
     monthly: "FREQ=MONTHLY",
@@ -4397,13 +4479,15 @@ const S = {
     right: 0,
     maxWidth: 480,
     margin: "0 auto",
-    display: "flex",
+    display: "grid",
+    gridTemplateColumns: "minmax(0,1fr) minmax(0,1fr) auto minmax(0,1fr) minmax(0,1fr)",
+    alignItems: "center",
     background: "var(--card)",
     borderTop: "1px solid var(--line)",
     padding: "6px 8px calc(8px + env(safe-area-inset-bottom))"
   },
   tabBtn: {
-    flex: 1,
+    minWidth: 0,
     border: "none",
     background: "none",
     cursor: "pointer",
@@ -4414,6 +4498,13 @@ const S = {
     gap: 2,
     padding: "6px 0",
     borderRadius: 12
+  },
+  tabLabel: {
+    fontSize: 11,
+    maxWidth: "100%",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap"
   },
   tabActive: {
     color: "var(--green-deep)",
