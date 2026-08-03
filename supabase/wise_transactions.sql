@@ -106,32 +106,171 @@ create table if not exists public.wise_transactions (
     unique (connection_id, wise_profile_id, wise_balance_id, wise_reference)
 );
 
--- Upgrade path: if an earlier version of this file was already run, widen the
--- uniqueness scope in place rather than requiring a drop.
-do $$
-begin
-  alter table public.wise_transactions
-    alter column wise_profile_id set default '',
-    alter column wise_balance_id set default '';
-  update public.wise_transactions
-     set wise_profile_id = coalesce(wise_profile_id, ''),
-         wise_balance_id = coalesce(wise_balance_id, '')
-   where wise_profile_id is null or wise_balance_id is null;
-  alter table public.wise_transactions
-    alter column wise_profile_id set not null,
-    alter column wise_balance_id set not null;
+-- ============================================================
+--  1b. Schema convergence
+-- ============================================================
+-- `create table if not exists` above is a SILENT NO-OP when a table of this
+-- name already exists in any other shape — an earlier version of this file, or
+-- a hand-rolled first attempt. Everything below therefore assumes nothing:
+-- every column is added with IF NOT EXISTS before any default, constraint or
+-- index refers to it. On a genuinely fresh database all of these are no-ops.
+alter table public.wise_transactions
+  add column if not exists connection_id uuid
+    references public.provider_connections(id) on delete cascade,
+  add column if not exists user_id uuid references auth.users(id) on delete cascade,
+  add column if not exists household_id uuid
+    references public.households(id) on delete set null,
+  add column if not exists wise_reference text,
+  add column if not exists wise_profile_id text,
+  add column if not exists wise_balance_id text,
+  add column if not exists occurred_at timestamptz,
+  add column if not exists direction text,
+  add column if not exists wise_status text,
+  add column if not exists detail_type text,
+  add column if not exists amount_value numeric,
+  add column if not exists amount_currency text,
+  add column if not exists amount_source_path text,
+  add column if not exists amount_low_confidence boolean not null default false,
+  add column if not exists merchant_amount_value numeric,
+  add column if not exists merchant_amount_currency text,
+  add column if not exists merchant_amount_source_path text,
+  add column if not exists wise_category text,
+  add column if not exists mapped_category text,
+  add column if not exists category_source text,
+  add column if not exists import_status text not null default 'pending_import',
+  add column if not exists skip_reason text,
+  add column if not exists error_summary text,
+  add column if not exists expense_id uuid references public.expenses(id) on delete set null,
+  add column if not exists raw_json jsonb,
+  add column if not exists created_at timestamptz not null default now(),
+  add column if not exists updated_at timestamptz not null default now();
 
-  if exists (
+-- Foreign keys, for the same reason: when a column already existed, the
+-- ADD COLUMN above was a no-op and its REFERENCES clause never ran. The delete
+-- behaviour is part of the guarantees this table makes — ledger rows must die
+-- with their connection, and must SURVIVE the deletion of their expense so the
+-- transaction is never re-imported — so each key is ensured explicitly.
+do $$
+declare
+  fk record;
+begin
+  for fk in
+    select * from (values
+      ('connection_id', 'public.provider_connections(id)', 'cascade'),
+      ('user_id',       'auth.users(id)',                  'cascade'),
+      ('household_id',  'public.households(id)',           'set null'),
+      ('expense_id',    'public.expenses(id)',             'set null')
+    ) as t(col, target, on_delete)
+  loop
+    if not exists (
+      select 1
+        from pg_constraint c
+        join pg_attribute a
+          on a.attrelid = c.conrelid and a.attnum = any(c.conkey)
+       where c.conrelid = 'public.wise_transactions'::regclass
+         and c.contype = 'f'
+         and a.attname = fk.col
+    ) then
+      begin
+        execute format(
+          'alter table public.wise_transactions add constraint %I foreign key (%I) references %s on delete %s',
+          'wise_transactions_' || fk.col || '_fkey', fk.col, fk.target, fk.on_delete);
+      exception when foreign_key_violation then
+        raise notice
+          'wise_transactions.% foreign key not added: existing rows reference missing parents', fk.col;
+      end;
+    end if;
+  end loop;
+end $$;
+
+-- The dedupe columns must never be NULL: NULLs do not collide in a unique
+-- constraint, so a single NULL profile or balance would quietly disable the
+-- idempotency guarantee. Default, backfill, then enforce — in that order, so
+-- this is safe on a table that already holds rows.
+alter table public.wise_transactions
+  alter column wise_profile_id set default '',
+  alter column wise_balance_id set default '';
+
+update public.wise_transactions
+   set wise_profile_id = coalesce(wise_profile_id, ''),
+       wise_balance_id = coalesce(wise_balance_id, '')
+ where wise_profile_id is null or wise_balance_id is null;
+
+alter table public.wise_transactions
+  alter column wise_profile_id set not null,
+  alter column wise_balance_id set not null;
+
+-- The remaining NOT NULLs and the status CHECK, applied only where the data
+-- allows it. A pre-existing table holding rows that violate them is left alone
+-- with a notice rather than failing the migration.
+do $$
+declare
+  col text;
+  bad bigint;
+begin
+  foreach col in array array['connection_id', 'user_id', 'wise_reference', 'raw_json'] loop
+    execute format('select count(*) from public.wise_transactions where %I is null', col)
+      into bad;
+    if bad = 0 then
+      execute format('alter table public.wise_transactions alter column %I set not null', col);
+    else
+      raise notice
+        'wise_transactions.% left nullable: % existing row(s) are NULL', col, bad;
+    end if;
+  end loop;
+
+  if not exists (
     select 1 from pg_constraint
-    where conname = 'wise_transactions_reference_unique'
+    where conname = 'wise_transactions_import_status_check'
       and conrelid = 'public.wise_transactions'::regclass
-      and array_length(conkey, 1) = 2
   ) then
+    select count(*) into bad from public.wise_transactions
+     where import_status is not null
+       and import_status not in ('pending_import', 'imported', 'skipped', 'failed');
+    if bad = 0 then
+      alter table public.wise_transactions
+        add constraint wise_transactions_import_status_check
+        check (import_status in ('pending_import', 'imported', 'skipped', 'failed'));
+    else
+      raise notice
+        'wise_transactions import_status CHECK not added: % row(s) hold other values', bad;
+    end if;
+  end if;
+end $$;
+
+-- ============================================================
+--  1c. The uniqueness scope
+-- ============================================================
+-- Ensure the constraint exists AND spans exactly the four target columns,
+-- whatever shape it had before (absent, or the earlier two-column version).
+do $$
+declare
+  target text[] := array['connection_id', 'wise_profile_id', 'wise_balance_id', 'wise_reference'];
+  current_cols text[];
+begin
+  select array_agg(a.attname::text order by k.ord)
+    into current_cols
+    from pg_constraint c
+    cross join lateral unnest(c.conkey) with ordinality as k(attnum, ord)
+    join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k.attnum
+   where c.conname = 'wise_transactions_reference_unique'
+     and c.conrelid = 'public.wise_transactions'::regclass;
+
+  if current_cols is not null and current_cols <> target then
     alter table public.wise_transactions
       drop constraint wise_transactions_reference_unique;
-    alter table public.wise_transactions
-      add constraint wise_transactions_reference_unique
-      unique (connection_id, wise_profile_id, wise_balance_id, wise_reference);
+    current_cols := null;
+  end if;
+
+  if current_cols is null then
+    begin
+      alter table public.wise_transactions
+        add constraint wise_transactions_reference_unique
+        unique (connection_id, wise_profile_id, wise_balance_id, wise_reference);
+    exception when unique_violation then
+      raise exception
+        'wise_transactions holds duplicate (connection_id, wise_profile_id, wise_balance_id, wise_reference) rows. Remove them, then re-run this migration.';
+    end;
   end if;
 end $$;
 
@@ -189,9 +328,23 @@ create table if not exists public.provider_sync_runs (
     check (trigger_source in ('cron', 'manual'))
 );
 
--- Upgrade path for an earlier version of this file.
+-- Schema convergence, for the same reason as above: `create table if not
+-- exists` is a no-op against an earlier-shaped table, so every column is added
+-- defensively. All no-ops on a fresh database.
 alter table public.provider_sync_runs
-  add column if not exists missing_stable_id integer not null default 0;
+  add column if not exists trigger_source text,
+  add column if not exists started_at timestamptz,
+  add column if not exists finished_at timestamptz not null default now(),
+  add column if not exists connections_processed integer not null default 0,
+  add column if not exists transactions_fetched integer not null default 0,
+  add column if not exists expenses_imported integer not null default 0,
+  add column if not exists duplicates_skipped integer not null default 0,
+  add column if not exists unsupported_skipped integer not null default 0,
+  add column if not exists failed integer not null default 0,
+  add column if not exists missing_stable_id integer not null default 0,
+  add column if not exists category_fallbacks integer not null default 0,
+  add column if not exists error_summary text,
+  add column if not exists created_at timestamptz not null default now();
 
 create index if not exists provider_sync_runs_started_idx
   on public.provider_sync_runs (started_at desc);
