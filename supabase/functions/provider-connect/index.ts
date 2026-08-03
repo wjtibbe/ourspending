@@ -23,12 +23,20 @@
 //  3. The token is encrypted before it touches the database and is never
 //     included in any response, on any code path, including errors.
 //  4. Every response is metadata only: status, label, masked hint, timestamps.
+//  5. Connect/reconnect verifies with GET /v1/me ONLY -- never /v1/profiles,
+//     balances or a balance statement, and never a business-profile check.
+//     Those need broader token permissions than plain identity and are not
+//     required merely to prove a token works; they are exercised for real
+//     the first time Sync now / the hourly job actually needs them.
 
 import { currentUser, db, del, q } from "../_shared/rest.ts";
 import { encryptToken, hasEncryptionKey, KEY_VERSION } from "../_shared/crypto.ts";
 import { publicStats, syncDeps } from "../_shared/deps.ts";
 import { recordRun, safeError, syncMany, type ConnectionRow } from "../_shared/sync.ts";
-import { WISE_API_BASE_DEFAULT } from "../_shared/wise.ts";
+import {
+  verifyWiseToken, WiseVerificationError,
+  WISE_API_BASE_DEFAULT, type WiseIdentity,
+} from "../_shared/wise.ts";
 
 // Sandbox override for testing: https://api.sandbox.transferwise.tech
 const WISE_API_BASE = Deno.env.get("WISE_API_BASE") ?? WISE_API_BASE_DEFAULT;
@@ -62,41 +70,12 @@ const fail = (code: string) => json({ ok: false, error: code });
 // verify() must either return non-secret display metadata, or throw. It must
 // never return anything derived from the token itself.
 
-type Verified = { externalId: string | null; label: string | null };
-type Adapter = { verify(token: string): Promise<Verified> };
-
-class TokenError extends Error {}
+type Adapter = { verify(token: string): Promise<WiseIdentity> };
 
 const ADAPTERS: Record<string, Adapter> = {
-  wise: {
-    async verify(token: string): Promise<Verified> {
-      const res = await fetch(`${WISE_API_BASE}/v1/profiles`, {
-        headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-      });
-
-      if (res.status === 401 || res.status === 403) {
-        throw new TokenError("invalid_token");
-      }
-      if (!res.ok) {
-        throw new Error(`wise_api_error_${res.status}`);
-      }
-
-      const profiles = await res.json();
-      if (!Array.isArray(profiles) || profiles.length === 0) {
-        throw new TokenError("no_profiles");
-      }
-
-      // Prefer the personal profile; fall back to whatever came first.
-      const p = profiles.find((x: Record<string, unknown>) => x.type === "personal") ?? profiles[0];
-      const d = (p.details ?? {}) as Record<string, string>;
-      const label =
-        [d.firstName, d.lastName].filter(Boolean).join(" ").trim() ||
-        d.name ||
-        (p.type ? String(p.type) : null);
-
-      return { externalId: p.id != null ? String(p.id) : null, label: label || null };
-    },
-  },
+  // The real check lives in _shared/wise.ts (verifyWiseToken), so it can be
+  // unit-tested without a live Deno runtime. This is a thin wrapper only.
+  wise: { verify: (token) => verifyWiseToken(token, { base: WISE_API_BASE }) },
 
   // revolut: { async verify(token) { ... } },
   // paypal:  { async verify(token) { ... } },
@@ -133,17 +112,49 @@ const publicView = (row: Record<string, unknown> | null) =>
 // ---------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------
-async function connect(userId: string, provider: string, token: string) {
+
+/**
+ * The exact row upserted into provider_connections after a successful check.
+ * Pulled out as its own pure function so "a 200 from the provider marks the
+ * connection connected" is something a test can assert directly, without
+ * going through Deno.serve or a real database.
+ */
+export function buildConnectionRow(
+  userId: string,
+  householdId: string,
+  provider: string,
+  verified: WiseIdentity,
+  secretHint: string,
+  nowIso: string,
+) {
+  return {
+    user_id: userId,
+    household_id: householdId,
+    provider,
+    status: "connected",
+    external_account_id: verified.externalId,
+    account_label: verified.label,
+    secret_hint: secretHint,
+    last_checked_at: nowIso,
+    last_error: null,
+  };
+}
+
+async function connect(userId: string, provider: string, rawToken: string) {
+  // Trimmed here, not just by the caller below: verification, encryption and
+  // storage must all see the same, whitespace-free value.
+  const token = rawToken.trim();
+
   const householdId = await householdOf(userId);
   if (!householdId) return fail("no_household");
 
-  let verified: Verified;
+  let verified: WiseIdentity;
   try {
     verified = await ADAPTERS[provider].verify(token);
   } catch (e) {
-    if (e instanceof TokenError) return fail("invalid_token");
+    if (e instanceof WiseVerificationError) return fail(e.code);
     console.error("provider-connect: verify failed for", provider, String(e));
-    return fail("provider_unreachable");
+    return fail("wise_temporarily_unavailable");
   }
 
   const { ciphertext, iv } = await encryptToken(token);
@@ -153,17 +164,7 @@ async function connect(userId: string, provider: string, token: string) {
   // credential instead of creating a second, ambiguous connection.
   const rows = await db.insert(
     "provider_connections?on_conflict=user_id,provider",
-    {
-      user_id: userId,
-      household_id: householdId,
-      provider,
-      status: "connected",
-      external_account_id: verified.externalId,
-      account_label: verified.label,
-      secret_hint: token.slice(-4),
-      last_checked_at: now,
-      last_error: null,
-    },
+    buildConnectionRow(userId, householdId, provider, verified, token.slice(-4), now),
     "resolution=merge-duplicates,return=representation",
   );
   const conn = rows[0];

@@ -306,3 +306,82 @@ export function createWiseClient(token: string, base = WISE_API_BASE_DEFAULT): W
       ),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Connect-time identity check
+// ---------------------------------------------------------------------------
+// Used ONLY by provider-connect's connect/reconnect action, to answer one
+// question: "is this token good for anything at all?" It is deliberately
+// separate from WiseAuthError / createWiseClient above, which classify errors
+// for the SYNC path and must not change here — connect-time verification has
+// its own, more specific error taxonomy (see WiseVerificationError below).
+//
+// This calls exactly GET {base}/v1/me and nothing else. It does not call
+// /v1/profiles, /v4/profiles/{id}/balances or any balance-statement endpoint:
+// those need broader token permissions than plain identity, are not required
+// merely to prove a token is valid, and were the actual cause of a real,
+// confirmed-valid personal-access token being rejected at connect time even
+// though GET /v1/me succeeded for it directly. Whatever those endpoints
+// require is checked for real the first time Sync now / the hourly job needs
+// them (see syncConnection() in _shared/sync.ts) — never at connect time, and
+// never against a business profile requirement of any kind.
+export type WiseIdentity = { externalId: string | null; label: string | null };
+
+export type WiseVerificationCode =
+  | "token_refused"
+  | "token_forbidden"
+  | "wise_rate_limited"
+  | "wise_temporarily_unavailable";
+
+export class WiseVerificationError extends Error {
+  code: WiseVerificationCode;
+  constructor(code: WiseVerificationCode) {
+    super(code);
+    this.code = code;
+  }
+}
+
+/**
+ * Verifies a Wise Personal Access Token against GET /v1/me and extracts only
+ * a safe display name. The full response body is read once, in this
+ * function, for exactly two field names (`firstName`/`lastName`, falling
+ * back to `name`) and then discarded — nothing else from it, and nothing
+ * from the request, is ever logged or returned: not the token, not the raw
+ * response, not email, phone, address or date of birth.
+ */
+export async function verifyWiseToken(
+  token: string,
+  opts: { base?: string; fetchImpl?: typeof fetch } = {},
+): Promise<WiseIdentity> {
+  // Trimmed here too, not just by the caller: this function's own contract
+  // ("verify a token") should hold regardless of caller discipline.
+  const trimmed = token.trim();
+  const base = opts.base ?? WISE_API_BASE_DEFAULT;
+  const doFetch = opts.fetchImpl ?? fetch;
+
+  let res: Response;
+  try {
+    res = await doFetch(`${base}/v1/me`, {
+      headers: { Authorization: `Bearer ${trimmed}`, Accept: "application/json" },
+    });
+  } catch {
+    // DNS failure, timeout, connection reset, ... — never the token's fault.
+    throw new WiseVerificationError("wise_temporarily_unavailable");
+  }
+
+  if (res.status === 401) throw new WiseVerificationError("token_refused");
+  if (res.status === 403) throw new WiseVerificationError("token_forbidden");
+  if (res.status === 429) throw new WiseVerificationError("wise_rate_limited");
+  if (!res.ok) throw new WiseVerificationError("wise_temporarily_unavailable");
+
+  const me = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+  const first = typeof me.firstName === "string" ? me.firstName : null;
+  const last = typeof me.lastName === "string" ? me.lastName : null;
+  const name = [first, last].filter(Boolean).join(" ").trim() ||
+    (typeof me.name === "string" ? me.name : null);
+
+  return {
+    externalId: me.id != null ? String(me.id) : null,
+    label: name || null,
+  };
+}
