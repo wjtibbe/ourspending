@@ -2437,7 +2437,10 @@ function ConnectedAccounts({
     try {
       const data = await call("sync", prov.id);
       const broken = data && data.connection && data.connection.status === "error";
-      showToast(broken ? t("prov_sync_problem") : t("prov_sync_ok"));
+      const stats = data && data.stats || {};
+      showToast(broken ? t("prov_sync_problem") : t("prov_sync_ok", {
+        n: stats.expensesImported || 0
+      }));
       await load();
     } catch (e) {
       setErr(e.message || String(e));

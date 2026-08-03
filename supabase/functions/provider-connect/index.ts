@@ -24,14 +24,14 @@
 //     included in any response, on any code path, including errors.
 //  4. Every response is metadata only: status, label, masked hint, timestamps.
 
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
-const ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!;
-const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const ENCRYPTION_KEY_B64 = Deno.env.get("PROVIDER_ENCRYPTION_KEY");
-const KEY_VERSION = 1;
+import { currentUser, db, del, q } from "../_shared/rest.ts";
+import { encryptToken, hasEncryptionKey, KEY_VERSION } from "../_shared/crypto.ts";
+import { publicStats, syncDeps } from "../_shared/deps.ts";
+import { recordRun, safeError, syncMany, type ConnectionRow } from "../_shared/sync.ts";
+import { WISE_API_BASE_DEFAULT } from "../_shared/wise.ts";
 
 // Sandbox override for testing: https://api.sandbox.transferwise.tech
-const WISE_API_BASE = Deno.env.get("WISE_API_BASE") ?? "https://api.transferwise.com";
+const WISE_API_BASE = Deno.env.get("WISE_API_BASE") ?? WISE_API_BASE_DEFAULT;
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -104,84 +104,14 @@ const ADAPTERS: Record<string, Adapter> = {
 };
 
 // ---------------------------------------------------------------------------
-// Encryption at rest — AES-256-GCM, key held only in Edge Function secrets
+// Data access (service role — server side only, see _shared/rest.ts)
 // ---------------------------------------------------------------------------
-// There is deliberately NO plaintext fallback: if the key is missing the
-// function refuses to store anything rather than quietly saving a bare token.
-
-const b64encode = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
-const b64decode = (s: string) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
-
-async function aesKey(): Promise<CryptoKey> {
-  if (!ENCRYPTION_KEY_B64) throw new Error("missing_encryption_key");
-  const raw = b64decode(ENCRYPTION_KEY_B64);
-  if (raw.length !== 32) throw new Error("bad_encryption_key_length");
-  return await crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, [
-    "encrypt",
-    "decrypt",
-  ]);
-}
-
-async function encryptToken(token: string) {
-  const key = await aesKey();
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv },
-    key,
-    new TextEncoder().encode(token),
-  );
-  return { ciphertext: b64encode(new Uint8Array(ct)), iv: b64encode(iv) };
-}
-
-async function decryptToken(ciphertext: string, iv: string) {
-  const key = await aesKey();
-  const pt = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: b64decode(iv) },
-    key,
-    b64decode(ciphertext),
-  );
-  return new TextDecoder().decode(pt);
-}
-
-// ---------------------------------------------------------------------------
-// Data access (service role — server side only)
-// ---------------------------------------------------------------------------
-async function rest(path: string, init: RequestInit = {}) {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
-    ...init,
-    headers: {
-      apikey: SERVICE_ROLE,
-      Authorization: `Bearer ${SERVICE_ROLE}`,
-      "Content-Type": "application/json",
-      ...((init.headers as Record<string, string>) ?? {}),
-    },
-  });
-  if (!res.ok) throw new Error(`db_${res.status}: ${await res.text()}`);
-  const text = await res.text();
-  return text ? JSON.parse(text) : null;
-}
-
-// Resolves the caller from their JWT. Returns null for anything unsigned,
-// expired or malformed — the function is never reachable without a real user.
-async function currentUser(req: Request): Promise<{ id: string } | null> {
-  const auth = req.headers.get("Authorization") ?? "";
-  if (!auth.toLowerCase().startsWith("bearer ")) return null;
-  const res = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
-    headers: { apikey: ANON_KEY, Authorization: auth },
-  });
-  if (!res.ok) return null;
-  const u = await res.json();
-  return u?.id ? { id: String(u.id) } : null;
-}
-
 // The household is ALWAYS read from the caller's own profile. It is never
 // accepted from the request body, so a crafted payload cannot attach an
 // external account to a household the caller is not a member of.
 async function householdOf(userId: string): Promise<string | null> {
-  const rows = await rest(
-    `profiles?id=eq.${encodeURIComponent(userId)}&select=household_id&limit=1`,
-  );
-  return rows?.[0]?.household_id ?? null;
+  const rows = await db.select(`profiles?id=eq.${q(userId)}&select=household_id&limit=1`);
+  return rows?.[0]?.household_id ? String(rows[0].household_id) : null;
 }
 
 // The only shape ever sent back to the browser. No token, no ciphertext, no
@@ -221,30 +151,26 @@ async function connect(userId: string, provider: string, token: string) {
 
   // Upsert on (user_id, provider): re-submitting a token rotates the stored
   // credential instead of creating a second, ambiguous connection.
-  const rows = await rest(
+  const rows = await db.insert(
     "provider_connections?on_conflict=user_id,provider",
     {
-      method: "POST",
-      headers: { Prefer: "resolution=merge-duplicates,return=representation" },
-      body: JSON.stringify({
-        user_id: userId,
-        household_id: householdId,
-        provider,
-        status: "connected",
-        external_account_id: verified.externalId,
-        account_label: verified.label,
-        secret_hint: token.slice(-4),
-        last_checked_at: now,
-        last_error: null,
-      }),
+      user_id: userId,
+      household_id: householdId,
+      provider,
+      status: "connected",
+      external_account_id: verified.externalId,
+      account_label: verified.label,
+      secret_hint: token.slice(-4),
+      last_checked_at: now,
+      last_error: null,
     },
+    "resolution=merge-duplicates,return=representation",
   );
   const conn = rows[0];
 
-  await rest("provider_credentials?on_conflict=connection_id", {
-    method: "POST",
-    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-    body: JSON.stringify({
+  await db.insert(
+    "provider_credentials?on_conflict=connection_id",
+    {
       connection_id: conn.id,
       user_id: userId,
       provider,
@@ -252,8 +178,9 @@ async function connect(userId: string, provider: string, token: string) {
       iv,
       key_version: KEY_VERSION,
       updated_at: now,
-    }),
-  });
+    },
+    "resolution=merge-duplicates,return=minimal",
+  );
 
   return json({ ok: true, connection: publicView(conn) });
 }
@@ -261,62 +188,47 @@ async function connect(userId: string, provider: string, token: string) {
 async function disconnect(userId: string, provider: string) {
   // Scoped by user_id as well as provider, so this can only ever delete the
   // caller's own row. provider_credentials follows via ON DELETE CASCADE.
-  await rest(
-    `provider_connections?user_id=eq.${encodeURIComponent(userId)}&provider=eq.${encodeURIComponent(provider)}`,
-    { method: "DELETE", headers: { Prefer: "return=minimal" } },
-  );
+  await del(`provider_connections?user_id=eq.${q(userId)}&provider=eq.${q(provider)}`);
   return json({ ok: true, connection: null });
 }
 
-// Transaction syncing is intentionally NOT implemented yet. "Sync now" proves
-// the stored credential still works and refreshes the connection's status, so
-// a revoked or expired token surfaces in Settings instead of failing silently
-// later. It imports nothing.
+// "Sync now" runs exactly the same core as the hourly cron job — see
+// _shared/sync.ts — scoped to this caller's own connection. The two entry
+// points differ only in who may call them and which connections they pass in.
 async function sync(userId: string, provider: string) {
-  const rows = await rest(
-    `provider_connections?user_id=eq.${encodeURIComponent(userId)}` +
-      `&provider=eq.${encodeURIComponent(provider)}&select=id&limit=1`,
+  const rows = await db.select(
+    `provider_connections?user_id=eq.${q(userId)}&provider=eq.${q(provider)}` +
+      "&select=id,user_id,provider&limit=1",
   );
   if (!rows?.length) return fail("not_connected");
-  const connectionId = rows[0].id;
 
-  const creds = await rest(
-    `provider_credentials?connection_id=eq.${connectionId}&select=ciphertext,iv&limit=1`,
-  );
-  if (!creds?.length) return fail("not_connected");
+  const conn: ConnectionRow = {
+    id: String(rows[0].id),
+    user_id: String(rows[0].user_id),
+    provider: String(rows[0].provider),
+  };
 
-  const now = new Date().toISOString();
-  let patch: Record<string, unknown>;
-
+  const started = new Date();
+  let stats;
   try {
-    const token = await decryptToken(creds[0].ciphertext, creds[0].iv);
-    const verified = await ADAPTERS[provider].verify(token);
-    patch = {
-      status: "connected",
-      account_label: verified.label,
-      external_account_id: verified.externalId,
-      last_checked_at: now,
-      last_sync_at: now,
-      last_error: null,
-    };
+    // syncMany already updates last_checked_at / last_sync_at / status and
+    // isolates failures, so nothing extra is needed here.
+    stats = await syncMany(syncDeps, [conn]);
+    await recordRun(db, "manual", started, stats);
   } catch (e) {
-    const reason = e instanceof TokenError ? "invalid_token" : "provider_unreachable";
-    console.error("provider-connect: sync failed for", provider, String(e));
-    patch = { status: "error", last_checked_at: now, last_error: reason };
+    console.error("provider-connect: sync failed:", safeError(e));
+    return fail("server_error");
   }
 
-  const updated = await rest(`provider_connections?id=eq.${connectionId}`, {
-    method: "PATCH",
-    headers: { Prefer: "return=representation" },
-    body: JSON.stringify(patch),
-  });
+  const updated = await db.select(`provider_connections?id=eq.${q(conn.id)}&select=*&limit=1`);
+  const outcome = stats.connections[0];
 
   return json({
     ok: true,
-    connection: publicView(updated[0]),
-    // Explicit so the UI never has to guess why nothing appeared.
-    imported: 0,
-    transactionSyncEnabled: false,
+    connection: publicView(updated[0] ?? null),
+    stats: publicStats(stats),
+    // Surfaced so the UI can say "reconnect" rather than a generic failure.
+    connectionError: outcome?.status === "error" ? outcome.error : null,
   });
 }
 
@@ -340,7 +252,7 @@ Deno.serve(async (req) => {
       if (token.length < 20 || token.length > 500) {
         return fail("invalid_token");
       }
-      if (!ENCRYPTION_KEY_B64) {
+      if (!hasEncryptionKey()) {
         console.error("provider-connect: PROVIDER_ENCRYPTION_KEY is not set");
         return fail("server_not_configured");
       }
