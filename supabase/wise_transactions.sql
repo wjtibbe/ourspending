@@ -74,9 +74,11 @@ create table if not exists public.wise_transactions (
   amount_currency text,
   amount_source_path text,
   amount_low_confidence boolean not null default false,
-  -- Compatibility alias for amount_value, kept NOT NULL. Self-populated by
-  -- the trigger below, same reason and same mechanism as wise_transaction_id.
+  -- Compatibility aliases for amount_value / amount_currency, kept NOT NULL.
+  -- Self-populated by the trigger below, same reason and same mechanism as
+  -- wise_transaction_id.
   amount numeric not null,
+  currency text not null,
 
   -- What the merchant charged, when a conversion means that differs. Optional
   -- source metadata only; the expense always uses the deducted amount.
@@ -141,6 +143,7 @@ alter table public.wise_transactions
   add column if not exists amount_source_path text,
   add column if not exists amount_low_confidence boolean not null default false,
   add column if not exists amount numeric,
+  add column if not exists currency text,
   add column if not exists merchant_amount_value numeric,
   add column if not exists merchant_amount_currency text,
   add column if not exists merchant_amount_source_path text,
@@ -220,25 +223,35 @@ update public.wise_transactions
    set wise_transaction_id = coalesce(wise_transaction_id, wise_reference)
  where wise_transaction_id is null;
 
--- amount_value is legitimately NULL for every SKIPPED transaction (pending,
--- reversed, incoming, unsupported-currency, ...) -- the sync core never
--- resolves an amount for those by design. A straight copy would therefore
--- make `amount` NOT NULL impossible to satisfy for real, everyday skip rows,
--- not just for this file's own tests. 0 is the "no resolved amount" sentinel
--- for exactly those rows.
+-- amount_value and amount_currency are legitimately NULL for every SKIPPED
+-- transaction (pending, reversed, incoming, unsupported-currency, ...) -- the
+-- sync core never resolves an amount or currency for those by design. A
+-- straight copy would therefore make `amount`/`currency` NOT NULL impossible
+-- to satisfy for real, everyday skip rows, not just for this file's own
+-- tests. 0 and '' are the "nothing resolved" sentinels for exactly those rows
+-- ('' matches the convention already used above for wise_profile_id and
+-- wise_balance_id).
 --
--- Two plain assignments rather than one COALESCE: a legacy `amount` column
--- could be text (Wise's own field naming isn't guaranteed numeric on an
--- unknown pre-existing table), and while a direct assignment from numeric
--- into text is allowed (an "assignment cast"), COALESCE(text, numeric, int)
--- is not -- it requires a common IMPLICIT cast across all arguments, which
--- text and numeric do not have, and errors even though a plain SET does not.
+-- Two plain assignments rather than one COALESCE, in both cases: a legacy
+-- `amount`/`currency` column's exact type on a pre-existing table is not
+-- guaranteed (e.g. `amount` could be text, `currency` could be varchar(3)),
+-- and while a direct assignment across compatible types is allowed (an
+-- "assignment cast"), COALESCE(a, b, c) is not -- it requires a common
+-- IMPLICIT cast across all its arguments, which e.g. text and numeric do not
+-- have, and errors even though a plain SET does not.
 update public.wise_transactions
    set amount = amount_value
  where amount is null and amount_value is not null;
 update public.wise_transactions
    set amount = 0
  where amount is null;
+
+update public.wise_transactions
+   set currency = amount_currency
+ where currency is null and amount_currency is not null;
+update public.wise_transactions
+   set currency = ''
+ where currency is null;
 
 create or replace function public.wise_transactions_default_transaction_id()
 returns trigger language plpgsql as $$
@@ -247,12 +260,19 @@ begin
     new.wise_transaction_id := new.wise_reference;
   end if;
   -- Same reason as the backfill above: two plain assignments, not a COALESCE,
-  -- so this works whether `amount` is numeric or text.
+  -- so this works whichever type `amount`/`currency` turn out to be.
   if new.amount is null then
     if new.amount_value is not null then
       new.amount := new.amount_value;
     else
       new.amount := 0;
+    end if;
+  end if;
+  if new.currency is null then
+    if new.amount_currency is not null then
+      new.currency := new.amount_currency;
+    else
+      new.currency := '';
     end if;
   end if;
   return new;
@@ -272,7 +292,7 @@ declare
   col text;
   bad bigint;
 begin
-  foreach col in array array['connection_id', 'user_id', 'wise_reference', 'wise_transaction_id', 'amount', 'raw_json'] loop
+  foreach col in array array['connection_id', 'user_id', 'wise_reference', 'wise_transaction_id', 'amount', 'currency', 'raw_json'] loop
     execute format('select count(*) from public.wise_transactions where %I is null', col)
       into bad;
     if bad = 0 then
@@ -300,6 +320,79 @@ begin
         'wise_transactions import_status CHECK not added: % row(s) hold other values', bad;
     end if;
   end if;
+end $$;
+
+-- ============================================================
+--  1d. Defence against the NEXT unrecognised legacy column
+-- ============================================================
+-- wise_transaction_id, amount and currency all turned out to be columns from
+-- a pre-existing wise_transactions table that neither this file nor
+-- verify_wise_transactions.sql has ever defined -- each one surfaced only
+-- when a real insert (the sync core's, or the verification script's) hit its
+-- NOT NULL constraint, one at a time.
+--
+-- Rather than keep discovering these individually, this scans for ANY other
+-- column on the live table that is NOT NULL, has no default, and is not one
+-- this migration already manages. Such a column can only ever have come from
+-- outside these two files. A semantically meaningful alias (like the three
+-- above) requires knowing what the column means, which cannot be discovered
+-- generically -- but a type-appropriate DEFAULT is enough to stop it from
+-- breaking every insert that omits it, and the NOTICE below flags it by name
+-- so it can be given a real mapping later if one turns out to be warranted.
+-- This does not weaken anything: NOT NULL is untouched, and this only adds a
+-- DEFAULT, which Postgres applies solely when a caller omits the column.
+do $$
+declare
+  known text[] := array[
+    'id', 'connection_id', 'user_id', 'household_id', 'wise_reference',
+    'wise_transaction_id', 'wise_profile_id', 'wise_balance_id', 'occurred_at',
+    'direction', 'wise_status', 'detail_type',
+    'amount_value', 'amount_currency', 'amount', 'currency',
+    'amount_source_path', 'amount_low_confidence',
+    'merchant_amount_value', 'merchant_amount_currency', 'merchant_amount_source_path',
+    'wise_category', 'mapped_category', 'category_source',
+    'import_status', 'skip_reason', 'error_summary',
+    'expense_id', 'raw_json', 'created_at', 'updated_at'
+  ];
+  col record;
+  default_expr text;
+begin
+  for col in
+    select a.attname::text as name, format_type(a.atttypid, a.atttypmod) as type
+      from pg_attribute a
+     where a.attrelid = 'public.wise_transactions'::regclass
+       and a.attnum > 0
+       and not a.attisdropped
+       and a.attnotnull
+       and not a.atthasdef
+       and a.attgenerated = ''
+       and a.attname <> all(known)
+  loop
+    default_expr := case
+      when col.type = 'boolean' then 'false'
+      when col.type in ('text') or col.type like 'character varying%' or col.type like 'character(%' then quote_literal('')
+      when col.type in ('numeric', 'integer', 'bigint', 'smallint', 'real', 'double precision')
+        or col.type like 'numeric(%' then '0'
+      when col.type like 'timestamp%' then 'now()'
+      when col.type = 'date' then 'current_date'
+      when col.type = 'jsonb' then quote_literal('{}') || '::jsonb'
+      when col.type = 'json' then quote_literal('{}') || '::json'
+      else null
+    end;
+
+    if default_expr is not null then
+      execute format(
+        'alter table public.wise_transactions alter column %I set default %s',
+        col.name, default_expr);
+      raise notice
+        'wise_transactions.% is an unrecognised NOT NULL column (type %) that neither this migration nor verify_wise_transactions.sql defines. A safe default (%) was applied so inserts no longer fail, but its value will not reflect anything real -- consider giving it a proper alias like wise_transaction_id, amount and currency got.',
+        col.name, col.type, default_expr;
+    else
+      raise notice
+        'wise_transactions.% is an unrecognised NOT NULL column (type %) with no default and no safe generic default for its type. Inserts that omit it will keep failing until it is handled explicitly.',
+        col.name, col.type;
+    end if;
+  end loop;
 end $$;
 
 -- ============================================================
