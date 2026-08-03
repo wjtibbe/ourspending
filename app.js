@@ -2173,6 +2173,11 @@ function SettingsPage({
     style: S.privacyNote
   }, t("no_household_yet")),
   // ===== CATEGORIES =====
+  // ===== CONNECTED ACCOUNTS =====
+  household && /*#__PURE__*/React.createElement(React.Fragment, null, section(t("sec_connected")), /*#__PURE__*/React.createElement(ConnectedAccounts, {
+    user: user,
+    showToast: showToast
+  })),
   household && /*#__PURE__*/React.createElement(React.Fragment, null, section(t("sec_categories")), /*#__PURE__*/React.createElement(CategorySettings, {
     hhId: hhId,
     user: user,
@@ -2301,6 +2306,424 @@ function SettingsPage({
     },
     onClick: onSignOut
   }, t("sign_out")));
+}
+
+// ---------- Connected accounts (external providers) ----------
+// One registry drives the whole section. Adding Revolut, PayPal or Stripe
+// later means flipping `available` here, adding an adapter to the
+// provider-connect Edge Function and adding the id to the provider CHECK
+// constraint in supabase/provider_connections.sql. No new component, no new
+// table, no new query.
+const PROVIDERS = [{
+  id: "wise",
+  name: "Wise",
+  mark: "wise",
+  bg: "#9FE870",
+  fg: "#163300",
+  available: true,
+  tokenUrl: "https://wise.com/settings/api-tokens"
+}, {
+  id: "revolut",
+  name: "Revolut",
+  mark: "R",
+  bg: "#0666EB",
+  fg: "#FFFFFF",
+  available: false
+}, {
+  id: "paypal",
+  name: "PayPal",
+  mark: "P",
+  bg: "#003087",
+  fg: "#FFFFFF",
+  available: false
+}, {
+  id: "stripe",
+  name: "Stripe",
+  mark: "S",
+  bg: "#635BFF",
+  fg: "#FFFFFF",
+  available: false
+}];
+
+// The Edge Function answers with stable machine codes rather than prose, so
+// every message here is translatable. Unknown codes degrade to the generic one
+// instead of leaking a raw server string into the UI.
+const providerMessage = code => {
+  const key = "prov_err_" + String(code || "server_error");
+  const msg = t(key);
+  return msg === key ? t("prov_err_server_error") : msg;
+};
+
+function ConnectedAccounts({
+  user,
+  showToast
+}) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(null);
+  const [connecting, setConnecting] = useState(null);
+  const [confirming, setConfirming] = useState(null);
+
+  // Metadata only. There is no column here that could carry the token: the
+  // secret lives in provider_credentials, which the browser cannot read at all.
+  const load = useCallback(async () => {
+    const {
+      data,
+      error
+    } = await db.from("provider_connections").select("provider,status,account_label,secret_hint,last_checked_at,last_sync_at,last_error").eq("user_id", user.id);
+    setLoading(false);
+    if (error) {
+      setErr(error.message);
+      return;
+    }
+    setErr(null);
+    setRows(data || []);
+  }, [user.id]);
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  // Every mutation goes through the Edge Function, which derives the user from
+  // the JWT and the household from that user's own profile. The client never
+  // sends — and could not usefully forge — either one.
+  const call = async (action, provider, token) => {
+    const body = {
+      action,
+      provider
+    };
+    if (token) body.token = token;
+    const {
+      data,
+      error
+    } = await withTimeout(db.functions.invoke("provider-connect", {
+      body
+    }), 30000, t("prov_err_slow"));
+    if (error) {
+      let code = null;
+      try {
+        if (error.context && typeof error.context.json === "function") {
+          const parsed = await error.context.json();
+          code = parsed && parsed.error;
+        }
+      } catch (e) {/* body already consumed or not JSON */}
+      throw new Error(code ? providerMessage(code) : t("prov_err_server_error"));
+    }
+    if (data && data.error) throw new Error(providerMessage(data.error));
+    return data;
+  };
+
+  // Returns an error message for the dialog to show, or null on success, so
+  // the token never has to travel back up into this component's state.
+  const doConnect = async (prov, token) => {
+    setBusy(prov.id);
+    try {
+      await call("connect", prov.id, token);
+      setConnecting(null);
+      showToast(t("prov_connected", {
+        name: prov.name
+      }));
+      await load();
+      return null;
+    } catch (e) {
+      return e.message || String(e);
+    } finally {
+      setBusy(null);
+    }
+  };
+  const doSync = async prov => {
+    setBusy(prov.id);
+    setErr(null);
+    try {
+      const data = await call("sync", prov.id);
+      const broken = data && data.connection && data.connection.status === "error";
+      const stats = data && data.stats || {};
+      showToast(broken ? t("prov_sync_problem") : t("prov_sync_ok", {
+        n: stats.expensesImported || 0
+      }));
+      await load();
+    } catch (e) {
+      setErr(e.message || String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+  const doDisconnect = async prov => {
+    setBusy(prov.id);
+    setErr(null);
+    try {
+      await call("disconnect", prov.id);
+      setConfirming(null);
+      showToast(t("prov_disconnected", {
+        name: prov.name
+      }));
+      await load();
+    } catch (e) {
+      setErr(e.message || String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+  const byId = {};
+  rows.forEach(r => {
+    byId[r.provider] = r;
+  });
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...S.privacyNote,
+      marginTop: 0
+    }
+  }, t("connected_hint")), err && /*#__PURE__*/React.createElement("div", {
+    style: S.errBox
+  }, err, /*#__PURE__*/React.createElement("br", null), (err.includes("does not exist") || err.includes("schema cache")) && t("prov_missing_table")), loading && !rows.length ? /*#__PURE__*/React.createElement("div", {
+    style: S.privacyNote
+  }, t("loading")) : PROVIDERS.map(p => /*#__PURE__*/React.createElement(ProviderCard, {
+    key: p.id,
+    provider: p,
+    conn: byId[p.id] || null,
+    busy: busy === p.id,
+    locked: busy != null,
+    onConnect: () => setConnecting(p),
+    onSync: () => doSync(p),
+    onDisconnect: () => setConfirming(p)
+  })), connecting && /*#__PURE__*/React.createElement(ProviderTokenModal, {
+    provider: connecting,
+    onCancel: () => setConnecting(null),
+    onSubmit: token => doConnect(connecting, token)
+  }), confirming && /*#__PURE__*/React.createElement(ProviderDisconnectModal, {
+    provider: confirming,
+    busy: busy === confirming.id,
+    onCancel: () => setConfirming(null),
+    onConfirm: () => doDisconnect(confirming)
+  }));
+}
+
+// ---------- One provider card ----------
+function ProviderCard({
+  provider,
+  conn,
+  busy,
+  locked,
+  onConnect,
+  onSync,
+  onDisconnect
+}) {
+  const connected = !!conn;
+  const problem = connected && conn.status === "error";
+  const pill = !provider.available ? {
+    text: t("prov_soon"),
+    bg: "var(--line)",
+    fg: "var(--muted)"
+  } : problem ? {
+    text: t("prov_status_error"),
+    bg: "var(--tint-danger)",
+    fg: "var(--danger)"
+  } : connected ? {
+    text: t("prov_status_connected"),
+    bg: "var(--tint-green)",
+    fg: "var(--green)"
+  } : {
+    text: t("prov_status_off"),
+    bg: "var(--line)",
+    fg: "var(--muted)"
+  };
+  // Never the whole token — only the last four characters that were stored as
+  // secret_hint, so you can tell which key is in place without revealing one.
+  const subtitle = connected ? [conn.account_label, conn.secret_hint ? "••••" + conn.secret_hint : null].filter(Boolean).join(" · ") || t("prov_status_connected") : provider.available ? t("prov_not_linked") : t("prov_soon_hint");
+  const halfBtn = extra => ({
+    ...S.ghostBtn,
+    marginTop: 0,
+    width: "auto",
+    flex: 1,
+    ...extra
+  });
+  return /*#__PURE__*/React.createElement("div", {
+    style: S.provCard
+  }, /*#__PURE__*/React.createElement("div", {
+    style: S.provHead
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      ...S.provLogo,
+      background: provider.bg,
+      color: provider.fg
+    },
+    "aria-hidden": "true"
+  }, provider.mark), /*#__PURE__*/React.createElement("span", {
+    style: {
+      flex: 1,
+      minWidth: 0
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: S.provName
+  }, provider.name), /*#__PURE__*/React.createElement("div", {
+    style: S.provMeta
+  }, subtitle)), /*#__PURE__*/React.createElement("span", {
+    style: {
+      ...S.provPill,
+      background: pill.bg,
+      color: pill.fg
+    }
+  }, pill.text)), connected && /*#__PURE__*/React.createElement("div", {
+    style: S.provMeta
+  }, t("prov_last_sync") + ": " + timeAgo(conn.last_sync_at)), problem && /*#__PURE__*/React.createElement("div", {
+    style: S.errBox
+  }, providerMessage(conn.last_error)), /*#__PURE__*/React.createElement("div", {
+    style: S.provBtnRow
+  }, /*#__PURE__*/React.createElement("button", {
+    style: halfBtn({
+      opacity: !provider.available || locked ? 0.5 : 1
+    }),
+    disabled: !provider.available || locked,
+    onClick: onConnect,
+    "aria-label": t(connected ? "prov_a11y_reconnect" : "prov_a11y_connect", {
+      name: provider.name
+    })
+  }, busy ? t("prov_working") : connected ? t("prov_reconnect") : t("prov_connect")), /*#__PURE__*/React.createElement("button", {
+    style: halfBtn({
+      opacity: !connected || locked ? 0.5 : 1
+    }),
+    disabled: !connected || locked,
+    onClick: onSync,
+    "aria-label": t("prov_a11y_sync", {
+      name: provider.name
+    })
+  }, t("prov_sync_now"))), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.ghostBtn,
+      marginTop: 8,
+      color: "var(--danger)",
+      borderColor: "var(--danger)",
+      opacity: !connected || locked ? 0.5 : 1
+    },
+    disabled: !connected || locked,
+    onClick: onDisconnect,
+    "aria-label": t("prov_a11y_disconnect", {
+      name: provider.name
+    })
+  }, t("prov_disconnect")));
+}
+
+// ---------- Token entry dialog ----------
+function ProviderTokenModal({
+  provider,
+  onCancel,
+  onSubmit
+}) {
+  // The token lives in this component's state and nowhere else: it is never
+  // lifted into a parent, never persisted, never put in localStorage, and the
+  // component unmounts the moment the dialog closes. The only thing that ever
+  // leaves is one HTTPS call to the Edge Function, and nothing the server
+  // stores can be read back.
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const submit = async () => {
+    const v = token.trim();
+    if (v.length < 20) {
+      setErr(t("prov_err_invalid_token"));
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    const message = await onSubmit(v);
+    // On success the parent unmounts this dialog, discarding `token` with it.
+    if (message) {
+      setErr(message);
+      setBusy(false);
+    }
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    style: S.modalWrap,
+    onClick: busy ? undefined : onCancel
+  }, /*#__PURE__*/React.createElement("div", {
+    style: S.modalCard,
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("h2", {
+    style: {
+      ...S.pageTitle,
+      marginTop: 0
+    }
+  }, t("prov_token_title", {
+    name: provider.name
+  })), /*#__PURE__*/React.createElement("div", {
+    style: S.fieldLabel
+  }, t("prov_token_label")), /*#__PURE__*/React.createElement("input", {
+    style: S.input,
+    type: "password",
+    value: token,
+    autoComplete: "off",
+    autoCapitalize: "off",
+    autoCorrect: "off",
+    spellCheck: false,
+    placeholder: t("prov_token_ph"),
+    onChange: e => setToken(e.target.value)
+  }), provider.tokenUrl && /*#__PURE__*/React.createElement("a", {
+    href: provider.tokenUrl,
+    target: "_blank",
+    rel: "noreferrer noopener",
+    style: {
+      ...S.linkBtn,
+      display: "inline-block",
+      marginTop: 10
+    }
+  }, t("prov_where_token")), err && /*#__PURE__*/React.createElement("div", {
+    style: S.errBox
+  }, err), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.primaryBtn,
+      opacity: busy ? 0.6 : 1
+    },
+    disabled: busy,
+    onClick: submit
+  }, busy ? t("prov_working") : t("prov_connect")), /*#__PURE__*/React.createElement("button", {
+    style: S.ghostBtn,
+    disabled: busy,
+    onClick: onCancel
+  }, t("cancel")), /*#__PURE__*/React.createElement("div", {
+    style: S.privacyNote
+  }, t("prov_token_note"))));
+}
+
+// ---------- Disconnect confirmation ----------
+function ProviderDisconnectModal({
+  provider,
+  busy,
+  onCancel,
+  onConfirm
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: S.modalWrap,
+    onClick: busy ? undefined : onCancel
+  }, /*#__PURE__*/React.createElement("div", {
+    style: S.modalCard,
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("h2", {
+    style: {
+      ...S.pageTitle,
+      marginTop: 0
+    }
+  }, t("prov_disconnect_title", {
+    name: provider.name
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...S.privacyNote,
+      marginTop: 0
+    }
+  }, t("prov_disconnect_body", {
+    name: provider.name
+  })), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.primaryBtn,
+      background: "var(--danger)",
+      opacity: busy ? 0.6 : 1
+    },
+    disabled: busy,
+    onClick: onConfirm
+  }, busy ? t("prov_working") : t("prov_disconnect")), /*#__PURE__*/React.createElement("button", {
+    style: S.ghostBtn,
+    disabled: busy,
+    onClick: onCancel
+  }, t("cancel"))));
 }
 
 // ---------- Category settings ----------
@@ -4388,6 +4811,54 @@ const S = {
     gap: 14,
     fontSize: 14,
     flexWrap: "wrap"
+  },
+  provCard: {
+    background: "var(--card)",
+    border: "1px solid var(--line)",
+    borderRadius: 16,
+    padding: 14,
+    marginTop: 12
+  },
+  provHead: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10
+  },
+  provLogo: {
+    width: 38,
+    height: 38,
+    borderRadius: 10,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontSize: 13,
+    fontWeight: 800,
+    letterSpacing: -0.3,
+    flexShrink: 0
+  },
+  provName: {
+    fontSize: 15,
+    fontWeight: 700
+  },
+  provMeta: {
+    fontSize: 12,
+    color: "var(--muted)",
+    marginTop: 3,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap"
+  },
+  provPill: {
+    fontSize: 11,
+    fontWeight: 700,
+    padding: "3px 8px",
+    borderRadius: 999,
+    whiteSpace: "nowrap"
+  },
+  provBtnRow: {
+    display: "flex",
+    gap: 8,
+    marginTop: 12
   },
   rateEditRow: {
     display: "flex",
