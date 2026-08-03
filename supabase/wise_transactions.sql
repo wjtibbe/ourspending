@@ -51,6 +51,11 @@ create table if not exists public.wise_transactions (
   -- taken from referenceNumber or, failing that, the transaction id. A
   -- transaction with neither is never imported and never reaches this table.
   wise_reference text not null,
+  -- Compatibility alias for wise_reference, kept NOT NULL. Self-populated by
+  -- the trigger below (never by application code), so every caller — the
+  -- sync Edge Function, "Sync now", and this file's own verification script —
+  -- satisfies it automatically without needing to know it exists.
+  wise_transaction_id text not null,
   -- Part of the uniqueness scope, so '' rather than null: NULLs do not collide
   -- in a unique constraint, which would silently disable the dedupe guarantee.
   wise_profile_id text not null default '',
@@ -121,6 +126,7 @@ alter table public.wise_transactions
   add column if not exists household_id uuid
     references public.households(id) on delete set null,
   add column if not exists wise_reference text,
+  add column if not exists wise_transaction_id text,
   add column if not exists wise_profile_id text,
   add column if not exists wise_balance_id text,
   add column if not exists occurred_at timestamptz,
@@ -200,6 +206,28 @@ alter table public.wise_transactions
   alter column wise_profile_id set not null,
   alter column wise_balance_id set not null;
 
+-- wise_transaction_id follows the same default/backfill/enforce shape as
+-- above, plus a trigger so it stays populated on every FUTURE insert or
+-- update too, not just the rows that already exist today.
+update public.wise_transactions
+   set wise_transaction_id = coalesce(wise_transaction_id, wise_reference)
+ where wise_transaction_id is null;
+
+create or replace function public.wise_transactions_default_transaction_id()
+returns trigger language plpgsql as $$
+begin
+  if new.wise_transaction_id is null then
+    new.wise_transaction_id := new.wise_reference;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists wise_transactions_default_transaction_id on public.wise_transactions;
+create trigger wise_transactions_default_transaction_id
+  before insert or update on public.wise_transactions
+  for each row execute function public.wise_transactions_default_transaction_id();
+
 -- The remaining NOT NULLs and the status CHECK, applied only where the data
 -- allows it. A pre-existing table holding rows that violate them is left alone
 -- with a notice rather than failing the migration.
@@ -208,7 +236,7 @@ declare
   col text;
   bad bigint;
 begin
-  foreach col in array array['connection_id', 'user_id', 'wise_reference', 'raw_json'] loop
+  foreach col in array array['connection_id', 'user_id', 'wise_reference', 'wise_transaction_id', 'raw_json'] loop
     execute format('select count(*) from public.wise_transactions where %I is null', col)
       into bad;
     if bad = 0 then
