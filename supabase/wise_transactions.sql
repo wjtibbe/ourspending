@@ -74,6 +74,9 @@ create table if not exists public.wise_transactions (
   amount_currency text,
   amount_source_path text,
   amount_low_confidence boolean not null default false,
+  -- Compatibility alias for amount_value, kept NOT NULL. Self-populated by
+  -- the trigger below, same reason and same mechanism as wise_transaction_id.
+  amount numeric not null,
 
   -- What the merchant charged, when a conversion means that differs. Optional
   -- source metadata only; the expense always uses the deducted amount.
@@ -137,6 +140,7 @@ alter table public.wise_transactions
   add column if not exists amount_currency text,
   add column if not exists amount_source_path text,
   add column if not exists amount_low_confidence boolean not null default false,
+  add column if not exists amount numeric,
   add column if not exists merchant_amount_value numeric,
   add column if not exists merchant_amount_currency text,
   add column if not exists merchant_amount_source_path text,
@@ -206,18 +210,50 @@ alter table public.wise_transactions
   alter column wise_profile_id set not null,
   alter column wise_balance_id set not null;
 
--- wise_transaction_id follows the same default/backfill/enforce shape as
--- above, plus a trigger so it stays populated on every FUTURE insert or
--- update too, not just the rows that already exist today.
+-- wise_transaction_id and amount are compatibility aliases for wise_reference
+-- and amount_value respectively. Both follow the same default/backfill/enforce
+-- shape as above, plus a trigger so they stay populated on every FUTURE insert
+-- or update too, not just the rows that already exist today. Neither the sync
+-- Edge Function, "Sync now", nor this file's own verification script ever
+-- needs to know these columns exist.
 update public.wise_transactions
    set wise_transaction_id = coalesce(wise_transaction_id, wise_reference)
  where wise_transaction_id is null;
+
+-- amount_value is legitimately NULL for every SKIPPED transaction (pending,
+-- reversed, incoming, unsupported-currency, ...) -- the sync core never
+-- resolves an amount for those by design. A straight copy would therefore
+-- make `amount` NOT NULL impossible to satisfy for real, everyday skip rows,
+-- not just for this file's own tests. 0 is the "no resolved amount" sentinel
+-- for exactly those rows.
+--
+-- Two plain assignments rather than one COALESCE: a legacy `amount` column
+-- could be text (Wise's own field naming isn't guaranteed numeric on an
+-- unknown pre-existing table), and while a direct assignment from numeric
+-- into text is allowed (an "assignment cast"), COALESCE(text, numeric, int)
+-- is not -- it requires a common IMPLICIT cast across all arguments, which
+-- text and numeric do not have, and errors even though a plain SET does not.
+update public.wise_transactions
+   set amount = amount_value
+ where amount is null and amount_value is not null;
+update public.wise_transactions
+   set amount = 0
+ where amount is null;
 
 create or replace function public.wise_transactions_default_transaction_id()
 returns trigger language plpgsql as $$
 begin
   if new.wise_transaction_id is null then
     new.wise_transaction_id := new.wise_reference;
+  end if;
+  -- Same reason as the backfill above: two plain assignments, not a COALESCE,
+  -- so this works whether `amount` is numeric or text.
+  if new.amount is null then
+    if new.amount_value is not null then
+      new.amount := new.amount_value;
+    else
+      new.amount := 0;
+    end if;
   end if;
   return new;
 end;
@@ -236,7 +272,7 @@ declare
   col text;
   bad bigint;
 begin
-  foreach col in array array['connection_id', 'user_id', 'wise_reference', 'wise_transaction_id', 'raw_json'] loop
+  foreach col in array array['connection_id', 'user_id', 'wise_reference', 'wise_transaction_id', 'amount', 'raw_json'] loop
     execute format('select count(*) from public.wise_transactions where %I is null', col)
       into bad;
     if bad = 0 then
