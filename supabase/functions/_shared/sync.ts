@@ -193,10 +193,13 @@ export async function syncConnection(
   try {
     balances = await listBalances(wise);
   } catch (e) {
+    // invalid_token / insufficient_permissions / wise_rate_limited come from
+    // WiseAuthError.code (see _shared/wise.ts); anything else -- a 5xx or a
+    // network failure -- is Wise's own availability, not the token's fault.
     return {
       ...result,
       status: "error",
-      error: e instanceof WiseAuthError ? "invalid_token" : "provider_unreachable",
+      error: e instanceof WiseAuthError ? e.code : "provider_unreachable",
     };
   }
 
@@ -209,7 +212,7 @@ export async function syncConnection(
       transactions = Array.isArray(statement?.transactions) ? statement.transactions : [];
     } catch (e) {
       if (e instanceof WiseAuthError) {
-        return { ...result, status: "error", error: "invalid_token" };
+        return { ...result, status: "error", error: e.code };
       }
       result.failed++;
       continue; // One unreadable balance must not stop the others.

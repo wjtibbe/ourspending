@@ -120,8 +120,16 @@ generic failure: `token_refused` (401 — wrong or revoked token),
 `token_forbidden` (403 — the token doesn't have permission for this),
 `wise_rate_limited` (429 — try again shortly), or
 `wise_temporarily_unavailable` (5xx or a network failure — Wise's side, not
-yours). `/v1/profiles`, balances and statements are only ever requested later,
-by **Sync now** and the hourly job — never at connect time.
+yours). Profile listing, balance access and statements are only ever
+requested later, by **Sync now** and the hourly job — never at connect time.
+
+**Sync now** and the hourly job list profiles via `GET /v2/profiles` — not
+`/v1/profiles`, which requires broader token permissions than a plain Personal
+Access Token carries and rejected a real, confirmed-valid token even though
+`GET /v1/me` succeeded for it directly. A rejection there also comes back
+distinctly: `invalid_token` (401), `insufficient_permissions` (403 — the token
+lacks the scope this call needs), `wise_rate_limited` (429), or
+`provider_unreachable` (5xx or a network failure).
 
 To replace a token, press **Reconnect** and paste the new one — the old one is
 overwritten. **Disconnect** deletes the connection and, by cascade, the stored
