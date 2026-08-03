@@ -42,6 +42,8 @@ export type ConnectionResult = {
   duplicatesSkipped: number;
   unsupportedSkipped: number;
   failed: number;
+  /** Transactions dropped because Wise supplied no stable identifier. */
+  missingStableId: number;
   categoryFallbacks: number;
 };
 
@@ -52,6 +54,7 @@ export type SyncStats = {
   duplicatesSkipped: number;
   unsupportedSkipped: number;
   failed: number;
+  missingStableId: number;
   categoryFallbacks: number;
   connections: ConnectionResult[];
 };
@@ -67,7 +70,7 @@ const q = (v: string) => encodeURIComponent(v);
 const emptyResult = (connectionId: string): ConnectionResult => ({
   connectionId, status: "ok", error: null,
   transactionsFetched: 0, expensesImported: 0, duplicatesSkipped: 0,
-  unsupportedSkipped: 0, failed: 0, categoryFallbacks: 0,
+  unsupportedSkipped: 0, failed: 0, missingStableId: 0, categoryFallbacks: 0,
 });
 
 /** Mirrors perEur() in app.js, so imported rows convert exactly like typed ones. */
@@ -159,7 +162,15 @@ export async function syncConnection(
   if (!householdId) {
     return { ...result, status: "skipped", error: "no_household" };
   }
-  const slot = slotRaw === 0 || slotRaw === 1 ? Number(slotRaw) : 0;
+
+  // An imported expense is SHARED, so `payer` decides who the household owes.
+  // Getting it wrong would misattribute money between the two members, so the
+  // slot is resolved from the owner's own profile and never defaulted: an
+  // unresolvable slot skips the connection rather than guessing p0.
+  const slot = slotRaw === 0 || slotRaw === 1 ? Number(slotRaw) : null;
+  if (slot === null) {
+    return { ...result, status: "skipped", error: "unresolved_slot" };
+  }
 
   const households = await db.select(
     `households?id=eq.${q(householdId)}&select=usd_per_eur,cop_per_eur&limit=1`,
@@ -237,8 +248,22 @@ type Ctx = {
 
 async function processTransaction(ctx: Ctx, tx: WiseTx, result: ConnectionResult) {
   const { db, conn } = ctx;
-  const reference = transactionReference(tx);
   const classification = classifyTransaction(tx);
+
+  // No stable provider identifier means no safe idempotency key, and without
+  // one a re-run could import the same spend twice. Record the anomaly, count
+  // it, and move on to the next transaction — never import, never abort.
+  const reference = transactionReference(tx);
+  if (!reference) {
+    console.error(
+      "wise-sync: missing_stable_id on connection", conn.id,
+      "balance", ctx.bal.balanceId,
+      "detailType", classification.detailType ?? "unknown",
+    );
+    result.failed++;
+    result.missingStableId++;
+    return;
+  }
 
   const baseRow: Row = {
     connection_id: conn.id,
@@ -308,6 +333,8 @@ async function processTransaction(ctx: Ctx, tx: WiseTx, result: ConnectionResult
     // whose expense never landed (a crash between the two writes).
     const existing = await db.select(
       `wise_transactions?connection_id=eq.${q(conn.id)}` +
+        `&wise_profile_id=eq.${q(ctx.bal.profileId)}` +
+        `&wise_balance_id=eq.${q(ctx.bal.balanceId)}` +
         `&wise_reference=eq.${q(reference)}&select=id,import_status,expense_id&limit=1`,
     );
     const e = existing[0];
@@ -330,9 +357,12 @@ async function processTransaction(ctx: Ctx, tx: WiseTx, result: ConnectionResult
       currency: amounts.balance.currency,
       amount_eur: Math.round((amounts.balance.value / rate) * 100) / 100,
       rate_used: rate,
-      // A card charge belongs to the person whose account it is. The owner can
-      // re-assign it in the app afterwards, exactly like a typed expense.
-      kind: ctx.slot === 1 ? "p1" : "p0",
+      // Imported spend is a SHARED household expense, using the app's own
+      // convention: kind "shared" means the household splits it, and `payer`
+      // records which member actually paid. The slot is the connection
+      // owner's, resolved from their profile above — never hardcoded. The
+      // expense stays fully editable in the normal expense interface.
+      kind: "shared",
       payer: ctx.slot,
       category: category.category,
       note: describeTransaction(tx),
@@ -356,10 +386,17 @@ async function processTransaction(ctx: Ctx, tx: WiseTx, result: ConnectionResult
   }
 }
 
-/** Returns the inserted row, or null when the unique key already existed. */
+/**
+ * Returns the inserted row, or null when the unique key already existed.
+ *
+ * The key spans profile and balance as well as the reference, because a Wise
+ * reference is only documented to be unique within a balance statement — the
+ * same reference appearing under a different profile or balance is a different
+ * movement, not a duplicate.
+ */
 async function insertIgnoringDuplicates(db: Db, row: Row): Promise<Row | null> {
   const rows = await db.insert(
-    "wise_transactions?on_conflict=connection_id,wise_reference",
+    "wise_transactions?on_conflict=connection_id,wise_profile_id,wise_balance_id,wise_reference",
     row,
     "resolution=ignore-duplicates,return=representation",
   );
@@ -402,7 +439,7 @@ export async function syncMany(
   const stats: SyncStats = {
     connectionsProcessed: 0, transactionsFetched: 0, expensesImported: 0,
     duplicatesSkipped: 0, unsupportedSkipped: 0, failed: 0,
-    categoryFallbacks: 0, connections: [],
+    missingStableId: 0, categoryFallbacks: 0, connections: [],
   };
 
   for (const conn of connections) {
@@ -419,6 +456,7 @@ export async function syncMany(
     stats.duplicatesSkipped += r.duplicatesSkipped;
     stats.unsupportedSkipped += r.unsupportedSkipped;
     stats.failed += r.failed;
+    stats.missingStableId += r.missingStableId;
     stats.categoryFallbacks += r.categoryFallbacks;
     stats.connections.push(r);
 
@@ -461,6 +499,7 @@ export async function recordRun(
       duplicates_skipped: stats.duplicatesSkipped,
       unsupported_skipped: stats.unsupportedSkipped,
       failed: stats.failed,
+      missing_stable_id: stats.missingStableId,
       category_fallbacks: stats.categoryFallbacks,
       error_summary: errorSummary,
     }, "return=minimal");

@@ -47,10 +47,14 @@ create table if not exists public.wise_transactions (
   user_id uuid not null references auth.users(id) on delete cascade,
   household_id uuid references public.households(id) on delete set null,
 
-  -- Wise's own stable identifier for the movement (e.g. "CARD-123456789").
+  -- Wise's own stable identifier for the movement (e.g. "CARD-123456789"),
+  -- taken from referenceNumber or, failing that, the transaction id. A
+  -- transaction with neither is never imported and never reaches this table.
   wise_reference text not null,
-  wise_profile_id text,
-  wise_balance_id text,
+  -- Part of the uniqueness scope, so '' rather than null: NULLs do not collide
+  -- in a unique constraint, which would silently disable the dedupe guarantee.
+  wise_profile_id text not null default '',
+  wise_balance_id text not null default '',
   occurred_at timestamptz,
 
   direction text,        -- out | in | unknown
@@ -93,9 +97,43 @@ create table if not exists public.wise_transactions (
 
   -- THE idempotency guarantee. Two runs over the same statement cannot create
   -- two ledger rows, and therefore cannot create two expenses.
+  --
+  -- The scope includes profile and balance because a Wise reference is only
+  -- documented to be unique within one balance statement. The same reference
+  -- under a different profile or balance is a different movement, and
+  -- collapsing the two would silently drop a real expense.
   constraint wise_transactions_reference_unique
-    unique (connection_id, wise_reference)
+    unique (connection_id, wise_profile_id, wise_balance_id, wise_reference)
 );
+
+-- Upgrade path: if an earlier version of this file was already run, widen the
+-- uniqueness scope in place rather than requiring a drop.
+do $$
+begin
+  alter table public.wise_transactions
+    alter column wise_profile_id set default '',
+    alter column wise_balance_id set default '';
+  update public.wise_transactions
+     set wise_profile_id = coalesce(wise_profile_id, ''),
+         wise_balance_id = coalesce(wise_balance_id, '')
+   where wise_profile_id is null or wise_balance_id is null;
+  alter table public.wise_transactions
+    alter column wise_profile_id set not null,
+    alter column wise_balance_id set not null;
+
+  if exists (
+    select 1 from pg_constraint
+    where conname = 'wise_transactions_reference_unique'
+      and conrelid = 'public.wise_transactions'::regclass
+      and array_length(conkey, 1) = 2
+  ) then
+    alter table public.wise_transactions
+      drop constraint wise_transactions_reference_unique;
+    alter table public.wise_transactions
+      add constraint wise_transactions_reference_unique
+      unique (connection_id, wise_profile_id, wise_balance_id, wise_reference);
+  end if;
+end $$;
 
 create index if not exists wise_transactions_user_idx
   on public.wise_transactions (user_id);
@@ -140,12 +178,20 @@ create table if not exists public.provider_sync_runs (
   duplicates_skipped integer not null default 0,
   unsupported_skipped integer not null default 0,
   failed integer not null default 0,
+  -- Transactions Wise reported with no stable identifier. These are logged and
+  -- counted but never imported, because without a stable key a re-run could
+  -- create the same expense twice.
+  missing_stable_id integer not null default 0,
   category_fallbacks integer not null default 0,
   error_summary text,
   created_at timestamptz not null default now(),
   constraint provider_sync_runs_trigger_check
     check (trigger_source in ('cron', 'manual'))
 );
+
+-- Upgrade path for an earlier version of this file.
+alter table public.provider_sync_runs
+  add column if not exists missing_stable_id integer not null default 0;
 
 create index if not exists provider_sync_runs_started_idx
   on public.provider_sync_runs (started_at desc);

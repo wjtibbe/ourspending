@@ -72,10 +72,11 @@ begin
   returning id into exp;
 
   insert into wise_transactions (connection_id, user_id, household_id, wise_reference,
+                                 wise_profile_id, wise_balance_id,
                                  direction, amount_value, amount_currency,
                                  amount_source_path, mapped_category, category_source,
                                  import_status, expense_id, raw_json)
-  values (conn, ua, ha, 'CARD-111', 'out', 12.34, 'USD',
+  values (conn, ua, ha, 'CARD-111', 'p1', 'b1', 'out', 12.34, 'USD',
           'amount', 'transport', 'provider_category', 'imported', exp, '{"x":1}'::jsonb)
   returning id into ledger;
 
@@ -85,16 +86,41 @@ begin
   blocked := false;
   begin
     insert into wise_transactions (connection_id, user_id, household_id, wise_reference,
-                                   import_status, raw_json)
-    values (conn, ua, ha, 'CARD-111', 'imported', '{"x":2}'::jsonb);
+                                   wise_profile_id, wise_balance_id, import_status, raw_json)
+    values (conn, ua, ha, 'CARD-111', 'p1', 'b1', 'imported', '{"x":2}'::jsonb);
   exception when unique_violation then blocked := true;
   end;
   assert blocked, 'BROKEN: the same Wise transaction was recorded twice';
 
-  -- The same reference on a DIFFERENT connection is a different transaction.
+  -- The SAME reference under a different balance is a different movement and
+  -- must be allowed through, or a real expense would be silently dropped.
   insert into wise_transactions (connection_id, user_id, household_id, wise_reference,
-                                 import_status, raw_json)
-  values (conn, ua, ha, 'CARD-222', 'skipped', '{"x":3}'::jsonb);
+                                 wise_profile_id, wise_balance_id, import_status, raw_json)
+  values (conn, ua, ha, 'CARD-111', 'p1', 'b2', 'imported', '{"x":3}'::jsonb);
+  select count(*) into n from wise_transactions where wise_reference = 'CARD-111';
+  assert n = 2, format('BROKEN: same reference on two balances collapsed to %s row(s)', n);
+
+  -- ...and so is the same reference under a different profile.
+  insert into wise_transactions (connection_id, user_id, household_id, wise_reference,
+                                 wise_profile_id, wise_balance_id, import_status, raw_json)
+  values (conn, ua, ha, 'CARD-111', 'p2', 'b1', 'imported', '{"x":4}'::jsonb);
+  select count(*) into n from wise_transactions where wise_reference = 'CARD-111';
+  assert n = 3, format('BROKEN: same reference on two profiles collapsed to %s row(s)', n);
+
+  -- The profile/balance columns must never be NULL: NULLs do not collide in a
+  -- unique constraint, which would quietly disable the dedupe guarantee.
+  blocked := false;
+  begin
+    insert into wise_transactions (connection_id, user_id, household_id, wise_reference,
+                                   wise_profile_id, import_status, raw_json)
+    values (conn, ua, ha, 'CARD-999', null, 'imported', '{"x":5}'::jsonb);
+  exception when not_null_violation then blocked := true;
+  end;
+  assert blocked, 'BROKEN: wise_profile_id accepts NULL, so the dedupe scope can be bypassed';
+
+  insert into wise_transactions (connection_id, user_id, household_id, wise_reference,
+                                 wise_profile_id, wise_balance_id, import_status, raw_json)
+  values (conn, ua, ha, 'CARD-222', 'p1', 'b1', 'skipped', '{"x":6}'::jsonb);
 
   -- ========================================================
   -- 2b. The owner may read their own ledger, and nothing else
@@ -103,7 +129,7 @@ begin
   perform set_config('request.jwt.claims', json_build_object('sub', ua, 'role', 'authenticated')::text, true);
 
   select count(*) into n from wise_transactions where connection_id = conn;
-  assert n = 2, format('BROKEN: owner sees %s of their own 2 ledger rows', n);
+  assert n = 4, format('BROKEN: owner sees %s of their own 4 ledger rows', n);
 
   -- ========================================================
   -- 2c. The ledger is read-only to clients

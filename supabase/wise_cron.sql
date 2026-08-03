@@ -49,7 +49,7 @@ select cron.schedule(
 -- What did the runs actually do? (this is the real answer)
 --   select started_at, trigger_source, connections_processed, transactions_fetched,
 --          expenses_imported, duplicates_skipped, unsupported_skipped,
---          failed, category_fallbacks
+--          failed, missing_stable_id, category_fallbacks
 --   from provider_sync_runs order by started_at desc limit 20;
 --
 -- To pause the job:      select cron.unschedule('wise-hourly-sync');

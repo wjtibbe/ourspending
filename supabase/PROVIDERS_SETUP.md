@@ -131,20 +131,40 @@ Each run, for every connected Wise account:
 2. lists the token's profiles and balances;
 3. reads each balance statement for the last `WISE_SYNC_DAYS` days;
 4. records every movement in `wise_transactions`, keyed by Wise's own
-   `referenceNumber`, so a movement is only ever processed once;
+   `referenceNumber` (or its transaction `id` when there is no reference),
+   scoped to the profile and balance it came from, so a movement is only ever
+   processed once;
 5. creates an expense for completed **outgoing** movements only.
 
 Skipped, with the reason stored on the ledger row: pending, reversed,
 cancelled, declined and failed statuses; incoming payments; balance
 conversions and top-ups; and any balance currency the app does not support
 (it holds rates for EUR, USD and COP only — an unsupported currency is
-skipped, never converted with a guessed rate).
+skipped as `unsupported_currency_<CUR>`, never converted with a guessed rate).
+
+A transaction carrying **neither** a `referenceNumber` nor an `id` is never
+imported: without a stable key a later run could create the same expense
+twice. It is logged as `missing_stable_id`, counted, and the run carries on. If
+`missing_stable_id` is ever non-zero, those few transactions need entering by
+hand — check the function logs for the balance they came from.
 
 A failure is always contained: one bad transaction does not stop the rest of
 the statement, and one broken connection does not stop other users'.
 
 **"Sync now" runs exactly the same code**, scoped to your own connection, and
 reports how many expenses it imported.
+
+### Who the expense belongs to
+
+Imported expenses are **shared household expenses**, using the app's existing
+convention: `kind = "shared"` so the household splits it, and `payer` set to
+the slot of the member who owns the Wise connection. The slot is read from that
+user's own profile — a `p0` owner imports with `payer = 0`, a `p1` owner with
+`payer = 1`. It is never assumed: if the slot cannot be resolved the connection
+is skipped rather than risk attributing the spend to the wrong member.
+
+Every imported expense is fully editable afterwards in the normal expense
+screen, so anything that should have been private can be changed there.
 
 ### Which amount is used
 
@@ -182,7 +202,7 @@ it.
 
     select started_at, trigger_source, connections_processed, transactions_fetched,
            expenses_imported, duplicates_skipped, unsupported_skipped,
-           failed, category_fallbacks
+           failed, missing_stable_id, category_fallbacks
     from provider_sync_runs order by started_at desc limit 20;
 
 Why something was skipped:

@@ -39,7 +39,8 @@ export const syncDeps: SyncDeps = {
 export const publicStats = (s: {
   connectionsProcessed: number; transactionsFetched: number;
   expensesImported: number; duplicatesSkipped: number;
-  unsupportedSkipped: number; failed: number; categoryFallbacks: number;
+  unsupportedSkipped: number; failed: number; missingStableId: number;
+  categoryFallbacks: number;
 }) => ({
   connectionsProcessed: s.connectionsProcessed,
   transactionsFetched: s.transactionsFetched,
@@ -47,5 +48,6 @@ export const publicStats = (s: {
   duplicatesSkipped: s.duplicatesSkipped,
   unsupportedSkipped: s.unsupportedSkipped,
   failed: s.failed,
+  missingStableId: s.missingStableId,
   categoryFallbacks: s.categoryFallbacks,
 });

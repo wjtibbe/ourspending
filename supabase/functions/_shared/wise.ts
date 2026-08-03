@@ -173,25 +173,22 @@ export function resolveAmounts(tx: WiseTx): {
 // ---------------------------------------------------------------------------
 
 /**
- * Stable idempotency key. Wise's statement gives every movement a
- * referenceNumber (e.g. "CARD-123456789"); the fallbacks keep a malformed
- * transaction from colliding with a different one.
+ * The stable idempotency key, or null when the provider supplied none.
+ *
+ * Order: referenceNumber (what Wise's statement gives every movement, e.g.
+ * "CARD-123456789"), then the transaction id.
+ *
+ * There is deliberately NO synthesised fallback. A key derived from date +
+ * amount + description is not stable: Wise can settle a transaction with a
+ * slightly different description or a corrected amount, and the "same"
+ * transaction would then hash differently and import a second time. Returning
+ * null instead means the caller records the anomaly and imports nothing, which
+ * is recoverable — a duplicate expense is not.
  */
-export function transactionReference(tx: WiseTx): string {
-  const direct = str(get(tx, "referenceNumber")) ??
+export function transactionReference(tx: WiseTx): string | null {
+  return str(get(tx, "referenceNumber")) ??
     str(get(tx, "id")) ??
-    str(get(tx, "details.id")) ??
-    str(get(tx, "details.reference"));
-  if (direct) return direct;
-
-  const a = readAmount(tx, "amount");
-  const parts = [
-    str(get(tx, "date")) ?? "",
-    a ? String(a.value) : "",
-    a ? a.currency : "",
-    (str(get(tx, "details.description")) ?? "").slice(0, 40),
-  ];
-  return "synthetic:" + parts.join("|");
+    null;
 }
 
 /** YYYY-MM-DD, matching the app's `spent_on` date column. */

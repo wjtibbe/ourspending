@@ -175,6 +175,23 @@ const UNKNOWN_CATEGORY: WiseTx = {
 
 const MALFORMED: WiseTx = { type: "DEBIT", date: "not-a-date", referenceNumber: "CARD-5001" };
 
+// No referenceNumber, but Wise supplied a transaction id: still stable.
+const ID_ONLY: WiseTx = {
+  type: "DEBIT",
+  date: "2026-08-02T13:00:00.000Z",
+  amount: { value: -5, currency: "USD" },
+  details: { type: "CARD", description: "Exito", category: "Groceries", merchant: { name: "Exito" } },
+  id: 987654321,
+};
+
+// Neither identifier: must never be imported.
+const NO_STABLE_ID: WiseTx = {
+  type: "DEBIT",
+  date: "2026-08-02T14:00:00.000Z",
+  amount: { value: -7, currency: "USD" },
+  details: { type: "CARD", description: "Mystery", category: "Groceries" },
+};
+
 const GBP_BALANCE_TX: WiseTx = {
   type: "DEBIT",
   date: "2026-08-02T12:00:00.000Z",
@@ -197,7 +214,8 @@ console.log("\n-- case 1: a completed outgoing transaction creates exactly one e
   check("currency is the deducted currency", e.currency === "USD");
   check("amount_eur uses the household rate", Number(e.amount_eur) === Math.round((12.34 / 1.08) * 100) / 100);
   check("rate_used recorded", Number(e.rate_used) === 1.08);
-  check("kind is private to the owner's slot", e.kind === "p0" && e.payer === 0);
+  check("imported as a SHARED household expense", e.kind === "shared");
+  check("payer is the connection owner's slot", e.payer === 0);
   check("category mapped from the Wise category", e.category === "subscriptions");
   check("spent_on is the transaction date", e.spent_on === "2026-08-01");
   check("note carries the merchant", String(e.note).includes("Netflix"));
@@ -348,11 +366,63 @@ console.log("\n-- the household is re-derived, never taken from the connection r
   check("expense lands in the CURRENT household", db.store.expenses[0].household_id === "hh-9");
 }
 
-console.log("\n-- slot 1 owner gets p1 --");
-{
-  const db = freshDb({ slot: 1 });
+console.log("\n-- ownership: shared by default, payer resolved from the owner's slot --");
+for (const slot of [0, 1]) {
+  const db = freshDb({ slot });
   await syncConnection(deps(db, fakeWise([COMPLETED_CARD])), CONN);
-  check("kind p1, payer 1", db.store.expenses[0].kind === "p1" && db.store.expenses[0].payer === 1);
+  const e = db.store.expenses[0];
+  check(`slot ${slot} owner -> shared expense`, e.kind === "shared", String(e.kind));
+  check(`slot ${slot} owner -> payer ${slot}`, e.payer === slot, String(e.payer));
+  check(`slot ${slot} owner -> never private`, e.kind !== "p0" && e.kind !== "p1");
+}
+{
+  // The slot is resolved, never assumed: an unresolvable one must not silently
+  // become p0 and misattribute a shared expense.
+  const db = freshDb();
+  db.store.profiles[0].slot = null;
+  const r = await syncConnection(deps(db, fakeWise([COMPLETED_CARD])), CONN);
+  check("unresolved slot skips the connection", r.status === "skipped" && r.error === "unresolved_slot", JSON.stringify(r));
+  check("nothing imported with an unresolved slot", db.store.expenses.length === 0);
+}
+
+console.log("\n-- stable identifiers --");
+{
+  const db = freshDb();
+  const r = await syncConnection(deps(db, fakeWise([ID_ONLY])), CONN);
+  check("no referenceNumber but a stable id -> imported", r.expensesImported === 1, JSON.stringify(r));
+  check("the id is used as the ledger key", db.store.wise_transactions[0].wise_reference === "987654321");
+  const again = await syncConnection(deps(db, fakeWise([ID_ONLY])), CONN);
+  check("id-keyed transaction imports exactly once", again.expensesImported === 0 && db.store.expenses.length === 1);
+}
+{
+  const db = freshDb();
+  const r = await syncConnection(deps(db, fakeWise([NO_STABLE_ID])), CONN);
+  check("no identifier at all -> no expense", db.store.expenses.length === 0, JSON.stringify(r));
+  check("no ledger row written either", db.store.wise_transactions.length === 0);
+  check("counted as missingStableId", r.missingStableId === 1);
+  check("counted in failed", r.failed === 1);
+  check("connection itself still ok", r.status === "ok");
+}
+{
+  // The unidentifiable one must not take the rest of the statement with it.
+  const db = freshDb();
+  const r = await syncConnection(deps(db, fakeWise([NO_STABLE_ID, COMPLETED_CARD, CONVERTED_CARD])), CONN);
+  check("processing continues after missing_stable_id", r.expensesImported === 2, JSON.stringify(r));
+  check("still exactly one missingStableId", r.missingStableId === 1);
+}
+{
+  // Same reference under a different balance is a different movement.
+  const db = freshDb();
+  const twoBalances: WiseClient = {
+    profiles: async () => [{ id: 111, type: "personal" }],
+    balances: async () => [{ id: 222, currency: "USD" }, { id: 333, currency: "EUR" }],
+    statement: async () => ({ transactions: [COMPLETED_CARD] }),
+  };
+  const r = await syncConnection(deps(db, twoBalances), CONN);
+  check("same reference on two balances imports twice", r.expensesImported === 2, JSON.stringify(r));
+  check("two distinct ledger rows", db.store.wise_transactions.length === 2);
+  const again = await syncConnection(deps(db, twoBalances), CONN);
+  check("and neither duplicates on a second run", again.expensesImported === 0 && db.store.expenses.length === 2);
 }
 
 console.log("\n-- a deactivated household category falls back to other --");
