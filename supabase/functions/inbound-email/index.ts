@@ -226,7 +226,10 @@ Deno.serve(async (req) => {
       return json({ ok: true, ignored: ctx.error });
     }
 
-    const result = await createExpense(db, ctx, tx);
+    const result = await createExpense(db, ctx, tx, {
+      sourceProvider: "wise",
+      conversionSource: wiseEmailParser.provider,
+    });
     if (result.status === "failed") {
       await mark(rowId, { status: "failed", error_summary: result.reason });
       return json({ ok: true, ignored: "import_failed" });

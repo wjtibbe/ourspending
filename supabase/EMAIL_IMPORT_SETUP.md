@@ -23,11 +23,14 @@ Supabase dashboard → **SQL Editor**, in this order:
 
 1. `supabase/email_import.sql`
 2. `supabase/verify_email_import.sql` → expect `EMAIL IMPORT VERIFICATION PASSED`
+3. `supabase/expense_conversion_fields.sql`
+4. `supabase/verify_expense_conversion_fields.sql` → expect `EXPENSE CONVERSION FIELDS VERIFICATION PASSED`
 
 | Table | Purpose |
 |---|---|
 | `email_import_connections` | One inbound alias per user. `alias_token` is 20 CSPRNG bytes as hex (160 bits) and encodes nothing — no user id, no household id. SELECT-only for its owner; every write goes through a `SECURITY DEFINER` RPC. |
 | `email_import_messages` | The ledger and audit trail. Four partial unique indexes give four independent dedupe layers, plus a **sanitised body retained for 7 days** to diagnose parser failures (see §9). |
+| `expenses` (extended) | Six additive columns: `merchant_amount`/`merchant_currency` (the merchant's own amount, display/audit only), `had_currency_conversion`, `amount_authority`, `source_provider`, `conversion_source`. See §12. |
 
 ---
 
@@ -256,3 +259,33 @@ Retired, but **not deleted** — nothing was removed from your Supabase project.
 An explicit **optional** production cleanup list will be supplied once email
 import is confirmed working end to end. Nothing is removed before then, so
 rollback stays a redeploy rather than a restore.
+
+---
+
+## 12. Authoritative amount & display for converted-currency imports
+
+A Wise card payment abroad reports two true amounts: what the merchant
+charged (e.g. `71,362 COP`) and what actually left the Wise balance (e.g.
+`19.76 EUR`). The deducted amount is, and always stays, the expense's
+authoritative amount — it is what `amount_orig`/`currency` store, and it is
+never recalculated from a later exchange rate. The merchant's own amount is
+kept alongside it, once, purely for display and audit, in `merchant_amount`/
+`merchant_currency`; it never creates a second expense and never becomes the
+authoritative figure.
+
+In the app, the expense list shows whichever of the two stored amounts
+matches the currently selected display currency — exactly, with no
+conversion:
+
+* Display currency **EUR** → `€19.76` large, `COP 71,362` small.
+* Display currency **COP** → `COP 71,362` large, `€19.76` small.
+* Display currency **USD** (neither stored currency) → a converted amount
+  large, `€19.76` small — the only case where a fresh conversion happens.
+
+A direct-currency payment (no conversion, or a manual expense) behaves
+exactly as before: `had_currency_conversion` is `false`, `merchant_amount`
+stays `null`, and nothing is invented.
+
+Later exchange-rate updates never touch a stored import: `amount_orig`,
+`currency`, `merchant_amount` and `merchant_currency` are written once, at
+import time, and are never rewritten by a rate change.

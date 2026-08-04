@@ -327,6 +327,45 @@ console.log("\n-- Wise completed card payment: real sample extraction --");
   if (shown.ok) {
     console.log("  extracted:", JSON.stringify(shown.transaction, null, 2).replace(/\n/g, "\n  "));
   }
+
+  // End-to-end: parser output through import-core produces one expense row
+  // whose stored amounts are exact and whose display fields let the UI show
+  // "€19.76 / COP 71,362" without any further conversion.
+  if (shown.ok) {
+    class FakeDb {
+      store: Record<string, Row[]> = {
+        profiles: [{ id: "user-1", household_id: "hh-1", slot: 0 }],
+        households: [{ id: "hh-1", usd_per_eur: 1.08, cop_per_eur: 4500 }],
+        household_categories: [],
+        expenses: [],
+      };
+      select(path: string) {
+        const t = path.split("?")[0];
+        return Promise.resolve((this.store[t] ?? []).map((r) => ({ ...r })));
+      }
+      insert(t: string, body: Row | Row[]) {
+        const rows = Array.isArray(body) ? body : [body];
+        const key = t.split("?")[0];
+        const out = rows.map((r, i) => ({ id: `${key}-${i}`, ...r }));
+        (this.store[key] ??= []).push(...out);
+        return Promise.resolve(out);
+      }
+      patch() { return Promise.resolve([]); }
+    }
+    const db = new FakeDb();
+    const ctx = await resolveImportContext(db, "user-1", new Date("2026-08-03T15:04:00.000Z"));
+    if (!("error" in ctx)) {
+      const outcome = await createExpense(db, ctx, shown.transaction, {
+        sourceProvider: "wise", conversionSource: "wise_email",
+      });
+      check("exactly one expense created from one Wise email", outcome.status === "imported" && db.store.expenses.length === 1);
+      const row = db.store.expenses[0];
+      check("stored amount is the deducted EUR figure, unconverted", row.amount_orig === 19.76 && row.currency === "EUR");
+      check("stored merchant amount is the exact COP figure", row.merchant_amount === 71362 && row.merchant_currency === "COP");
+      check("flagged as a real conversion", row.had_currency_conversion === true);
+      check("amount_authority recorded", row.amount_authority === "deducted_balance_amount");
+    }
+  }
 }
 
 

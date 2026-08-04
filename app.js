@@ -1224,6 +1224,9 @@ function Overview({
   const [fCat, setFCat] = useState(null);
   const [search, setSearch] = useState("");
   const [confirmId, setConfirmId] = useState(null);
+  // Exact stored amounts when displayCur matches either the deducted or the
+  // merchant currency; only a genuine third currency is freshly converted.
+  const expenseAmountView = e => ExpenseDisplay.expenseDisplayAmounts(e, displayCur, fmt, disp);
   const shift = d => {
     let m = month.m + d,
       y = month.y;
@@ -1527,9 +1530,9 @@ function Overview({
       }
     }, /*#__PURE__*/React.createElement("div", {
       style: S.expAmount
-    }, e.currency === displayCur ? fmt(Number(e.amount_orig), displayCur) : disp(Number(e.amount_eur))), e.currency !== displayCur && /*#__PURE__*/React.createElement("div", {
+    }, expenseAmountView(e).primary), expenseAmountView(e).secondary && /*#__PURE__*/React.createElement("div", {
       style: S.origTag
-    }, fmt(Number(e.amount_orig), e.currency)), confirmId === e.id ? /*#__PURE__*/React.createElement("div", {
+    }, expenseAmountView(e).secondary), confirmId === e.id ? /*#__PURE__*/React.createElement("div", {
       style: {
         display: "flex",
         gap: 4,

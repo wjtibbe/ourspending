@@ -208,6 +208,86 @@ console.log("\n-- createExpense --");
   check("no expense written when the rate is missing", db.store.expenses.length === 0);
 }
 
+console.log("\n-- authoritative amount & merchant metadata (Wise-style conversions) --");
+{
+  // The Éxito Express example: deducted 19.76 EUR, merchant charged 71,362 COP.
+  const exito = () => tx({
+    amount: { value: 19.76, currency: "EUR" },
+    merchantAmount: { value: 71362, currency: "COP" },
+    merchant: "Éxito Express",
+  });
+  const ctx = await resolveImportContext(seed(), "user-1", NOW) as ImportContext;
+  const { row } = buildExpenseRow(ctx, exito(), { sourceProvider: "wise", conversionSource: "wise_email" });
+
+  check("the deducted amount is the authoritative stored amount",
+    row.amount_orig === 19.76 && row.currency === "EUR");
+  check("the merchant amount is retained, in its own currency",
+    row.merchant_amount === 71362 && row.merchant_currency === "COP");
+  check("flagged as a real currency conversion", row.had_currency_conversion === true);
+  check("amount_authority records the deducted amount as authoritative",
+    row.amount_authority === "deducted_balance_amount");
+  check("provenance is recorded", row.source_provider === "wise" && row.conversion_source === "wise_email");
+
+  const out = await createExpense(seed(), ctx, exito(), { sourceProvider: "wise", conversionSource: "wise_email" });
+  check("creates exactly one expense (no double counting)", out.status === "imported");
+}
+{
+  // A later exchange-rate update must never recompute a historical import:
+  // buildExpenseRow only ever looks at the rates handed to it via ctx, and a
+  // fresh ctx built from updated household rates does not touch a row that
+  // was already written with the OLD rate.
+  const db = seed();
+  const ctx1 = await resolveImportContext(db, "user-1", NOW) as ImportContext;
+  const first = buildExpenseRow(ctx1, tx({
+    amount: { value: 19.76, currency: "EUR" },
+    merchantAmount: { value: 71362, currency: "COP" },
+  })).row;
+
+  db.store.households = [{ id: "hh-1", usd_per_eur: 1.08, cop_per_eur: 4700 }]; // rate moved
+  const ctx2 = await resolveImportContext(db, "user-1", NOW) as ImportContext;
+  const second = buildExpenseRow(ctx2, tx({
+    amount: { value: 19.76, currency: "EUR" },
+    merchantAmount: { value: 71362, currency: "COP" },
+  })).row;
+
+  check("the already-built row's stored amounts are the exact source values, independent of ctx",
+    first.amount_orig === 19.76 && first.merchant_amount === 71362);
+  check("a fresh build from an updated rate still stores the same source amounts (nothing is back-converted)",
+    second.amount_orig === 19.76 && second.merchant_currency === "COP" && second.merchant_amount === 71362);
+  check("only rate_used reflects which rate was in effect when EUR itself needs no conversion",
+    first.rate_used === 1 && second.rate_used === 1); // EUR is always rate 1 regardless of cop_per_eur
+}
+{
+  // A direct EUR transaction with no conversion (e.g. Wise itself reports the
+  // same currency in both fields, or no merchant amount at all) must not
+  // invent a second amount or a fake conversion flag.
+  const ctx = await resolveImportContext(seed(), "user-1", NOW) as ImportContext;
+  const noMerchant = buildExpenseRow(ctx, tx({ amount: { value: 9.99, currency: "EUR" } })).row;
+  check("no merchantAmount -> had_currency_conversion is false", noMerchant.had_currency_conversion === false);
+  check("no merchantAmount -> merchant_amount stays null", noMerchant.merchant_amount === null);
+  check("no merchantAmount -> merchant_currency stays null", noMerchant.merchant_currency === null);
+
+  const sameCurrency = buildExpenseRow(ctx, tx({
+    amount: { value: 9.99, currency: "EUR" },
+    merchantAmount: { value: 9.99, currency: "EUR" },
+  })).row;
+  check("merchantAmount in the SAME currency is not treated as a conversion",
+    sameCurrency.had_currency_conversion === false);
+  check("and is not stored as a second amount",
+    sameCurrency.merchant_amount === null && sameCurrency.merchant_currency === null);
+}
+{
+  // Manual/API-style callers that never pass provenance get null audit
+  // fields, never invented values -- this is what keeps every existing test
+  // above (which calls buildExpenseRow(ctx, tx()) with no third argument)
+  // passing unchanged.
+  const ctx = await resolveImportContext(seed(), "user-1", NOW) as ImportContext;
+  const row = buildExpenseRow(ctx, tx()).row;
+  check("provenance defaults to null when not supplied", row.source_provider === null && row.conversion_source === null);
+  check("amount_authority is set unconditionally (a contract fact, not provider-specific)",
+    row.amount_authority === "deducted_balance_amount");
+}
+
 console.log("\n-- perEur matches app.js --");
 {
   check("EUR is 1", perEur("EUR", { usd: 1.08, cop: 4500 }) === 1);
