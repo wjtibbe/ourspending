@@ -47,22 +47,43 @@ begin
 end $$;
 
 -- ------------------------------------------------------------
--- 2. A pre-existing (pre-migration-shaped) manual expense is unaffected.
+-- 2. Behavioural tests with a real test user.
 -- ------------------------------------------------------------
+-- expenses.created_by is `references auth.users(id)` -- a hard FK, same as
+-- calendar_events/groceries. A bare gen_random_uuid() satisfies no foreign
+-- key and is rejected outright ("expenses_created_by_fkey"). Every sibling
+-- verification (verify_rls.sql, verify_wise_transactions.sql,
+-- verify_email_import.sql) instead creates a real auth.users row, a real
+-- household, and a profile linking them via the trusted
+-- `app.household_assign` path -- reused here unchanged.
 do $$
 declare
-  v_hh uuid := gen_random_uuid();
-  v_user uuid := gen_random_uuid();
+  ua uuid := gen_random_uuid();   -- the test user; owns both households below
+  ha uuid;                        -- household for the plain-expense check
+  hb uuid;                        -- household for the Wise-conversion check
   v_id uuid;
   v_had boolean;
   v_merchant_amt numeric;
+  v_row record;
 begin
-  insert into households (id, name, usd_per_eur, cop_per_eur)
-  values (v_hh, 'verify-conv', 1.08, 4500);
+  insert into auth.users (id, email, instance_id, aud, role) values
+    (ua, 'conv-a@test.invalid', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated');
 
+  insert into households (name, invite_code, usd_per_eur, cop_per_eur)
+  values ('Conv A', 'convcod1', 1.08, 4500) returning id into ha;
+  insert into households (name, invite_code, usd_per_eur, cop_per_eur)
+  values ('Conv B', 'convcod2', 1.08, 4500) returning id into hb;
+
+  perform set_config('app.household_assign', 'on', true);
+  insert into profiles (id, display_name, household_id, slot) values (ua, 'Conv', ha, 0);
+  perform set_config('app.household_assign', 'off', true);
+
+  -- ========================================================
+  -- 2a. A pre-existing (pre-migration-shaped) manual expense is unaffected.
+  -- ========================================================
   insert into expenses (household_id, amount_orig, currency, amount_eur, rate_used,
                          kind, payer, category, note, spent_on, created_by)
-  values (v_hh, 12.34, 'EUR', 12.34, 1, 'shared', 0, 'other', 'Spotify', current_date, v_user)
+  values (ha, 12.34, 'EUR', 12.34, 1, 'shared', 0, 'other', 'Spotify', current_date, ua)
   returning id into v_id;
 
   select had_currency_conversion, merchant_amount into v_had, v_merchant_amt
@@ -74,26 +95,15 @@ begin
   if v_merchant_amt is not null then
     raise exception 'a plain manual expense must not have a merchant amount invented, got %', v_merchant_amt;
   end if;
-end $$;
 
--- ------------------------------------------------------------
--- 3. A Wise-converted import stores both amounts and flags correctly.
--- ------------------------------------------------------------
-do $$
-declare
-  v_hh uuid := gen_random_uuid();
-  v_user uuid := gen_random_uuid();
-  v_id uuid;
-  v_row record;
-begin
-  insert into households (id, name, usd_per_eur, cop_per_eur)
-  values (v_hh, 'verify-conv-2', 1.08, 4500);
-
+  -- ========================================================
+  -- 2b. A Wise-converted import stores both amounts and flags correctly.
+  -- ========================================================
   insert into expenses (household_id, amount_orig, currency, amount_eur, rate_used,
                          kind, payer, category, note, spent_on, created_by,
                          merchant_amount, merchant_currency, had_currency_conversion,
                          amount_authority, source_provider, conversion_source)
-  values (v_hh, 19.76, 'EUR', 19.76, 1, 'shared', 0, 'other', 'Éxito Express', current_date, v_user,
+  values (hb, 19.76, 'EUR', 19.76, 1, 'shared', 0, 'other', 'Éxito Express', current_date, ua,
           71362, 'COP', true,
           'deducted_balance_amount', 'wise', 'wise_email')
   returning id into v_id;
@@ -117,7 +127,7 @@ begin
 
   -- Simulate a later exchange-rate update on the household -- must not touch
   -- the stored expense at all.
-  update households set cop_per_eur = 4700 where id = v_hh;
+  update households set cop_per_eur = 4700 where id = hb;
 
   select * into v_row from expenses where id = v_id;
   if v_row.amount_orig <> 19.76 or v_row.merchant_amount <> 71362 then
@@ -125,7 +135,7 @@ begin
   end if;
 
   -- Exactly one expense per Wise message -- no second row was created.
-  if (select count(*) from expenses where household_id = v_hh) <> 1 then
+  if (select count(*) from expenses where household_id = hb) <> 1 then
     raise exception 'one Wise email must create exactly one expense';
   end if;
 end $$;
