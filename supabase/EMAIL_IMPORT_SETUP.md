@@ -12,7 +12,7 @@ which parses the transaction and creates a shared expense.
 **The parser is not implemented yet.** Everything else is. Until real Wise
 email samples exist, messages are recorded with `status = 'unparsed'` and no
 expense is created — nothing is lost, and those rows can be replayed once
-extraction lands. See "Current status" at the bottom.
+extraction lands. See §10 at the bottom.
 
 ---
 
@@ -26,7 +26,7 @@ Supabase dashboard → **SQL Editor**, in this order:
 | Table | Purpose |
 |---|---|
 | `email_import_connections` | One inbound alias per user. `alias_token` is 20 CSPRNG bytes as hex (160 bits) and encodes nothing — no user id, no household id. SELECT-only for its owner; every write goes through a `SECURITY DEFINER` RPC. |
-| `email_import_messages` | The ledger and audit trail. Four partial unique indexes give four independent dedupe layers. **No raw email body is stored** — only extracted fields, so there is no retention job and nothing to leak beyond what the expense already shows. |
+| `email_import_messages` | The ledger and audit trail. Four partial unique indexes give four independent dedupe layers, plus a **sanitised body retained for 7 days** to diagnose parser failures (see §9). |
 
 ---
 
@@ -90,25 +90,39 @@ the raw request body before anything else is read.
 This is done **once, by hand**. The app deliberately does not automate Gmail's
 confirmation handshake.
 
-1. In the app: **⚙ Settings → Connected accounts → Wise email import**. Copy
+1. In the app: **⚙ Settings → Wise email import**. Copy
    your address, e.g. `wise-a1b2c3…@inbound.yourdomain.com`.
 2. Gmail → **Settings → Forwarding and POP/IMAP → Add a forwarding address** →
    paste it → **Next → Proceed**.
-3. **Gmail now emails a confirmation code to that address.** It arrives at the
-   webhook, not at a mailbox you can read, so retrieve it from the Edge
-   Function logs:
+3. **Gmail now emails a confirmation code to that address.** That code arrives
+   at the webhook, not at any inbox you can open — so retrieve it one of these
+   ways, easiest first:
 
-       Supabase dashboard → Edge Functions → inbound-email → Logs
+   **A. Resend dashboard (simplest).** Resend → **Emails → Received**. Open the
+   message from `forwarding-noreply@google.com` and read the code, or click its
+   confirmation link directly. Nothing extra to set up.
 
-   The confirmation message is recorded with `skip_reason =
-   'sender_not_recognised'` (it is from Google, not Wise). To read the code,
-   temporarily use Resend's dashboard → **Emails → Received**, open the Gmail
-   confirmation, and copy the code or click the confirmation link.
+   **B. Confirm against a normal mailbox first (avoids the problem entirely).**
+   Before step 2, add a plain mailbox you control as the forwarding address and
+   confirm that. Then create the filter in step 5 pointing at your inbound
+   alias. Gmail requires confirmation **per destination address**, so this only
+   works if you forward to the confirmed mailbox — use A or C for the alias
+   itself.
 
-   > If you would rather not hunt for it: before step 2, point the forwarding
-   > address at a normal mailbox you control, confirm it, and only then switch
-   > the Gmail filter to the inbound alias. Gmail only requires confirmation
-   > per destination address.
+   **C. Read it from the ledger.** The confirmation is recorded like any other
+   message. It is from Google, not Wise, so it is stored as
+   `status = 'skipped'`, `skip_reason = 'sender_not_recognised'` — and because
+   it failed sender authenticity, its sanitised body is retained for 7 days.
+   As the project owner, in the SQL editor:
+
+       select raw_text
+       from email_import_messages
+       where from_address like '%google.com'
+       order by received_at desc
+       limit 1;
+
+   The code is in that text. Note this query only works from the SQL editor
+   (service role): the app itself cannot read `raw_text` at all.
 
 4. Paste the code back into Gmail and confirm.
 5. Gmail → **Settings → Filters → Create a new filter**:
@@ -152,19 +166,60 @@ own mail.
 
 ---
 
-## 9. Current status
+## 9. Data retention
+
+A **sanitised** copy of each email body is kept for **7 days**, purely so a
+parser failure can be diagnosed during rollout. It is constrained three ways:
+
+**Sanitised before storage.** `<script>`, `<style>`, `<iframe>`, and **every
+`<img>`** (tracking pixels included) are removed, along with all remote URLs
+(`href`/`src`/`srcset`/`url()`), inline event handlers and HTML comments.
+Email addresses become `[email]`, card-length digit runs become `[number]`,
+IBANs become `[iban]`. Amounts, merchants, dates and references are kept
+deliberately — they are the parse targets, and redacting them would defeat the
+purpose. Attachments and binary content are **never** stored.
+
+**Unreadable by the app.** Column-level grants omit `raw_text` and `raw_html`,
+so no client query can return them — not even the owner's. Privileges are
+checked before RLS, so a policy mistake cannot expose them either.
+
+**Cleared automatically.** A successful import purges its body *immediately*
+(a message that parsed needs no diagnosis), so in practice only failures
+occupy retention at all. Everything else expires after 7 days:
+
+    create extension if not exists pg_cron;
+    select cron.schedule(
+      'purge-email-raw-content',
+      '20 3 * * *',
+      $cron$ select public.purge_expired_email_raw_content(); $cron$
+    );
+
+Purging removes **only** the body. Message ids, hashes, parsed metadata,
+parsing status, the linked expense and the safe error summary all survive — so
+history and dedupe are unaffected and a purged message can never re-import.
+
+To purge everything now, regardless of expiry:
+
+    update email_import_messages
+       set raw_text = null, raw_html = null, raw_content_expires_at = null
+     where raw_text is not null or raw_html is not null;
+
+---
+
+## 10. Current status
 
 | Piece | State |
 |---|---|
 | Migrations + RLS + 4-layer dedupe | **Done**, verified on PostgreSQL 16 |
+| 7-day sanitised retention + purge job | **Done**, verified on PostgreSQL 16 |
+| Settings UI (address, copy, status, rotate, disable) | **Done** |
+| Wise API path retired from the app | **Done** — see §11 |
 | Provider-neutral import core | **Done**, 58 tests |
 | Svix signature verification | **Done**, 73 tests incl. replay and tampering |
 | Resend adapter (envelope + body fetch) | **Done** |
 | Alias resolution / sender authenticity | **Done** |
 | Locale-aware money parsing (`45.000` → 45000) | **Done** |
 | **Wise email field extraction** | **Blocked — needs real anonymised samples** |
-| Settings UI showing the address | Not started |
-| Retiring the Wise API path | Not started |
 
 To finish the parser, only `extract()` in
 `supabase/functions/_shared/parse-wise-email.ts` has to be written, against:
@@ -174,3 +229,22 @@ To finish the parser, only `extract()` in
 3. a converted-currency payment (e.g. COP merchant charged to a USD balance).
 
 Both the plain-text and HTML parts are useful — in Gmail, **⋮ → Show original**.
+
+---
+
+## 11. The old Wise API path
+
+Retired, but **not deleted** — nothing was removed from your Supabase project.
+
+| Thing | State |
+|---|---|
+| Token field, Connect, Reconnect, Sync now | **Gone from the app.** No UI renders them and nothing calls `provider-connect`. |
+| `wise-sync` function | Source kept, marked `OBSOLETE` in its header. Absent from these instructions. |
+| `wise_cron.sql` | Source kept, marked `OBSOLETE`. Not part of setup. |
+| `PROVIDERS_SETUP.md` | Marked **SUPERSEDED**, kept for rollback. |
+| `provider_connections`, `provider_credentials`, `wise_transactions` | Untouched in the database. |
+| `PROVIDER_ENCRYPTION_KEY`, `SYNC_CRON_SECRET`, `WISE_SYNC_DAYS` | Untouched. |
+
+An explicit **optional** production cleanup list will be supplied once email
+import is confirmed working end to end. Nothing is removed before then, so
+rollback stays a redeploy rather than a restore.

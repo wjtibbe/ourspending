@@ -1,3 +1,15 @@
+// =============================================================================
+// OBSOLETE -- NOT PART OF THE CURRENT SETUP. DO NOT DEPLOY.
+// =============================================================================
+// The Wise API transaction path was retired: personal Wise accounts cannot
+// read balance statements, so transactions now arrive as forwarded Wise
+// notification emails instead. See supabase/EMAIL_IMPORT_SETUP.md.
+//
+// This file is kept ONLY so the API path can be restored from source if Wise
+// ever grants statement access. Nothing in the app calls it, no cron invokes
+// it, and it is deliberately absent from the setup instructions.
+// =============================================================================
+
 // Supabase Edge Function: the hourly Wise import.
 //
 // Deploy with "Verify JWT" OFF — pg_cron calls this from inside Postgres and

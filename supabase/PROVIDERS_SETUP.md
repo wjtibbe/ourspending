@@ -1,3 +1,16 @@
+> # ⚠️ SUPERSEDED — do not follow this guide for a new setup
+>
+> The Wise **API** integration described below was retired. Personal Wise
+> accounts cannot read balance statements, so transactions now arrive as
+> forwarded Wise notification **emails**.
+>
+> **Use [`EMAIL_IMPORT_SETUP.md`](./EMAIL_IMPORT_SETUP.md) instead.**
+>
+> This document is kept for rollback only. Do not create Wise API tokens, do
+> not deploy `wise-sync`, and do not schedule `wise_cron.sql`.
+
+---
+
 # Connected accounts setup (Wise)
 
 Settings → **Connected accounts** lets each user link their own external

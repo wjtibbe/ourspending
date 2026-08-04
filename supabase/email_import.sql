@@ -28,9 +28,20 @@
 -- not collide in a unique constraint: a message missing one identifier must
 -- still be deduped by the others rather than slipping past all of them.
 --
--- PRIVACY: no raw email body is stored. Only the extracted fields the app
--- actually uses, plus hashes. There is therefore no retention job to run and
--- nothing to leak from this table beyond what an expense already shows.
+-- PRIVACY / RETENTION: the table stores the extracted fields the app actually
+-- uses, plus hashes, plus a SANITISED copy of the body kept for SEVEN DAYS to
+-- diagnose parser failures during rollout.
+--
+-- That retained body is constrained three ways:
+--   * sanitised before storage -- scripts, styles, images, remote URLs and
+--     inline handlers stripped; email addresses and card-length digit runs
+--     redacted; attachments and binary content never stored at all;
+--   * unreadable by clients -- column-level grants below omit raw_text and
+--     raw_html, so no frontend query can return them, RLS notwithstanding;
+--   * cleared on expiry by purge_expired_email_raw_content(), and cleared
+--     EARLY on a successful import, since a message that parsed needs no
+--     diagnosis. Purging removes only the body: ids, hashes, parsed metadata,
+--     status, linked expense and error summary all survive.
 
 -- ============================================================
 --  0. Shared helper (idempotent)
@@ -153,6 +164,16 @@ create table if not exists public.email_import_messages (
 
   expense_id uuid references public.expenses(id) on delete set null,
 
+  -- ---- short-lived diagnostic retention (7 days) ----
+  -- Sanitised body kept ONLY to diagnose a parser failure: scripts, styles,
+  -- images, remote URLs and inline handlers are stripped before storage, and
+  -- email addresses / long card-like digit runs are redacted. Attachments and
+  -- binary content are never stored at all. Cleared early on a successful
+  -- import, because a message that parsed needs no diagnosis.
+  raw_text text,
+  raw_html text,
+  raw_content_expires_at timestamptz,
+
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
 
@@ -184,6 +205,9 @@ alter table public.email_import_messages
   add column if not exists mapped_category text,
   add column if not exists category_source text,
   add column if not exists expense_id uuid references public.expenses(id) on delete set null,
+  add column if not exists raw_text text,
+  add column if not exists raw_html text,
+  add column if not exists raw_content_expires_at timestamptz,
   add column if not exists created_at timestamptz not null default now(),
   add column if not exists updated_at timestamptz not null default now();
 
@@ -216,8 +240,23 @@ create index if not exists email_import_messages_connection_idx
 alter table public.email_import_messages enable row level security;
 
 revoke all on public.email_import_messages from anon, authenticated;
-grant select on public.email_import_messages to authenticated;
-grant all    on public.email_import_messages to service_role;
+
+-- COLUMN-level SELECT, deliberately omitting raw_text and raw_html. RLS scopes
+-- rows to their owner; this additionally makes the retained body unreadable by
+-- ANY client, including its own owner, so it can never surface in the frontend.
+-- Privileges are checked before RLS, so a future policy mistake cannot expose
+-- it either.
+grant select (
+  id, connection_id, user_id, household_id, source,
+  provider_message_id, rfc_message_id, external_ref, fingerprint,
+  received_at, from_address, status, skip_reason, error_summary,
+  merchant, amount_value, amount_currency,
+  merchant_amount_value, merchant_amount_currency, occurred_at,
+  mapped_category, category_source, expense_id,
+  raw_content_expires_at, created_at, updated_at
+) on public.email_import_messages to authenticated;
+
+grant all on public.email_import_messages to service_role;
 
 drop policy if exists "Users read own email import messages" on public.email_import_messages;
 create policy "Users read own email import messages" on public.email_import_messages
@@ -298,3 +337,74 @@ $$;
 
 revoke all on function public.set_email_import_enabled(boolean) from public, anon;
 grant execute on function public.set_email_import_enabled(boolean) to authenticated;
+
+-- ============================================================
+--  4. Retention cleanup
+-- ============================================================
+-- Removes the retained body once it expires, and NOTHING else. Message ids,
+-- hashes, parsed metadata, parsing status, the linked expense and the safe
+-- error summary all survive -- so history, dedupe and auditing are unaffected
+-- and a purged message can never be re-imported.
+--
+-- SECURITY DEFINER with execute revoked from clients: only the scheduled job
+-- (or an operator) runs this. Batched so a large backlog cannot hold a long
+-- transaction open.
+create or replace function public.purge_expired_email_raw_content(p_limit integer default 5000)
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_purged integer;
+begin
+  with due as (
+    select id
+      from email_import_messages
+     where raw_content_expires_at is not null
+       and raw_content_expires_at <= now()
+       and (raw_text is not null or raw_html is not null)
+     order by raw_content_expires_at
+     limit greatest(1, p_limit)
+     for update skip locked
+  )
+  update email_import_messages m
+     set raw_text = null,
+         raw_html = null,
+         raw_content_expires_at = null
+    from due
+   where m.id = due.id;
+
+  get diagnostics v_purged = row_count;
+  return v_purged;
+end;
+$$;
+
+revoke all on function public.purge_expired_email_raw_content(integer) from public, anon, authenticated;
+grant execute on function public.purge_expired_email_raw_content(integer) to service_role;
+
+-- ------------------------------------------------------------
+-- Scheduling (optional but recommended)
+-- ------------------------------------------------------------
+-- Retention is enforced in two independent ways, so a missing schedule can
+-- never turn 7-day retention into indefinite retention by accident:
+--   1. this daily job actively clears expired bodies;
+--   2. the frontend cannot read raw_text/raw_html at all (column grants
+--      above), so an unpurged body is still unreachable.
+--
+-- Run once to schedule it:
+--
+--   create extension if not exists pg_cron;
+--   select cron.schedule(
+--     'purge-email-raw-content',
+--     '20 3 * * *',
+--     $cron$ select public.purge_expired_email_raw_content(); $cron$
+--   );
+--
+-- To check:  select * from cron.job where jobname = 'purge-email-raw-content';
+-- To remove: select cron.unschedule('purge-email-raw-content');
+--
+-- To purge everything immediately, regardless of expiry:
+--   update email_import_messages
+--      set raw_text = null, raw_html = null, raw_content_expires_at = null
+--    where raw_text is not null or raw_html is not null;

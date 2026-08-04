@@ -258,7 +258,101 @@ begin
   select count(*) into n from email_import_messages where connection_id = conn_a;
   assert n = 0, 'BROKEN: ledger rows outlived the connection they belong to';
 
-  raise notice 'EMAIL IMPORT VERIFICATION PASSED — aliases are random and private, the ledger is client-read-only, and all four dedupe keys hold.';
+  -- ========================================================
+  -- 2g. 7-day sanitised retention
+  -- ========================================================
+  perform set_config('role', 'postgres', true);
+
+  -- A message that could not be parsed keeps a sanitised body for 7 days.
+  insert into email_import_messages (connection_id, user_id, provider_message_id,
+                                     status, skip_reason,
+                                     raw_text, raw_html, raw_content_expires_at)
+  values (conn_b, ub, 'resend-retain', 'unparsed', 'parser_awaiting_samples',
+          'You spent 45.000 COP', '<p>You spent 45.000 COP</p>', now() + interval '7 days')
+  returning id into msg;
+
+  select count(*) into n from email_import_messages
+   where id = msg and raw_content_expires_at > now() + interval '6 days'
+     and raw_content_expires_at <= now() + interval '7 days';
+  assert n = 1, 'BROKEN: default retention is not seven days';
+
+  -- Not yet expired: the purge must leave it alone.
+  n := public.purge_expired_email_raw_content();
+  select count(*) into n from email_import_messages where id = msg and raw_text is not null;
+  assert n = 1, 'BROKEN: the purge removed content that had not expired yet';
+
+  -- Expired: the purge clears the body...
+  update email_import_messages
+     set raw_content_expires_at = now() - interval '1 minute' where id = msg;
+  n := public.purge_expired_email_raw_content();
+  assert n >= 1, format('BROKEN: the purge reported %s rows, expected at least 1', n);
+
+  select count(*) into n from email_import_messages
+   where id = msg and raw_text is null and raw_html is null
+     and raw_content_expires_at is null;
+  assert n = 1, 'BROKEN: expired raw content was not removed';
+
+  -- ...but preserves everything that is not the body.
+  select count(*) into n from email_import_messages
+   where id = msg
+     and provider_message_id = 'resend-retain'
+     and status = 'unparsed'
+     and skip_reason = 'parser_awaiting_samples'
+     and user_id = ub
+     and connection_id = conn_b;
+  assert n = 1, 'BROKEN: purging the body destroyed metadata, status or ids';
+
+  -- The purge is idempotent and does not churn already-clean rows.
+  n := public.purge_expired_email_raw_content();
+  assert n = 0, format('BROKEN: a second purge touched %s rows, expected 0', n);
+
+  -- ========================================================
+  -- 2h. Retained content is unreadable by ANY client
+  -- ========================================================
+  insert into email_import_messages (connection_id, user_id, provider_message_id,
+                                     status, raw_text, raw_html, raw_content_expires_at)
+  values (conn_b, ub, 'resend-secret', 'unparsed',
+          'SECRET BODY', '<p>SECRET BODY</p>', now() + interval '7 days');
+
+  perform set_config('role', 'authenticated', true);
+  -- Even the OWNER cannot read the retained body: column-level grants omit it,
+  -- so it can never surface in the frontend.
+  perform set_config('request.jwt.claims', json_build_object('sub', ub, 'role', 'authenticated')::text, true);
+  blocked := false;
+  begin
+    perform raw_text from email_import_messages where connection_id = conn_b;
+  exception when insufficient_privilege then blocked := true;
+  end;
+  assert blocked, 'LEAK: the owner can read the retained raw body';
+
+  blocked := false;
+  begin
+    perform raw_html from email_import_messages where connection_id = conn_b;
+  exception when insufficient_privilege then blocked := true;
+  end;
+  assert blocked, 'LEAK: the owner can read the retained raw HTML';
+
+  -- The safe columns still work, so the Settings screen is unaffected.
+  select count(*) into n from email_import_messages
+   where connection_id = conn_b and status is not null;
+  assert n >= 1, 'BROKEN: excluding raw columns broke ordinary ledger reads';
+
+  -- And a different user still sees nothing at all.
+  perform set_config('request.jwt.claims', json_build_object('sub', ua, 'role', 'authenticated')::text, true);
+  select count(*) into n from email_import_messages where connection_id = conn_b;
+  assert n = 0, 'LEAK: another user can see retained rows';
+
+  -- Clients cannot run the purge either.
+  blocked := false;
+  begin
+    perform public.purge_expired_email_raw_content();
+  exception when insufficient_privilege then blocked := true;
+  end;
+  assert blocked, 'BYPASS: a client can execute the retention purge';
+
+  perform set_config('role', 'postgres', true);
+
+  raise notice 'EMAIL IMPORT VERIFICATION PASSED — aliases are random and private, the ledger is client-read-only, all four dedupe keys hold, and 7-day raw retention purges cleanly without losing metadata.';
 end $$;
 
 rollback;

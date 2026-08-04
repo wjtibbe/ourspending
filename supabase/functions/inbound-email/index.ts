@@ -29,6 +29,7 @@ import {
   type InboundMessage,
 } from "../_shared/inbound-types.ts";
 import { fingerprint, wiseEmailParser } from "../_shared/parse-wise-email.ts";
+import { retentionExpiry, sanitizeForRetention } from "../_shared/sanitize.ts";
 import {
   classifyNormalized, createExpense, isContextFailure, resolveImportContext,
   safeError, type NormalizedTransaction,
@@ -136,6 +137,18 @@ Deno.serve(async (req) => {
       return json({ ok: false, error: "content_fetch_failed" }, 500);
     }
 
+    // ---- retain a sanitised copy for 7 days, for parser diagnosis ----
+    // Written now, before parsing, so a message that fails at ANY later step
+    // is still diagnosable. Cleared again immediately below if it imports.
+    const retained = sanitizeForRetention(message.text, message.html);
+    if (retained.text || retained.html) {
+      await mark(rowId, {
+        raw_text: retained.text,
+        raw_html: retained.html,
+        raw_content_expires_at: retentionExpiry(new Date()),
+      });
+    }
+
     // ---- dedupe layer 2: RFC Message-ID ----
     if (message.rfcMessageId) {
       const dup = await db.select(
@@ -226,6 +239,11 @@ Deno.serve(async (req) => {
       mapped_category: result.category,
       category_source: result.categoryFallback ? "fallback" : "mapped",
       error_summary: null,
+      // Early purge: a message that parsed cleanly needs no diagnosis, so its
+      // body goes now rather than sitting for the full seven days.
+      raw_text: null,
+      raw_html: null,
+      raw_content_expires_at: null,
     });
 
     await db.patch(

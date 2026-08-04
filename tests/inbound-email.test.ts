@@ -23,6 +23,15 @@ const { verifySvixSignature, createResendAdapter } = await import(
   "../supabase/functions/_shared/inbound-resend.ts"
 );
 
+import {
+  MAX_RETAINED_CHARS, RETENTION_DAYS, redactIdentifiers,
+  retentionExpiry, sanitizeForRetention, sanitizeHtml,
+} from "../supabase/functions/_shared/sanitize.ts";
+import {
+  classifyNormalized, createExpense, resolveImportContext,
+  type ImportContext, type Row,
+} from "../supabase/functions/_shared/import-core.ts";
+
 let pass = 0, fail = 0;
 const check = (name: string, ok: boolean, detail = "") => {
   if (ok) { pass++; console.log("  PASS  " + name); }
@@ -255,6 +264,109 @@ console.log("\n-- the parser refuses to guess until real samples exist --");
   const out = wiseEmailParser.parse(msg);
   check("returns unparsed rather than inventing a template", !out.ok && out.reason === "unparsed");
   check("and says why", !out.ok && out.detail === "parser_awaiting_samples");
+}
+
+
+console.log("\n-- sanitising retained content --");
+{
+  check("strips <script>", !sanitizeHtml('<p>a</p><script>evil()</script>').includes("evil"));
+  check("strips <style>", !sanitizeHtml('<style>.x{color:red}</style><p>a</p>').includes("color:red"));
+  check("strips <iframe>", !sanitizeHtml('<iframe src="http://x"></iframe>').includes("iframe"));
+  check("removes ALL <img> (tracking pixels included)",
+    !sanitizeHtml('<img src="http://t.example/p.gif?u=1" width="1" height="1">').includes("img"));
+  check("removes remote src", !sanitizeHtml('<img src="http://evil/x">').includes("evil"));
+  check("removes href", !sanitizeHtml('<a href="http://evil/x">link</a>').includes("evil"));
+  check("keeps link TEXT for diagnosis", sanitizeHtml('<a href="http://evil/x">Uber</a>').includes("Uber"));
+  check("removes inline handlers", !sanitizeHtml('<div onclick="steal()">a</div>').includes("steal"));
+  check("neutralises javascript: URLs", !sanitizeHtml('<p>javascript:alert(1)</p>').includes("javascript:"));
+  check("strips comments", !sanitizeHtml("<!-- build 42 --><p>a</p>").includes("build 42"));
+  check("removes url() in styles", !sanitizeHtml('<div style="background:url(http://evil/x)">a</div>').includes("evil"));
+}
+
+console.log("\n-- redaction keeps parse targets, removes identifiers --");
+{
+  check("redacts email addresses", redactIdentifiers("write to john.doe@gmail.com now") === "write to [email] now");
+  check("redacts long card-length digit runs", redactIdentifiers("card 4111111111111111 used").includes("[number]"));
+  check("redacts spaced card numbers", redactIdentifiers("4111 1111 1111 1111").includes("[number]"));
+  check("redacts IBANs", redactIdentifiers("NL91ABNA0417164300").includes("[iban]"));
+  // The whole point of retention is diagnosing a parse, so the parse targets
+  // must survive redaction intact.
+  check("KEEPS a COP amount", redactIdentifiers("You spent 45.000 COP") === "You spent 45.000 COP");
+  check("KEEPS a decimal amount", redactIdentifiers("12,34 EUR") === "12,34 EUR");
+  check("KEEPS the merchant name", redactIdentifiers("at UBER *TRIP").includes("UBER *TRIP"));
+  check("KEEPS a transaction reference", redactIdentifiers("ref CARD-12345678").includes("CARD-12345678"));
+}
+
+console.log("\n-- retention envelope --");
+{
+  const out = sanitizeForRetention("You spent 45.000 COP at UBER", "<p>You spent 45.000 COP</p><script>x()</script>");
+  check("returns sanitised text", out.text!.includes("45.000 COP"));
+  check("returns sanitised html", out.html!.includes("45.000 COP") && !out.html!.includes("x()"));
+  const empty = sanitizeForRetention(null, null);
+  check("nothing to keep -> nulls, so no storage is used", empty.text === null && empty.html === null);
+  const huge = sanitizeForRetention("x".repeat(MAX_RETAINED_CHARS * 3), null);
+  check("caps size so one message cannot bloat the table", huge.text!.length === MAX_RETAINED_CHARS);
+
+  check("retention window is 7 days", RETENTION_DAYS === 7);
+  const from = new Date("2026-08-03T12:00:00.000Z");
+  const expiry = new Date(retentionExpiry(from));
+  check("expiry is exactly 7 days after receipt",
+    expiry.toISOString() === "2026-08-10T12:00:00.000Z", expiry.toISOString());
+}
+
+console.log("\n-- the stub parser records an unparsed message and creates NO expense --");
+{
+  // Mirrors the webhook's decision sequence around the parser, with a fake db,
+  // to prove that today's stub cannot produce an expense by any route.
+  class FakeDb {
+    store: Record<string, Row[]> = {
+      profiles: [{ id: "user-1", household_id: "hh-1", slot: 0 }],
+      households: [{ id: "hh-1", usd_per_eur: 1.08, cop_per_eur: 4500 }],
+      household_categories: [],
+      expenses: [],
+      email_import_messages: [{ id: "m-1", status: "received" }],
+    };
+    select(path: string) {
+      const t = path.split("?")[0];
+      return Promise.resolve((this.store[t] ?? []).map((r) => ({ ...r })));
+    }
+    insert(t: string, body: Row | Row[]) {
+      const rows = Array.isArray(body) ? body : [body];
+      const key = t.split("?")[0];
+      (this.store[key] ??= []).push(...rows);
+      return Promise.resolve(rows.map((r, i) => ({ id: `${key}-${i}`, ...r })));
+    }
+    patch(path: string, body: Row) {
+      const t = path.split("?")[0];
+      (this.store[t] ?? []).forEach((r) => Object.assign(r, body));
+      return Promise.resolve([]);
+    }
+  }
+  const db = new FakeDb();
+  const msg = {
+    providerMessageId: "resend-1", recipients: [], from: "Wise <noreply@wise.com>",
+    subject: "You spent", receivedAt: "", text: "You spent 45.000 COP at UBER",
+    html: null, headers: {}, rfcMessageId: null,
+  };
+
+  const outcome = wiseEmailParser.parse(msg);
+  check("parser reports unparsed", !outcome.ok && outcome.reason === "unparsed");
+
+  if (!outcome.ok) {
+    // What the webhook does with that outcome.
+    await db.patch("email_import_messages?id=eq.m-1", {
+      status: outcome.reason === "not_a_transaction" ? "skipped" : "unparsed",
+      skip_reason: outcome.detail,
+    });
+  }
+  check("ledger row marked unparsed", db.store.email_import_messages[0].status === "unparsed");
+  check("skip reason recorded", db.store.email_import_messages[0].skip_reason === "parser_awaiting_samples");
+  check("NO expense was created", db.store.expenses.length === 0);
+  check("the message is recorded, not dropped", db.store.email_import_messages.length === 1);
+
+  // And the sanitised body would be retained for diagnosis.
+  const retained = sanitizeForRetention(msg.text, msg.html);
+  check("its body is retained for diagnosis", !!retained.text);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

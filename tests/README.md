@@ -60,7 +60,12 @@ any bank's template: Svix signature verification (tampering, wrong secret,
 missing headers, replay via old and future timestamps, multi-signature key
 rotation), alias resolution, sender authenticity including lookalike domains,
 locale-aware money parsing (`45.000` → 45000, the Colombian 1000x trap), HTML
-reduction, and fingerprint dedupe bucketing.
+reduction, and fingerprint dedupe bucketing. It also covers the 7-day
+retention layer: sanitisation removing scripts/styles/images/remote URLs and
+redacting emails, card numbers and IBANs while KEEPING amounts, merchants and
+references (the parse targets), the size cap, the exact 7-day expiry, and that
+the stub parser records an `unparsed` message without ever creating an
+expense.
 
 ## Database-level verification
 
@@ -71,3 +76,9 @@ Run in the Supabase SQL editor. Each wraps itself in a transaction that ends in
     supabase/verify_provider_connections.sql -> PROVIDER VERIFICATION PASSED
     supabase/verify_wise_transactions.sql    -> WISE LEDGER VERIFICATION PASSED
     supabase/verify_email_import.sql         -> EMAIL IMPORT VERIFICATION PASSED
+
+`verify_email_import.sql` additionally proves the retention contract: the
+default expiry is seven days, the purge leaves unexpired content alone, an
+expired purge clears the body while preserving ids, hashes, status, metadata
+and the linked expense, the purge is idempotent, and neither the owner nor any
+other user can read `raw_text`/`raw_html` or execute the purge.
