@@ -1,3 +1,19 @@
+-- =============================================================================
+-- OBSOLETE -- DO NOT RUN ON A NEW SETUP.
+-- =============================================================================
+-- The hourly Wise API sync was retired: personal Wise accounts cannot read
+-- balance statements. Transactions now arrive as forwarded Wise notification
+-- emails; see supabase/EMAIL_IMPORT_SETUP.md.
+--
+-- Kept only for rollback. If this job is already scheduled in your project,
+-- removing it is one of the OPTIONAL production cleanup steps:
+--
+--   select cron.unschedule('wise-hourly-sync');
+--
+-- Leaving it scheduled is harmless but pointless: it will keep calling a
+-- function that returns permission errors from the Wise API.
+-- =============================================================================
+
 -- OurSpending — hourly Wise import schedule.
 --
 -- Run this LAST, after supabase/wise_transactions.sql and after the wise-sync

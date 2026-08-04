@@ -1,3 +1,16 @@
+> # ⚠️ SUPERSEDED — do not follow this guide for a new setup
+>
+> The Wise **API** integration described below was retired. Personal Wise
+> accounts cannot read balance statements, so transactions now arrive as
+> forwarded Wise notification **emails**.
+>
+> **Use [`EMAIL_IMPORT_SETUP.md`](./EMAIL_IMPORT_SETUP.md) instead.**
+>
+> This document is kept for rollback only. Do not create Wise API tokens, do
+> not deploy `wise-sync`, and do not schedule `wise_cron.sql`.
+
+---
+
 # Connected accounts setup (Wise)
 
 Settings → **Connected accounts** lets each user link their own external
@@ -109,9 +122,27 @@ Both share one synchronisation core (`supabase/functions/_shared/sync.ts`), so
 2. In the app: **⚙ Settings → Connected accounts → Connect** on the Wise card.
 3. Paste the token and confirm.
 
-The app calls the Edge Function, which checks the token against
-`GET /v1/profiles`, stores it encrypted, and returns only metadata. The card
-then shows the account name and the last four characters of the token.
+The app calls the Edge Function, which checks the token against `GET /v1/me`
+only — no profile listing, no balance access, no business-profile requirement,
+since none of that is needed merely to prove a token works. It stores the
+token encrypted and returns only metadata. The card then shows the account
+name from `/v1/me` and the last four characters of the token.
+
+A rejected token comes back as one of four distinct reasons rather than one
+generic failure: `token_refused` (401 — wrong or revoked token),
+`token_forbidden` (403 — the token doesn't have permission for this),
+`wise_rate_limited` (429 — try again shortly), or
+`wise_temporarily_unavailable` (5xx or a network failure — Wise's side, not
+yours). Profile listing, balance access and statements are only ever
+requested later, by **Sync now** and the hourly job — never at connect time.
+
+**Sync now** and the hourly job list profiles via `GET /v2/profiles` — not
+`/v1/profiles`, which requires broader token permissions than a plain Personal
+Access Token carries and rejected a real, confirmed-valid token even though
+`GET /v1/me` succeeded for it directly. A rejection there also comes back
+distinctly: `invalid_token` (401), `insufficient_permissions` (403 — the token
+lacks the scope this call needs), `wise_rate_limited` (429), or
+`provider_unreachable` (5xx or a network failure).
 
 To replace a token, press **Reconnect** and paste the new one — the old one is
 overwritten. **Disconnect** deletes the connection and, by cascade, the stored

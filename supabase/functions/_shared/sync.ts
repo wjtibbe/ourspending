@@ -11,7 +11,13 @@ import {
   categoryInputFrom, classifyTransaction, describeTransaction, resolveAmounts,
   transactionDate, transactionReference, WiseAuthError, type WiseClient, type WiseTx,
 } from "./wise.ts";
-import { APP_CATEGORIES, resolveCategory } from "./categories.ts";
+import { resolveCategory } from "./categories.ts";
+// The provider-neutral half of importing lives in import-core.ts. This module
+// keeps only the Wise-API-shaped parts (statement paging, Wise JSON readers)
+// and delegates every rule that must behave identically across input methods.
+import {
+  allowedCategories, perEur, safeError, SUPPORTED_CURRENCIES,
+} from "./import-core.ts";
 
 export type Row = Record<string, unknown>;
 
@@ -59,10 +65,6 @@ export type SyncStats = {
   connections: ConnectionResult[];
 };
 
-// The app's expense.currency values. A Wise balance in any other currency
-// cannot be converted without a rate the app does not hold, so it is skipped
-// rather than guessed at.
-const SUPPORTED_CURRENCIES = new Set(["EUR", "USD", "COP"]);
 const DEFAULT_LOOKBACK_DAYS = 14;
 
 const q = (v: string) => encodeURIComponent(v);
@@ -72,37 +74,6 @@ const emptyResult = (connectionId: string): ConnectionResult => ({
   transactionsFetched: 0, expensesImported: 0, duplicatesSkipped: 0,
   unsupportedSkipped: 0, failed: 0, missingStableId: 0, categoryFallbacks: 0,
 });
-
-/** Mirrors perEur() in app.js, so imported rows convert exactly like typed ones. */
-function perEur(currency: string, rates: { usd: number; cop: number }): number {
-  if (currency === "EUR") return 1;
-  if (currency === "USD") return rates.usd;
-  if (currency === "COP") return rates.cop;
-  throw new Error("unsupported_currency");
-}
-
-/**
- * The categories this household actually has switched on. The override model
- * is sparse: no rows means every built-in is active, and only rows with
- * active=false hide one. Mapping never resurrects a category the household
- * chose to disable.
- */
-async function allowedCategories(db: Db, householdId: string): Promise<Set<string>> {
-  const allowed = new Set<string>(APP_CATEGORIES);
-  try {
-    const rows = await db.select(
-      `household_categories?household_id=eq.${q(householdId)}&select=category_key,active,is_custom`,
-    );
-    for (const r of rows) {
-      if (r.active === false && r.is_custom !== true) allowed.delete(String(r.category_key));
-    }
-  } catch {
-    // A category-lookup problem must never stop an import.
-  }
-  // "other" is the terminal fallback and always remains available.
-  allowed.add("other");
-  return allowed;
-}
 
 /**
  * Lists every balance across every profile the token can see. Falls back to
@@ -193,10 +164,13 @@ export async function syncConnection(
   try {
     balances = await listBalances(wise);
   } catch (e) {
+    // invalid_token / insufficient_permissions / wise_rate_limited come from
+    // WiseAuthError.code (see _shared/wise.ts); anything else -- a 5xx or a
+    // network failure -- is Wise's own availability, not the token's fault.
     return {
       ...result,
       status: "error",
-      error: e instanceof WiseAuthError ? "invalid_token" : "provider_unreachable",
+      error: e instanceof WiseAuthError ? e.code : "provider_unreachable",
     };
   }
 
@@ -209,7 +183,7 @@ export async function syncConnection(
       transactions = Array.isArray(statement?.transactions) ? statement.transactions : [];
     } catch (e) {
       if (e instanceof WiseAuthError) {
-        return { ...result, status: "error", error: "invalid_token" };
+        return { ...result, status: "error", error: e.code };
       }
       result.failed++;
       continue; // One unreadable balance must not stop the others.
@@ -422,11 +396,9 @@ function firstString(tx: WiseTx, paths: string[]): string | null {
   return null;
 }
 
-/** Short, non-sensitive error label. Never a provider body or a token. */
-export function safeError(e: unknown): string {
-  const msg = e instanceof Error ? e.message : String(e);
-  return msg.replace(/[^a-zA-Z0-9_ .:-]/g, "").slice(0, 120);
-}
+// Re-exported so existing importers (provider-connect, wise-sync) keep working
+// while the shared implementation lives in import-core.ts.
+export { safeError };
 
 /**
  * Synchronise many connections. One failing connection never stops the others:
