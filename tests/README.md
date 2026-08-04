@@ -64,8 +64,18 @@ reduction, and fingerprint dedupe bucketing. It also covers the 7-day
 retention layer: sanitisation removing scripts/styles/images/remote URLs and
 redacting emails, card numbers and IBANs while KEEPING amounts, merchants and
 references (the parse targets), the size cap, the exact 7-day expiry, and that
-the stub parser records an `unparsed` message without ever creating an
+a non-matching message is recorded as `unparsed` without ever creating an
 expense.
+
+It also covers the one template implemented so far — the completed
+card-payment email ("You spent 71,362 COP at Éxito Express." / "This used
+19.76 EUR from your account.") — against both a plain-text and an
+HTML-reduced fixture built from the same real anonymised sample: the deducted
+account amount becomes the expense amount, the merchant amount is kept only
+as metadata, no reference or date is invented, and mail that does not match
+this exact template (declined/reversed/refunds, anything else) still falls
+through to `unparsed` / `parser_awaiting_samples` rather than being guessed
+at.
 
 ## Database-level verification
 

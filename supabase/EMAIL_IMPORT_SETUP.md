@@ -9,10 +9,11 @@ which parses the transaction and creates a shared expense.
       → Resend inbound (MX) → inbound-email Edge Function
       → parsed → shared expense, correct payer, deduped
 
-**The parser is not implemented yet.** Everything else is. Until real Wise
-email samples exist, messages are recorded with `status = 'unparsed'` and no
-expense is created — nothing is lost, and those rows can be replayed once
-extraction lands. See §10 at the bottom.
+**One template is implemented: the completed card payment.** Other Wise
+emails (declined, reversed, refunds, converted-currency) still need real
+samples — until then those messages are recorded with `status = 'unparsed'`
+and no expense is created, nothing is lost, and those rows can be replayed
+once each template lands. See §10 at the bottom.
 
 ---
 
@@ -219,13 +220,20 @@ To purge everything now, regardless of expiry:
 | Resend adapter (envelope + body fetch) | **Done** |
 | Alias resolution / sender authenticity | **Done** |
 | Locale-aware money parsing (`45.000` → 45000) | **Done** |
-| **Wise email field extraction** | **Blocked — needs real anonymised samples** |
+| Wise email field extraction — completed card payment | **Done** |
+| Wise email field extraction — declined / reversed / refund / converted-currency | **Not started — needs real anonymised samples** |
 
-To finish the parser, only `extract()` in
-`supabase/functions/_shared/parse-wise-email.ts` has to be written, against:
+The completed-payment template ("You spent *amount currency* at *merchant*."
+/ "This used *amount currency* from your account.") is implemented in
+`wiseEmailParser` in `supabase/functions/_shared/parse-wise-email.ts`. The
+deducted account amount becomes the expense amount; the merchant's own amount
+is kept only as metadata. Any other Wise email — declined, reversed, a
+refund, a converted-currency notice — still records as `unparsed` until a
+real anonymised sample of that template is supplied. To extend the parser,
+add a new template branch next to `extractCompletedPayment()`, against:
 
-1. a successful Wise card payment email,
-2. a declined payment email (if available),
+1. a declined payment email,
+2. a reversed/refunded payment email,
 3. a converted-currency payment (e.g. COP merchant charged to a USD balance).
 
 Both the plain-text and HTML parts are useful — in Gmail, **⋮ → Show original**.

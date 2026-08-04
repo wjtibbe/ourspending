@@ -1,30 +1,39 @@
 // Wise notification-email parser.
 //
 // ============================================================================
-// STATUS: FIELD EXTRACTION IS DELIBERATELY NOT IMPLEMENTED YET.
+// STATUS: one template implemented -- the completed card-payment email.
 // ============================================================================
-// Inventing a Wise email template would produce a parser that looks finished,
-// passes tests written against the same invention, and silently imports wrong
-// amounts against real mail. So `parse()` returns `unparsed` until real
-// anonymised samples are supplied, and the webhook records such messages as
-// `unparsed` instead of dropping them -- nothing is lost, and every message
-// held this way can be re-processed once extraction lands.
+// Only the exact wording below is recognised. Anything else (declined,
+// reversed, refunds, converted-currency notices, marketing, security alerts)
+// still falls through to `unparsed` / `parser_awaiting_samples` rather than
+// being guessed at -- inventing a template would produce a parser that looks
+// finished, passes tests written against the same invention, and silently
+// imports wrong amounts against real mail.
 //
-// What IS implemented here is everything that does NOT require knowing the
-// template, and it is fully tested:
+// Completed card payment (the only template implemented so far):
+//
+//   "You spent 71,362 COP at Éxito Express."
+//   "This used 19.76 EUR from your account."
+//
+// The first sentence carries the merchant and the merchant's own currency --
+// stored as metadata only. The second sentence carries what actually left the
+// account, which is what becomes the expense amount. Neither line implies a
+// date or a reference, so `occurredAt` and `externalRef` stay null rather
+// than being backfilled from the time the mail was received.
+//
+// Also implemented here, and independent of any template:
 //
 //   * sender recognition (Wise's own sending domains -- a fact, not a guess)
 //   * locale-aware money parsing, including the Colombian `45.000` form
 //   * HTML -> text reduction
 //   * deterministic fingerprinting for the last-resort dedupe key
-//
-// When samples arrive, only `extract()` below has to be written.
 
 import type {
   InboundMessage,
   ParseOutcome,
   TransactionEmailParser,
 } from "./inbound-types.ts";
+import type { Money, NormalizedTransaction } from "./import-core.ts";
 
 // Wise sends from these domains. Verifying the sender is what stops a stranger
 // who guessed an alias from injecting expenses.
@@ -195,6 +204,66 @@ export async function fingerprint(parts: {
 }
 
 // ---------------------------------------------------------------------------
+// Completed card payment template
+// ---------------------------------------------------------------------------
+//
+//   "You spent 71,362 COP at Éxito Express."
+//   "This used 19.76 EUR from your account."
+//
+// Matched on stable wording, not on markup: both regexes run against
+// `messageText()`, which already reduces HTML to text, so the HTML and
+// plain-text parts of the same email are handled identically.
+
+const SPENT_LINE = /You spent\s+([^\n]+?)\s+at\s+(.+?)\.(?=\s|\n|$)/i;
+const USED_LINE = /This used\s+([^\n]+?)\s+from your account\.?/i;
+
+function extractMoney(fragment: string): Money | null {
+  const value = parseMoneyValue(fragment);
+  const currency = parseCurrency(fragment);
+  if (value == null || !currency) return null;
+  return { value, currency };
+}
+
+/**
+ * The completed-payment template only. Anything that does not match both
+ * sentences exactly -- a declined payment, a refund, a converted-currency
+ * notice, marketing, a security alert -- falls through to `null` so the
+ * caller reports `unparsed` rather than a guess.
+ */
+function extractCompletedPayment(msg: InboundMessage): NormalizedTransaction | null {
+  const text = messageText(msg);
+
+  const spent = text.match(SPENT_LINE);
+  const used = text.match(USED_LINE);
+  if (!spent || !used) return null;
+
+  const merchantAmount = extractMoney(spent[1]);
+  const accountAmount = extractMoney(used[1]);
+  const merchant = spent[2].trim();
+  if (!merchantAmount || !accountAmount || !merchant) return null;
+
+  return {
+    // Neither sentence carries a reference or a transaction date -- both stay
+    // null rather than being inferred from the time the mail arrived.
+    externalRef: null,
+    occurredAt: null,
+    direction: "out",
+    status: "completed",
+    // What actually left the account -- the expense amount.
+    amount: accountAmount,
+    // The merchant's own currency, kept as metadata only.
+    merchantAmount,
+    merchant,
+    categoryInput: { description: merchant },
+    sourceMetadata: {
+      template: "wise_completed_card_payment",
+      subject: msg.subject,
+      sender: msg.from,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // The parser
 // ---------------------------------------------------------------------------
 
@@ -207,11 +276,15 @@ export const wiseEmailParser: TransactionEmailParser = {
     return isWiseSender((m ? m[1] : from).trim().toLowerCase());
   },
 
-  parse(_msg: InboundMessage): ParseOutcome {
-    // See the banner at the top of this file. Returning `unparsed` (rather
-    // than throwing, or worse, guessing) means the webhook still records the
-    // message, still returns 200, and nothing is lost -- these rows can be
-    // replayed once extraction is implemented against real samples.
+  parse(msg: InboundMessage): ParseOutcome {
+    const transaction = extractCompletedPayment(msg);
+    if (transaction) return { ok: true, transaction };
+
+    // Anything else -- declined/reversed/refund templates are explicitly not
+    // implemented yet. Returning `unparsed` (rather than throwing, or worse,
+    // guessing) means the webhook still records the message, still returns
+    // 200, and nothing is lost -- these rows can be replayed once more
+    // templates are implemented against real samples.
     return {
       ok: false,
       reason: "unparsed",

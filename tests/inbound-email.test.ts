@@ -256,14 +256,77 @@ console.log("\n-- Resend envelope parsing --");
   check("a missing email_id is ignored", adapter.parseEnvelope(JSON.stringify({ type: "email.received", data: {} })) === null);
 }
 
-console.log("\n-- the parser refuses to guess until real samples exist --");
+console.log("\n-- the parser refuses to guess on mail that isn't the known template --");
 {
+  // "You spent ... at ..." alone (no "This used ... from your account"
+  // sentence) is NOT the completed-payment template implemented below -- it
+  // must still fall through to unparsed rather than a guess. This is the same
+  // fixture used before the template existed; it now exercises the fallback
+  // path instead of a blanket stub.
   const msg = { providerMessageId: "x", recipients: [], from: "Wise <noreply@wise.com>",
     subject: "You spent 45.000 COP", receivedAt: "", text: "You spent 45.000 COP at UBER",
     html: null, headers: {}, rfcMessageId: null };
   const out = wiseEmailParser.parse(msg);
   check("returns unparsed rather than inventing a template", !out.ok && out.reason === "unparsed");
   check("and says why", !out.ok && out.detail === "parser_awaiting_samples");
+}
+
+console.log("\n-- Wise completed card payment: real sample extraction --");
+{
+  // The first real anonymised Wise sample supplied for this template.
+  const WISE_COMPLETED_PAYMENT_TEXT_FIXTURE = {
+    providerMessageId: "resend-real-1",
+    recipients: ["wise-abc123@inbound.example.com"],
+    from: "Wise <noreply@wise.com>",
+    subject: "71,362 COP spent at Éxito Express",
+    receivedAt: "2026-08-03T15:04:00.000Z",
+    text: "Hi Alex,\n\nYou spent 71,362 COP at Éxito Express.\n\n" +
+      "This used 19.76 EUR from your account.\n\nThanks for using Wise.",
+    html: null,
+    headers: {},
+    rfcMessageId: "<real-1@wise.com>",
+  };
+  // Same stable wording, reduced through markup instead of given as plain
+  // text -- proves extraction does not depend on the text part being present.
+  const WISE_COMPLETED_PAYMENT_HTML_FIXTURE = {
+    ...WISE_COMPLETED_PAYMENT_TEXT_FIXTURE,
+    providerMessageId: "resend-real-2",
+    text: null,
+    html: "<html><body><p>Hi Alex,</p>" +
+      "<p>You spent 71,362 COP at Éxito Express.</p>" +
+      "<p>This used 19.76 EUR from your account.</p>" +
+      "<p>Thanks for using Wise.</p></body></html>",
+  };
+
+  for (
+    const [label, msg] of [
+      ["plain-text part", WISE_COMPLETED_PAYMENT_TEXT_FIXTURE],
+      ["HTML part", WISE_COMPLETED_PAYMENT_HTML_FIXTURE],
+    ] as const
+  ) {
+    const out = wiseEmailParser.parse(msg);
+    check(`${label}: parses successfully`, out.ok, !out.ok ? out.detail : "");
+    if (!out.ok) continue;
+    const tx = out.transaction;
+    check(`${label}: status completed`, tx.status === "completed");
+    check(`${label}: direction outgoing`, tx.direction === "out");
+    check(`${label}: merchant`, tx.merchant === "Éxito Express", tx.merchant ?? "null");
+    check(`${label}: deducted account amount is the expense amount`,
+      tx.amount.value === 19.76 && tx.amount.currency === "EUR", JSON.stringify(tx.amount));
+    check(`${label}: merchant amount stored only as metadata`,
+      tx.merchantAmount?.value === 71362 && tx.merchantAmount?.currency === "COP",
+      JSON.stringify(tx.merchantAmount));
+    check(`${label}: no reference was invented`, tx.externalRef === null);
+    check(`${label}: no date was invented`, tx.occurredAt === null);
+    check(`${label}: subject/sender captured as metadata only`,
+      tx.sourceMetadata?.subject === msg.subject && tx.sourceMetadata?.sender === msg.from);
+  }
+
+  // The extracted JSON, shown for review.
+  const shown = wiseEmailParser.parse(WISE_COMPLETED_PAYMENT_TEXT_FIXTURE);
+  if (shown.ok) {
+    console.log("  extracted:", JSON.stringify(shown.transaction, null, 2).replace(/\n/g, "\n  "));
+  }
 }
 
 
