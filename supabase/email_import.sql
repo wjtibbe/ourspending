@@ -44,7 +44,21 @@
 --     status, linked expense and error summary all survive.
 
 -- ============================================================
---  0. Shared helper (idempotent)
+--  0. Extensions
+-- ============================================================
+-- Supabase installs pgcrypto into the `extensions` schema, not `public`.
+-- issue_email_import_alias() below is SECURITY DEFINER with
+-- `set search_path = public, pg_temp` -- deliberately narrow, so a caller
+-- cannot hijack a security-definer function by creating a same-named object
+-- earlier on a wider path. gen_random_uuid() still resolves unqualified
+-- because it has been a pg_catalog builtin since Postgres 13; gen_random_bytes()
+-- is pgcrypto-only and is not on that narrow path, so it must be schema-
+-- qualified everywhere it is called below.
+create schema if not exists extensions;
+create extension if not exists pgcrypto with schema extensions;
+
+-- ============================================================
+--  0b. Shared helper (idempotent)
 -- ============================================================
 create or replace function public.touch_updated_at()
 returns trigger language plpgsql as $$
@@ -279,6 +293,10 @@ create trigger email_import_messages_touch
 -- part, which is what makes `wise-<token>@...` route reliably. Deliberately
 -- NOT random() -- that is not cryptographically strong, and this token is the
 -- only thing standing between a stranger and injecting expenses.
+--
+-- extensions.gen_random_bytes -- schema-qualified because this function's own
+-- `search_path = public, pg_temp` (below) does not include `extensions`,
+-- where Supabase installs pgcrypto. See "0. Extensions" above.
 create or replace function public.issue_email_import_alias(p_rotate boolean default false)
 returns text
 language plpgsql
@@ -300,7 +318,7 @@ begin
     return v_existing;
   end if;
 
-  v_token := encode(gen_random_bytes(20), 'hex');
+  v_token := encode(extensions.gen_random_bytes(20), 'hex');
 
   insert into email_import_connections (user_id, provider, alias_token)
   values (v_uid, 'wise_email', v_token)
