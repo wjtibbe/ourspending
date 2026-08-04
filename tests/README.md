@@ -7,6 +7,8 @@ Functions import, using Node's native type stripping (Node 22.6+).
     node --experimental-strip-types tests/sync.test.ts
     node --experimental-strip-types tests/wise-connect.test.ts
     node --experimental-strip-types tests/wise-sync-client.test.ts
+    node --experimental-strip-types tests/import-core.test.ts
+    node --experimental-strip-types tests/inbound-email.test.ts
 
 `categories.test.ts` covers the mapping layer: multilingual aliases, MCC codes,
 resolution priority, deactivated household categories, and the guarantee that
@@ -45,6 +47,21 @@ network failure is deliberately NOT a `WiseAuthError` (so it maps to
 (`verifyWiseToken`, `/v1/me`) and Sync (`createWiseClient`, `/v2/profiles`)
 never cross-call each other's endpoint.
 
+`import-core.test.ts` drives `_shared/import-core.ts` — the provider-neutral
+importer shared by every input method. It proves the rules that must hold no
+matter where a transaction came from: household and payer slot resolved from
+the database (never a payload, never defaulted), shared expenses with the
+owner as payer, EUR conversion identical to `app.js`, EUR/USD/COP enforced,
+declined/reversed/refund/incoming never imported, disabled household
+categories not resurrected, and per-user isolation.
+
+`inbound-email.test.ts` covers the inbound plumbing that does not depend on
+any bank's template: Svix signature verification (tampering, wrong secret,
+missing headers, replay via old and future timestamps, multi-signature key
+rotation), alias resolution, sender authenticity including lookalike domains,
+locale-aware money parsing (`45.000` → 45000, the Colombian 1000x trap), HTML
+reduction, and fingerprint dedupe bucketing.
+
 ## Database-level verification
 
 Run in the Supabase SQL editor. Each wraps itself in a transaction that ends in
@@ -53,3 +70,4 @@ Run in the Supabase SQL editor. Each wraps itself in a transaction that ends in
     supabase/verify_rls.sql                  -> VERIFICATION PASSED
     supabase/verify_provider_connections.sql -> PROVIDER VERIFICATION PASSED
     supabase/verify_wise_transactions.sql    -> WISE LEDGER VERIFICATION PASSED
+    supabase/verify_email_import.sql         -> EMAIL IMPORT VERIFICATION PASSED
