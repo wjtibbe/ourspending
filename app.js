@@ -19,8 +19,6 @@ const db = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 // domain whose MX record points at the inbound provider. The per-user token is
 // issued server-side and is the only thing that identifies a user.
 // Set this to the subdomain you configured, e.g. "inbound.ourspending.app".
-const INBOUND_EMAIL_DOMAIN = "inbound.example.com";
-const INBOUND_ALIAS_PREFIX = "wise";
 
 // ---- i18n helpers (dictionaries live in i18n.js) ----
 const t = (k, v) => window.I18N.t(k, v);
@@ -2184,8 +2182,8 @@ function SettingsPage({
     style: S.privacyNote
   }, t("no_household_yet")),
   // ===== CATEGORIES =====
-  // ===== WISE EMAIL IMPORT =====
-  household && /*#__PURE__*/React.createElement(React.Fragment, null, section(t("sec_email_import")), /*#__PURE__*/React.createElement(EmailImportSettings, {
+  // ===== WISE GMAIL IMPORT =====
+  household && /*#__PURE__*/React.createElement(React.Fragment, null, section(t("sec_email_import")), /*#__PURE__*/React.createElement(GmailImportSettings, {
     user: user,
     showToast: showToast
   })),
@@ -2319,17 +2317,16 @@ function SettingsPage({
   }, t("sign_out")));
 }
 
-// ---------- Wise email import ----------
-// Replaces the former Wise API "Connected accounts" panel. Personal Wise
-// accounts cannot read balance statements, so transactions arrive as forwarded
-// notification emails instead. There is deliberately no token field, no
-// Connect/Reconnect and no Sync now: nothing here talks to the Wise API.
-const emailImportMessage = code => {
-  const key = "eimp_err_" + String(code || "server_error");
-  const msg = t(key);
-  return msg === key ? t("eimp_err_server_error") : msg;
-};
-function EmailImportSettings({
+// ---------- Wise Gmail import ----------
+// Personal Wise accounts cannot read balance statements over the API, so
+// transactions are read from the Wise notification emails that already arrive
+// in the user's own Gmail. The app polls a deliberately narrow Gmail search
+// (Wise's sender, a two-day window) with a read-only scope.
+//
+// There is deliberately no Wise API token field here, and no forwarding
+// address: nothing on this screen talks to the Wise API or to an inbound
+// email provider.
+function GmailImportSettings({
   user,
   showToast
 }) {
@@ -2340,13 +2337,12 @@ function EmailImportSettings({
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);
-  const [confirmRotate, setConfirmRotate] = useState(false);
-  const configured = INBOUND_EMAIL_DOMAIN && INBOUND_EMAIL_DOMAIN.indexOf("example.com") < 0;
+  const [confirmDisconnect, setConfirmDisconnect] = useState(false);
   const load = useCallback(async () => {
     const {
       data,
       error
-    } = await db.from("email_import_connections").select("id,alias_token,enabled,status,last_message_at,last_error,created_at").eq("user_id", user.id).limit(1);
+    } = await db.from("email_import_connections").select("id,enabled,status,account_email,granted_scopes,last_message_at,last_checked_at,last_synced_at,last_error,created_at").eq("user_id", user.id).eq("provider", "gmail").limit(1);
     if (error) {
       setLoading(false);
       setErr(error.message);
@@ -2375,6 +2371,24 @@ function EmailImportSettings({
   useEffect(() => {
     load();
   }, [load]);
+  // Google redirects back with ?gmail=<status>. Surfaced once, then stripped
+  // from the URL so a refresh does not replay the toast.
+  useEffect(() => {
+    let status = null;
+    try {
+      status = new URLSearchParams(window.location.search).get("gmail");
+    } catch (e) {
+      return;
+    }
+    if (!status) return;
+    if (status === "connected") showToast(t("gmi_connected"));else setErr(t("gmi_err_" + status) === "gmi_err_" + status ? t("gmi_err_failed") : t("gmi_err_" + status));
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("gmail");
+      window.history.replaceState({}, "", url.toString());
+    } catch (e) {/* ignore */}
+    load();
+  }, [load, showToast]);
   const run = async (fn, okMsg) => {
     setBusy(true);
     setErr(null);
@@ -2383,57 +2397,71 @@ function EmailImportSettings({
       if (okMsg) showToast(okMsg);
       await load();
     } catch (e) {
-      setErr(emailImportMessage(e && e.message));
+      setErr(e && e.message ? e.message : String(e));
     } finally {
       setBusy(false);
     }
   };
-  const address = conn && conn.alias_token ? INBOUND_ALIAS_PREFIX + "-" + conn.alias_token + "@" + INBOUND_EMAIL_DOMAIN : null;
-  const createAlias = () => run(async () => {
+  // The consent URL is built server-side so the client id, the client secret
+  // and the PKCE verifier never pass through the browser.
+  const connect = () => run(async () => {
     const {
+      data,
       error
-    } = await db.rpc("issue_email_import_alias", {
-      p_rotate: false
+    } = await db.functions.invoke("gmail-oauth-start", {
+      body: {}
     });
     if (error) throw new Error(error.message);
-  }, t("eimp_created"));
-  const rotate = () => run(async () => {
+    if (data && data.error) throw new Error(t("gmi_err_" + data.error) === "gmi_err_" + data.error ? t("gmi_err_failed") : t("gmi_err_" + data.error));
+    if (!data || !data.url) throw new Error(t("gmi_err_failed"));
+    window.location.href = data.url;
+  });
+  const syncNow = () => run(async () => {
     const {
+      data,
       error
-    } = await db.rpc("issue_email_import_alias", {
-      p_rotate: true
+    } = await db.functions.invoke("gmail-sync", {
+      body: {}
     });
     if (error) throw new Error(error.message);
-    setConfirmRotate(false);
-  }, t("eimp_rotated"));
-  const toggle = () => run(async () => {
-    const next = !(conn && conn.enabled);
+    if (data && data.error) throw new Error(t("gmi_err_" + data.error) === "gmi_err_" + data.error ? t("gmi_err_failed") : t("gmi_err_" + data.error));
+    showToast(t("gmi_synced", {
+      n: data && data.expensesImported || 0
+    }));
+  });
+  const disconnect = () => run(async () => {
     const {
+      data,
       error
-    } = await db.rpc("set_email_import_enabled", {
-      p_enabled: next
+    } = await db.functions.invoke("gmail-disconnect", {
+      body: {}
     });
     if (error) throw new Error(error.message);
-  }, conn && conn.enabled ? t("eimp_disabled_toast") : t("eimp_enabled_toast"));
-  const copy = () => {
-    if (!address) return;
-    navigator.clipboard.writeText(address).then(() => showToast(t("copied")), () => setErr(t("copy_failed")));
-  };
+    if (data && data.error) throw new Error(t("gmi_err_failed"));
+    setConfirmDisconnect(false);
+  }, t("gmi_disconnected"));
   const enabled = !!(conn && conn.enabled);
+  // A dead refresh token is its own state: only reconnecting fixes it, so it
+  // must not look like an ordinary transient error.
+  const reconnect = !!(conn && conn.last_error === "reconnect_required");
   const pill = !conn ? {
-    text: t("eimp_status_none"),
+    text: t("gmi_status_none"),
     bg: "var(--line)",
     fg: "var(--muted)"
+  } : reconnect ? {
+    text: t("gmi_status_reconnect"),
+    bg: "var(--tint-danger)",
+    fg: "var(--danger)"
   } : !enabled ? {
-    text: t("eimp_status_disabled"),
+    text: t("gmi_status_disabled"),
     bg: "var(--line)",
     fg: "var(--muted)"
-  } : conn.last_message_at ? {
-    text: t("eimp_status_active"),
+  } : conn.last_synced_at ? {
+    text: t("gmi_status_active"),
     bg: "var(--tint-green)",
     fg: "var(--green)"
   } : {
-    text: t("eimp_status_awaiting"),
+    text: t("gmi_status_awaiting"),
     bg: "var(--tint-green)",
     fg: "var(--green)"
   };
@@ -2449,11 +2477,9 @@ function EmailImportSettings({
       ...S.privacyNote,
       marginTop: 0
     }
-  }, t("eimp_intro")), err && /*#__PURE__*/React.createElement("div", {
+  }, t("gmi_intro")), err && /*#__PURE__*/React.createElement("div", {
     style: S.errBox
-  }, err, /*#__PURE__*/React.createElement("br", null), (err.includes("does not exist") || err.includes("schema cache")) && t("eimp_missing_table")), !configured && /*#__PURE__*/React.createElement("div", {
-    style: S.errBox
-  }, t("eimp_not_configured")), loading ? /*#__PURE__*/React.createElement("div", {
+  }, err, /*#__PURE__*/React.createElement("br", null), (err.includes("does not exist") || err.includes("schema cache")) && t("gmi_missing_table")), loading ? /*#__PURE__*/React.createElement("div", {
     style: S.privacyNote
   }, t("loading")) : /*#__PURE__*/React.createElement("div", {
     style: S.provCard
@@ -2473,102 +2499,92 @@ function EmailImportSettings({
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: S.provName
-  }, t("sec_email_import")), /*#__PURE__*/React.createElement("div", {
+  }, t("gmi_title")), /*#__PURE__*/React.createElement("div", {
     style: S.provMeta
-  }, conn ? t("eimp_forwarding_hint") : t("eimp_not_set_up"))), /*#__PURE__*/React.createElement("span", {
+  }, conn && conn.account_email ? conn.account_email : t("gmi_not_connected"))), /*#__PURE__*/React.createElement("span", {
     style: {
-      ...S.provPill,
+      ...S.pill,
       background: pill.bg,
       color: pill.fg
     }
-  }, pill.text)), conn && address && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
-    style: S.fieldLabel
-  }, t("eimp_address_label")), /*#__PURE__*/React.createElement("div", {
+  }, pill.text)), conn && /*#__PURE__*/React.createElement("div", {
     style: {
-      ...S.input,
-      wordBreak: "break-all",
-      fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-      fontSize: 13
-    }
-  }, address), /*#__PURE__*/React.createElement("button", {
-    style: {
-      ...S.ghostBtn,
-      marginTop: 8
-    },
-    onClick: copy
-  }, t("eimp_copy"))), conn && /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginTop: 12
+      marginTop: 10
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: S.provMeta
-  }, t("eimp_last_received") + ": " + timeAgo(conn.last_message_at)), /*#__PURE__*/React.createElement("div", {
+  }, t("gmi_last_checked") + ": " + timeAgo(conn.last_checked_at)), /*#__PURE__*/React.createElement("div", {
     style: S.provMeta
-  }, t("eimp_last_import") + ": " + timeAgo(counts.lastImport)), counts.unparsed > 0 && /*#__PURE__*/React.createElement("div", {
+  }, t("gmi_last_import") + ": " + timeAgo(counts.lastImport)), counts.unparsed > 0 && /*#__PURE__*/React.createElement("div", {
     style: S.provMeta
-  }, t("eimp_unparsed", {
+  }, t("gmi_unparsed", {
     n: counts.unparsed
-  }))), conn && conn.last_error && /*#__PURE__*/React.createElement("div", {
-    style: S.errBox
-  }, emailImportMessage(conn.last_error)), !conn ? /*#__PURE__*/React.createElement("button", {
+  })), conn.last_error && /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...S.provMeta,
+      color: "var(--danger)"
+    }
+  }, t("gmi_last_error") + ": " + (t("gmi_err_" + conn.last_error) === "gmi_err_" + conn.last_error ? conn.last_error : t("gmi_err_" + conn.last_error)))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 12
+    }
+  }, !conn ? /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.primaryBtn,
-      opacity: busy || !configured ? 0.5 : 1
+      opacity: busy ? 0.6 : 1
     },
-    disabled: busy || !configured,
-    onClick: createAlias
-  }, busy ? t("prov_working") : t("eimp_create")) : /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
-    style: S.provBtnRow
+    disabled: busy,
+    onClick: connect
+  }, busy ? t("prov_working") : t("gmi_connect")) : /*#__PURE__*/React.createElement("div", null, reconnect && /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.primaryBtn,
+      opacity: busy ? 0.6 : 1
+    },
+    disabled: busy,
+    onClick: connect
+  }, busy ? t("prov_working") : t("gmi_reconnect")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      marginTop: 10
+    }
   }, /*#__PURE__*/React.createElement("button", {
     style: halfBtn({
-      opacity: busy ? 0.5 : 1
+      opacity: busy ? 0.6 : 1
     }),
     disabled: busy,
-    onClick: toggle
-  }, enabled ? t("eimp_disable") : t("eimp_enable")), /*#__PURE__*/React.createElement("button", {
+    onClick: syncNow
+  }, busy ? t("prov_working") : t("gmi_sync_now")), /*#__PURE__*/React.createElement("button", {
     style: halfBtn({
-      opacity: busy ? 0.5 : 1,
       color: "var(--danger)",
-      borderColor: "var(--danger)"
+      opacity: busy ? 0.6 : 1
     }),
     disabled: busy,
-    onClick: () => setConfirmRotate(true)
-  }, t("eimp_rotate"))))), conn && /*#__PURE__*/React.createElement("div", {
+    onClick: () => setConfirmDisconnect(true)
+  }, t("gmi_disconnect")))))), conn && /*#__PURE__*/React.createElement("div", {
     style: {
-      ...S.provCard,
+      ...S.privacyNote,
       marginTop: 12
     }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: S.provName
-  }, t("eimp_gmail_title")), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("b", null, t("gmi_label_title")), /*#__PURE__*/React.createElement("div", {
     style: {
-      ...S.privacyNote,
-      marginTop: 8
-    }
-  }, t("eimp_gmail_1")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      ...S.privacyNote,
       marginTop: 4
     }
-  }, t("eimp_gmail_2")), /*#__PURE__*/React.createElement("div", {
+  }, t("gmi_label_1")), /*#__PURE__*/React.createElement("div", {
     style: {
-      ...S.privacyNote,
-      marginTop: 4
+      marginTop: 2
     }
-  }, t("eimp_gmail_3")), /*#__PURE__*/React.createElement("div", {
+  }, t("gmi_label_2")), /*#__PURE__*/React.createElement("div", {
     style: {
-      ...S.privacyNote,
-      marginTop: 4
+      marginTop: 2
     }
-  }, t("eimp_gmail_4"))), confirmRotate && /*#__PURE__*/React.createElement(EmailImportRotateModal, {
+  }, t("gmi_label_3"))), confirmDisconnect && /*#__PURE__*/React.createElement(GmailDisconnectModal, {
     busy: busy,
-    onCancel: () => setConfirmRotate(false),
-    onConfirm: rotate
+    onCancel: () => setConfirmDisconnect(false),
+    onConfirm: disconnect
   }));
 }
-
-// ---------- Rotate confirmation ----------
-function EmailImportRotateModal({
+function GmailDisconnectModal({
   busy,
   onCancel,
   onConfirm
@@ -2584,12 +2600,12 @@ function EmailImportRotateModal({
       ...S.pageTitle,
       marginTop: 0
     }
-  }, t("eimp_rotate_title")), /*#__PURE__*/React.createElement("div", {
+  }, t("gmi_disconnect_title")), /*#__PURE__*/React.createElement("div", {
     style: {
       ...S.privacyNote,
       marginTop: 0
     }
-  }, t("eimp_rotate_body")), /*#__PURE__*/React.createElement("button", {
+  }, t("gmi_disconnect_body")), /*#__PURE__*/React.createElement("button", {
     style: {
       ...S.primaryBtn,
       background: "var(--danger)",
@@ -2597,7 +2613,7 @@ function EmailImportRotateModal({
     },
     disabled: busy,
     onClick: onConfirm
-  }, busy ? t("prov_working") : t("eimp_rotate")), /*#__PURE__*/React.createElement("button", {
+  }, busy ? t("prov_working") : t("gmi_disconnect")), /*#__PURE__*/React.createElement("button", {
     style: S.ghostBtn,
     disabled: busy,
     onClick: onCancel

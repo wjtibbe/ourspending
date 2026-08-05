@@ -9,6 +9,7 @@ Functions import, using Node's native type stripping (Node 22.6+).
     node --experimental-strip-types tests/wise-sync-client.test.ts
     node --experimental-strip-types tests/import-core.test.ts
     node --experimental-strip-types tests/inbound-email.test.ts
+    node --experimental-strip-types tests/gmail-import.test.ts
     node tests/expense-display.test.js
 
 `categories.test.ts` covers the mapping layer: multilingual aliases, MCC codes,
@@ -96,6 +97,28 @@ at. An end-to-end case then runs that extracted transaction through
 the deducted EUR amount stored as `amount_orig`, the merchant COP amount
 stored separately, and `had_currency_conversion` true.
 
+`gmail-import.test.ts` covers the Gmail half of the import path: base64url
+decoding (including the multi-byte UTF-8 trap that turns "Éxito" into
+"Ãxito" if the bytes skip TextDecoder), MIME walking across flat,
+multipart/alternative and nested multipart/mixed structures with attachments
+skipped, RFC 2047 encoded-word headers, the deliberately narrow Gmail search
+(`from:noreply@wise.com newer_than:2d`, plus an optional label),
+message-list pagination, OAuth state/PKCE generation and the consent URL
+(gmail.readonly only, `access_type=offline`, S256, consent forced on first
+connect but not on reconnect), the token-endpoint error taxonomy — with
+`invalid_grant` mapped to its own `reconnect_required` code rather than being
+collapsed into a generic failure — and end to end: one completed Wise email
+becomes exactly one shared expense with the connected user as payer, the
+daily lookback overlap creates no duplicate, the same mail under two Gmail
+ids still dedupes on `Message-ID`, an unparsed email creates no expense, one
+malformed message does not stop the ones after it, one failing connection
+does not stop other users, an expired access token is refreshed and a rotated
+refresh token is honoured, and no token ever reaches the ledger.
+
+The Wise parsing and expense rules are deliberately NOT re-tested there: both
+adapters run the same `_shared/email-import-core.ts`, so those rules are
+covered once, by `inbound-email.test.ts` and `import-core.test.ts`.
+
 `expense-display.test.js` drives `expense-display.js` — the pure function
 `app.js` uses to decide what an expense row's large/small amounts show. It
 proves: a display currency matching the deducted amount shows that amount
@@ -118,6 +141,7 @@ Run in the Supabase SQL editor. Each wraps itself in a transaction that ends in
     supabase/verify_wise_transactions.sql          -> WISE LEDGER VERIFICATION PASSED
     supabase/verify_email_import.sql               -> EMAIL IMPORT VERIFICATION PASSED
     supabase/verify_expense_conversion_fields.sql  -> EXPENSE CONVERSION FIELDS VERIFICATION PASSED
+    supabase/verify_gmail_import.sql               -> GMAIL IMPORT VERIFICATION PASSED
 
 `verify_email_import.sql` additionally proves the retention contract: the
 default expiry is seven days, the purge leaves unexpired content alone, an
@@ -132,3 +156,12 @@ Wise-style conversion row stores both exact amounts and the right flags, that
 a simulated later household rate change leaves an already-stored row
 untouched, and that exactly one expense exists per import (no double
 counting). Verified on real PostgreSQL 16.
+
+`verify_gmail_import.sql` proves the Gmail-specific database contract: an
+OAuth state is single-use (a replay resolves to no user), expires, and is
+bound to the user who started the flow; refresh tokens and PKCE verifiers are
+unreadable by every client role including the row's own owner; the
+`alias_token` shape constraint keeps a forwarding connection from existing
+without an alias and a Gmail one from carrying a stray alias; Gmail message
+ids dedupe per connection but not across users; and disconnecting takes the
+credential and the ledger rows with it. Verified on real PostgreSQL 16.
