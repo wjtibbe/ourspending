@@ -49,12 +49,22 @@ import { safeError } from "../_shared/import-core.ts";
 import {
   claimMessage, importClaimedMessage, markMessage,
 } from "../_shared/email-import-core.ts";
+import { createAiClassifier, type AiClassifier } from "../_shared/merchant-categorization.ts";
 
 const RESEND_WEBHOOK_SECRET = Deno.env.get("RESEND_WEBHOOK_SECRET");
 const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY");
 const INBOUND_EMAIL_DOMAIN = Deno.env.get("INBOUND_EMAIL_DOMAIN") ?? "";
 // Aliases look like `wise-<token>@<domain>`; set to "" for a bare `<token>@`.
 const INBOUND_ALIAS_PREFIX = Deno.env.get("INBOUND_ALIAS_PREFIX") ?? "wise";
+
+// Same feature flag as gmail-sync, kept in step so re-activating this
+// adapter someday behaves identically. Off unless both are explicitly set.
+const AI_CATEGORIZATION_ENABLED = (Deno.env.get("AI_CATEGORIZATION_ENABLED") ?? "")
+  .trim().toLowerCase() === "true";
+const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY");
+const aiClassifier: AiClassifier | null = AI_CATEGORIZATION_ENABLED && ANTHROPIC_API_KEY
+  ? createAiClassifier(ANTHROPIC_API_KEY)
+  : null;
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), {
@@ -158,6 +168,7 @@ Deno.serve(async (req) => {
       userId,
       message,
       now: new Date(),
+      aiClassifier,
     });
 
     if (result.outcome === "imported") {

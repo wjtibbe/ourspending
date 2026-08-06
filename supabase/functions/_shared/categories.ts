@@ -38,6 +38,9 @@ const ALIAS_GROUPS: Record<AppCategory, string[]> = {
     "food store", "food and groceries",
     "boodschappen", "supermarkt", "kruidenier", "levensmiddelen",
     "supermercado", "mercado", "abarrotes", "comestibles", "tienda",
+    // Named Colombian supermarket chains -- brand names, not generic words,
+    // but common enough in Wise merchant strings to be worth matching directly.
+    "exito", "jumbo", "carulla",
   ],
   snacks: [
     "snacks", "snack", "drinks", "beverages", "coffee", "coffee shop", "cafe",
@@ -48,7 +51,7 @@ const ALIAS_GROUPS: Record<AppCategory, string[]> = {
   dining: [
     "dining", "dining out", "restaurant", "restaurants", "restaurants and bars",
     "bars", "bar", "pub", "fast food", "takeaway", "take away", "food delivery",
-    "eating out", "food and drink",
+    "eating out", "food and drink", "pizza", "burger", "crepes",
     "uit eten", "eten bestellen", "afhaal", "eetcafe",
     "restaurante", "restaurantes", "comida", "comida rapida", "cena", "almuerzo",
   ],
@@ -99,6 +102,9 @@ const ALIAS_GROUPS: Record<AppCategory, string[]> = {
   subscriptions: [
     "subscriptions", "subscription", "streaming", "software", "saas",
     "membership", "memberships", "cloud", "hosting", "domain", "app store",
+    // Named streaming/software brands -- common enough in Wise merchant
+    // strings to match directly, same reasoning as the supermarket names above.
+    "spotify", "netflix", "adobe",
     "abonnementen", "abonnement", "lidmaatschap",
     "suscripciones", "suscripcion", "membresia", "membresias",
   ],
@@ -111,10 +117,11 @@ const ALIAS_GROUPS: Record<AppCategory, string[]> = {
   entertainment: [
     "entertainment", "leisure", "cinema", "movies", "music", "concerts",
     "games", "gaming", "sports", "events", "nightlife", "books", "hobbies",
+    "tickets",
     "vermaak", "uitgaan", "bioscoop", "films", "muziek", "spellen", "sport",
-    "boeken", "hobby",
+    "boeken", "hobby", "activiteiten",
     "entretenimiento", "ocio", "cine", "peliculas", "musica", "juegos",
-    "deportes", "eventos", "libros",
+    "deportes", "eventos", "libros", "feria", "actividades",
   ],
   gifts: [
     "gifts", "gift", "presents", "donation", "donations", "charity", "tips",

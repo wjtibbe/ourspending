@@ -21,11 +21,23 @@ import {
   enabledGmailConnections, syncGmailConnections,
   type GmailConnectionRow, type GmailSyncDeps,
 } from "../_shared/gmail-sync.ts";
+import { createAiClassifier, type AiClassifier } from "../_shared/merchant-categorization.ts";
 
 const GOOGLE_CLIENT_ID = Deno.env.get("GOOGLE_CLIENT_ID");
 const GOOGLE_CLIENT_SECRET = Deno.env.get("GOOGLE_CLIENT_SECRET");
 const SYNC_CRON_SECRET = Deno.env.get("SYNC_CRON_SECRET");
 const GMAIL_LABEL = Deno.env.get("GMAIL_LABEL") ?? "";
+
+// AI categorisation fallback (layer 4) is feature-flagged and off by
+// default: it only ever runs once household rules, the existing global
+// mapping and the multilingual keyword mapping have all found nothing, and
+// even then only if BOTH this flag is explicitly on AND a key is set.
+const AI_CATEGORIZATION_ENABLED = (Deno.env.get("AI_CATEGORIZATION_ENABLED") ?? "")
+  .trim().toLowerCase() === "true";
+const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY");
+const aiClassifier: AiClassifier | null = AI_CATEGORIZATION_ENABLED && ANTHROPIC_API_KEY
+  ? createAiClassifier(ANTHROPIC_API_KEY)
+  : null;
 // Default 8, not 2: the job runs once daily, and Gmail OAuth or the
 // scheduled invocation can occasionally fail outright (a dead token, a
 // transient 5xx). An 8-day window means one or even several missed days
@@ -67,6 +79,7 @@ const deps = (): GmailSyncDeps => ({
     ? lookbackConfigured
     : 8,
   label: GMAIL_LABEL.trim() || null,
+  aiClassifier,
 });
 
 Deno.serve(async (req) => {

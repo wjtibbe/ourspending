@@ -109,6 +109,11 @@
       save_changes: "Save changes",
       cancel: "Cancel",
       save: "Save",
+      // Learned merchant categorisation rule
+      learn_rule_title: "Always categorize “{merchant}” as {category}?",
+      learn_rule_body: "Future Wise imports from this merchant will use this category automatically. This expense, and any already imported, are not changed.",
+      learn_rule_yes: "Yes, remember this",
+      learn_rule_no: "Not this time",
       // Budgets & settings
       budgets_dash: "Budgets — ",
       budgets_note: "Budgets are set in EUR and count all expenses. Shown in {cur}.",
@@ -494,6 +499,11 @@
       save_changes: "Guardar cambios",
       cancel: "Cancelar",
       save: "Guardar",
+      // Regla aprendida de categorización de comercios
+      learn_rule_title: "¿Categorizar siempre “{merchant}” como {category}?",
+      learn_rule_body: "Las futuras importaciones de Wise de este comercio usarán esta categoría automáticamente. Este gasto, y los ya importados, no cambian.",
+      learn_rule_yes: "Sí, recordar esto",
+      learn_rule_no: "Esta vez no",
       // Budgets & settings
       budgets_dash: "Presupuestos — ",
       budgets_note: "Los presupuestos se definen en EUR e incluyen todos los gastos. Mostrado en {cur}.",

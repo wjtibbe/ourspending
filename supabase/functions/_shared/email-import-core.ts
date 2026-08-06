@@ -24,6 +24,7 @@ import {
   classifyNormalized, createExpense, isContextFailure, q, resolveImportContext,
   safeError, type NormalizedTransaction,
 } from "./import-core.ts";
+import { categorizeTransaction, type AiClassifier } from "./merchant-categorization.ts";
 
 /** Records an outcome on an already-claimed ledger row. Never throws. */
 export async function markMessage(db: Db, rowId: string, patch: Row): Promise<void> {
@@ -86,6 +87,8 @@ export async function importClaimedMessage(db: Db, params: {
   userId: string;
   message: InboundMessage;
   now: Date;
+  /** Layer 4 of categorizeTransaction(). Omitted = AI fallback disabled. */
+  aiClassifier?: AiClassifier | null;
 }): Promise<ImportResult> {
   const { rowId, connectionId, userId, message, now } = params;
 
@@ -189,9 +192,26 @@ export async function importClaimedMessage(db: Db, params: {
       return { outcome: "skipped", reason: ctx.error };
     }
 
+    // ---- layered categorisation: household rule -> global/keyword -> AI -> fallback ----
+    // Resolved BEFORE createExpense() so the decision (and which layer made
+    // it) is known up front, rather than re-deriving "was this a fallback"
+    // from the expense afterwards.
+    const categorization = await categorizeTransaction(db, {
+      householdId: ctx.householdId,
+      merchant: tx.merchant,
+      subject: typeof tx.sourceMetadata?.subject === "string" ? tx.sourceMetadata.subject : null,
+      categoryInput: tx.categoryInput,
+      allowed: ctx.allowed,
+      aiClassifier: params.aiClassifier ?? null,
+    });
+
     const result = await createExpense(db, ctx, tx, {
       sourceProvider: "wise",
       conversionSource: wiseEmailParser.provider,
+    }, {
+      category: categorization.category,
+      source: categorization.provenance,
+      matched: categorization.matched,
     });
     if (result.status === "failed") {
       await markMessage(db, rowId, { status: "failed", error_summary: result.reason });
@@ -203,7 +223,12 @@ export async function importClaimedMessage(db: Db, params: {
       household_id: ctx.householdId,
       expense_id: result.expenseId,
       mapped_category: result.category,
-      category_source: result.categoryFallback ? "fallback" : "mapped",
+      // household_rule | global_rule | keyword | ai | fallback -- see
+      // _shared/merchant-categorization.ts. Never email content, an amount
+      // or a token; category_match (below) carries the normalized merchant
+      // or keyword only, when there is one to show.
+      category_source: categorization.provenance,
+      category_match: categorization.matched,
       error_summary: null,
       // Early purge: a message that parsed cleanly needs no diagnosis, so its
       // body goes now rather than sitting for the full seven days.
