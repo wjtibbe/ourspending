@@ -235,9 +235,13 @@ export function buildWiseQuery(opts: {
   label?: string | null;
   sender?: string;
 } = {}): string {
+  // 8, not 2: the job runs once daily and an occasional missed run (a dead
+  // token, a transient failure) must still be caught by the next one. Safe
+  // to widen because duplicate protection does not rely on a tight window --
+  // see the comment on GMAIL_LOOKBACK_DAYS in functions/gmail-sync/index.ts.
   const days = Number.isFinite(opts.lookbackDays) && (opts.lookbackDays as number) > 0
     ? Math.floor(opts.lookbackDays as number)
-    : 2;
+    : 8;
   const sender = opts.sender && opts.sender.trim() ? opts.sender.trim() : "noreply@wise.com";
   const parts = [`from:${sender}`, `newer_than:${days}d`];
   if (opts.label && opts.label.trim()) {

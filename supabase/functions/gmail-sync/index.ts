@@ -26,6 +26,15 @@ const GOOGLE_CLIENT_ID = Deno.env.get("GOOGLE_CLIENT_ID");
 const GOOGLE_CLIENT_SECRET = Deno.env.get("GOOGLE_CLIENT_SECRET");
 const SYNC_CRON_SECRET = Deno.env.get("SYNC_CRON_SECRET");
 const GMAIL_LABEL = Deno.env.get("GMAIL_LABEL") ?? "";
+// Default 8, not 2: the job runs once daily, and Gmail OAuth or the
+// scheduled invocation can occasionally fail outright (a dead token, a
+// transient 5xx). An 8-day window means one or even several missed days
+// still catch up on the next successful run. This is safe to widen because
+// duplicate protection does not depend on the window being tight -- four
+// independent dedupe keys (provider message id, RFC Message-ID, transaction
+// reference, fingerprint) already make re-scanning the same message a no-op
+// rather than a second expense. See claimMessage()/importClaimedMessage() in
+// _shared/email-import-core.ts, unchanged here.
 const lookbackConfigured = parseInt(Deno.env.get("GMAIL_LOOKBACK_DAYS") ?? "", 10);
 
 const json = (body: unknown, status = 200) =>
@@ -48,7 +57,7 @@ const deps = (): GmailSyncDeps => ({
   decrypt: decryptToken,
   lookbackDays: Number.isFinite(lookbackConfigured) && lookbackConfigured > 0
     ? lookbackConfigured
-    : 2,
+    : 8,
   label: GMAIL_LABEL.trim() || null,
 });
 

@@ -10,9 +10,9 @@ records, no forwarding.
       → one shared expense, you as payer, deduped
 
 **Scope:** `gmail.readonly` only. Nothing is ever sent, modified, labelled or
-deleted, and the search is restricted to Wise's sender address over a two-day
-window — the app never asks Gmail for, and therefore never sees, the rest of
-your mailbox.
+deleted, and the search is restricted to Wise's sender address over an
+eight-day window — the app never asks Gmail for, and therefore never sees,
+the rest of your mailbox.
 
 ---
 
@@ -56,14 +56,15 @@ Without this, OAuth succeeds but every read returns 403.
 | App name | OurSpending (or anything) |
 | User support email | your address |
 | Developer contact | your address |
-| Publishing status | **leave in `Testing`** — do **not** click "Publish app" |
+| Publishing status | **start in `Testing`** while you set up and confirm the flow works |
 
 Then **Scopes → Add or remove scopes** → add exactly:
 
     https://www.googleapis.com/auth/gmail.readonly
 
 Do not add any other scope. `gmail.readonly` is a *restricted* scope, which is
-why Testing mode matters — see §16.
+why the publishing status matters — see §16, including when and how to move
+from `Testing` to `In production` once you're past initial setup.
 
 ## 5. Test users
 
@@ -111,7 +112,7 @@ Optional:
 
 | Name | Default | Purpose |
 |---|---|---|
-| `GMAIL_LOOKBACK_DAYS` | `2` | Search window. Overlap is safe (see §13). |
+| `GMAIL_LOOKBACK_DAYS` | `8` | Search window. The job runs once daily; 8 days gives it room to catch up after a missed run without losing a transaction. Overlap is safe (see §13). |
 | `GMAIL_LABEL` | *(none)* | Restrict further to one Gmail label, e.g. `Wise Import`. |
 
 `GOOGLE_CLIENT_SECRET` and the refresh tokens never reach a browser.
@@ -183,7 +184,7 @@ confirmation code, no password.
 2. Google consent screen → pick the account → **Allow**. You return to the app
    with "Gmail connected."
 3. Confirm the panel shows the connected address and `Waiting for first sync`.
-4. Make a small real Wise card payment (or use one from the last two days).
+4. Make a small real Wise card payment (or use one from the last eight days).
 5. Press **Sync now**. Expect "Sync finished. 1 new expense(s) imported."
 6. Overview → the expense appears: shared, you as payer, the **deducted**
    amount as the headline figure and the merchant amount as the secondary one.
@@ -214,21 +215,27 @@ confirmation code, no password.
 
 ---
 
-## 13. Why repeated syncs are safe
+## 13. Why repeated syncs — and an 8-day overlap — are safe
 
-Four independent dedupe layers, all scoped to one connection:
+The job runs once daily, and either half of it can occasionally fail (Gmail
+OAuth, or the scheduled invocation itself). An 8-day lookback means each run
+re-scans up to a week of mail it has likely already seen, on purpose, so a
+missed day or two never loses a transaction. That overlap is safe only
+because duplicate protection does not depend on the window being tight — it
+is four independent dedupe layers, all scoped to one connection:
 
 | Layer | Key | Catches |
 |---|---|---|
-| 1 | Gmail message id | the same message in overlapping lookback windows |
+| 1 | Gmail message id | the same message re-seen in the overlapping window |
 | 2 | RFC 5322 `Message-ID` | the same mail arriving by two routes |
 | 3 | Wise transaction reference | two mails about one transaction |
 | 4 | deterministic fingerprint | everything else |
 
-So a missed day is caught by the next run, and the overlap is a no-op. Only
-completed, outgoing Wise card payments become expenses; declined, reversed,
-refunds, incoming transfers, marketing and security alerts are recorded and
-skipped without creating one.
+Re-scanning the same seven days of mail every day for years is therefore a
+no-op, not a risk: nothing here re-imports a transaction because the window
+saw it again. Only completed, outgoing Wise card payments become expenses;
+declined, reversed, refunds, incoming transfers, marketing and security
+alerts are recorded and skipped without creating one.
 
 ---
 
@@ -273,31 +280,86 @@ retention/purge function — Gmail import uses all of them.
 
 ---
 
-## 16. Known limitations of Google OAuth Testing mode
+## 16. Google OAuth publishing status: Testing vs. In production
 
-This deployment deliberately stays in **Testing**, which is the right trade for
-a private app but has real consequences:
+These are two stages of the **same unverified app** — nothing about the
+`gmail.readonly` scope, the consent screen configuration, or the OAuth client
+changes between them. Only the **Publishing status** field on the consent
+screen (§4) changes. Below is what each stage means and when to move between
+them.
 
-**Refresh tokens expire after 7 days.** This is the big one. In Testing mode
-with a *restricted* scope like `gmail.readonly`, Google expires refresh tokens
-after seven days. Each user must press **Connect Gmail** again roughly weekly.
-The app handles this correctly rather than silently: the connection flips to
-**Reconnect needed**, the sync records `reconnect_required`, no partial or
-wrong data is written, and reconnecting resumes cleanly. Because the lookback
-is two days, reconnect within 48 hours and nothing is missed; longer than that
-and older emails fall outside the window (raise `GMAIL_LOOKBACK_DAYS`
-temporarily to catch up).
+### A. Initial testing — Publishing status = `Testing`
 
-**Maximum 100 test users**, added by hand on the consent screen. Fine for "me
-and a few friends"; it is a hard ceiling.
+Use this while you are setting the app up and confirming it works, per §4–§5
+of this guide:
 
-**An unverified-app warning** appears during consent — "Google hasn't verified
-this app". Test users click **Advanced → Go to OurSpending (unsafe)**. Expected,
-and worth telling friends in advance.
+* **Only explicitly listed test users can connect.** Anyone not added under
+  **Audience → Test users** gets "OurSpending has not completed the Google
+  verification process" and cannot proceed at all — not even to the unverified
+  app warning.
+* **Refresh tokens may expire after 7 days.** In Testing status, with a
+  *restricted* scope like `gmail.readonly`, Google time-limits refresh tokens
+  to about seven days regardless of use. Each user must press **Connect
+  Gmail** again roughly weekly. The app handles this explicitly rather than
+  failing silently: the connection flips to **Reconnect needed**, the sync
+  records `reconnect_required`, no partial or wrong data is written, and
+  reconnecting resumes cleanly. The default 8-day `GMAIL_LOOKBACK_DAYS`
+  window (§7, §13) means even a token that expired right on schedule and is
+  reconnected a day or two late still catches everything.
+* Maximum 100 test users, added by hand.
 
-**Escaping these limits requires Google verification**, which for a restricted
-Gmail scope means a CASA security assessment, a privacy policy, a demo video
-and an annual review — deliberately out of scope here.
+Stay here only as long as you are actively testing. It is not the right
+long-term state for people you expect to rely on this daily, because of the
+weekly reconnect requirement above.
 
-**Not designed for Workspace admin.** No domain-wide delegation, no service
-account impersonation. Each user authorises their own mailbox individually.
+### B. Ongoing private use for fewer than 100 users — Publishing status = `In production`
+
+Once testing looks good, switch **Publishing status** from `Testing` to
+`In production` on the OAuth consent screen. This is **not** the same as
+completing Google's verification process (§ below) — it is still the same
+unverified app, just no longer gated to an explicit test-user list. Nothing
+else changes: same scope, same OAuth client, same redirect URI, no code or
+deployment change.
+
+What changes in practice:
+
+* **Any Google account can attempt to connect**, not just ones on the test-user
+  list — useful once "me and a few friends" is fixed but the friend list
+  might grow slightly.
+* **Refresh tokens stop expiring on the 7-day Testing-mode timer.** This is
+  the main reason to make this switch: it removes the weekly reconnect
+  requirement. (Google can still revoke a token for the usual reasons — the
+  user revokes access, the password changes, ~6 months of inactivity — the
+  `reconnect_required` handling in this app covers that either way.)
+* **Users still see the unverified-app warning** during consent —
+  "Google hasn't verified this app" — and must click
+  **Advanced → Go to OurSpending (unsafe)**. Switching to `In production`
+  does not remove this; only completing verification does. Worth telling
+  people in advance.
+* **The app remains subject to Google's unverified-app user cap: 100 users
+  total.** This is a hard ceiling enforced by Google on any unverified app in
+  production, distinct from (and not to be confused with) the Testing-mode
+  test-user list — it is a cap on how many distinct Google accounts can ever
+  grant this app consent. It fits "me and a few friends" with room to spare,
+  but it is a real limit, not a formality.
+
+**This is still not verification, and does not substitute for it if you ever
+outgrow it.** `In production` + unverified is appropriate for exactly the
+scale this app targets — a private tool for you and a handful of people you
+know, all willing to click past an unfamiliar-app warning. It is **not**
+appropriate for, and does not remove the requirement for, genuine Google
+verification if this were ever opened to the general public or scaled past
+the 100-user cap. Do not treat the `In production` switch described here as
+a substitute for verification in that scenario.
+
+### Getting verified (only if you outgrow B)
+
+Full verification for a restricted Gmail scope means a CASA security
+assessment, a published privacy policy, a demo video, and an annual review —
+deliberately out of scope for this deployment, and unnecessary for private
+use under the 100-user cap.
+
+### Not designed for Workspace admin
+
+No domain-wide delegation, no service account impersonation, in either
+Testing or Production. Each user authorises their own mailbox individually.

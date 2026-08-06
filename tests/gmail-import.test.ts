@@ -204,17 +204,22 @@ console.log("\n-- the Gmail search query stays narrow --");
 {
   const q = buildWiseQuery();
   check("restricted to Wise's sender", q.includes("from:noreply@wise.com"));
-  check("restricted to two days by default", q.includes("newer_than:2d"), q);
+  // 8 days, not 2: the job runs once daily, so the window must survive an
+  // occasional missed run (a dead token, a transient failure) without losing
+  // a transaction. Overlap is safe -- duplicate protection is four
+  // independent dedupe keys, not a tight window (see the isolation/overlap
+  // tests further down in this file).
+  check("restricted to eight days by default", q.includes("newer_than:8d"), q);
   check("no label term unless configured", !q.includes("label:"));
-  check("is exactly the documented default", q === "from:noreply@wise.com newer_than:2d", q);
+  check("is exactly the documented default", q === "from:noreply@wise.com newer_than:8d", q);
 
   const labelled = buildWiseQuery({ label: "Wise Import" });
   check("an optional label narrows it further", labelled.includes('label:"Wise Import"'), labelled);
   check("a label with a space stays one term", labelled.includes('"Wise Import"'));
 
   check("lookback is configurable", buildWiseQuery({ lookbackDays: 5 }).includes("newer_than:5d"));
-  check("a nonsense lookback falls back to 2 days",
-    buildWiseQuery({ lookbackDays: 0 }).includes("newer_than:2d"));
+  check("a nonsense lookback falls back to 8 days",
+    buildWiseQuery({ lookbackDays: 0 }).includes("newer_than:8d"));
   check("a blank label is ignored", !buildWiseQuery({ label: "  " }).includes("label:"));
 }
 
