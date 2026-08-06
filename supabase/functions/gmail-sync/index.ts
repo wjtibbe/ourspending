@@ -37,14 +37,22 @@ const GMAIL_LABEL = Deno.env.get("GMAIL_LABEL") ?? "";
 // _shared/email-import-core.ts, unchanged here.
 const lookbackConfigured = parseInt(Deno.env.get("GMAIL_LOOKBACK_DAYS") ?? "", 10);
 
+// Matches provider-connect's established pattern, with x-sync-secret added
+// for the cron caller. supabase-js's functions.invoke() ("Sync now") always
+// sends apikey and x-client-info alongside authorization and content-type --
+// omitting either from Allow-Headers makes the browser's CORS preflight fail
+// closed with no error surfaced to this function at all: the request never
+// arrives, only the OPTIONS does.
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-sync-secret",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), {
     status,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Headers": "authorization, content-type, x-sync-secret",
-    },
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
   });
 
 const deps = (): GmailSyncDeps => ({
@@ -62,7 +70,13 @@ const deps = (): GmailSyncDeps => ({
 });
 
 Deno.serve(async (req) => {
-  if (req.method === "OPTIONS") return json({ ok: true });
+  // Answered before anything else, and unauthenticated: the platform lets an
+  // OPTIONS preflight through even with "Verify JWT" on, but only if the
+  // function itself replies -- and the reply must carry these headers or the
+  // browser blocks the real request (cron's x-sync-secret path is a
+  // server-to-server call and never preflights, but the browser-driven
+  // "Sync now" path does).
+  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
   if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
 
   if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !hasEncryptionKey()) {

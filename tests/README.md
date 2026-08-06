@@ -10,6 +10,7 @@ Functions import, using Node's native type stripping (Node 22.6+).
     node --experimental-strip-types tests/import-core.test.ts
     node --experimental-strip-types tests/inbound-email.test.ts
     node --experimental-strip-types tests/gmail-import.test.ts
+    node --experimental-strip-types tests/gmail-cors.test.ts
     node tests/expense-display.test.js
 
 `categories.test.ts` covers the mapping layer: multilingual aliases, MCC codes,
@@ -102,7 +103,7 @@ decoding (including the multi-byte UTF-8 trap that turns "Éxito" into
 "Ãxito" if the bytes skip TextDecoder), MIME walking across flat,
 multipart/alternative and nested multipart/mixed structures with attachments
 skipped, RFC 2047 encoded-word headers, the deliberately narrow Gmail search
-(`from:noreply@wise.com newer_than:2d`, plus an optional label),
+(`from:noreply@wise.com newer_than:8d`, plus an optional label),
 message-list pagination, OAuth state/PKCE generation and the consent URL
 (gmail.readonly only, `access_type=offline`, S256, consent forced on first
 connect but not on reconnect), the token-endpoint error taxonomy — with
@@ -118,6 +119,23 @@ refresh token is honoured, and no token ever reaches the ledger.
 The Wise parsing and expense rules are deliberately NOT re-tested there: both
 adapters run the same `_shared/email-import-core.ts`, so those rules are
 covered once, by `inbound-email.test.ts` and `import-core.test.ts`.
+
+`gmail-cors.test.ts` drives the actual `Deno.serve` handler in
+`gmail-oauth-start`, `gmail-sync` and `gmail-disconnect` — not a
+reimplementation, the real callback each file passes to `Deno.serve()`,
+captured via a stubbed `Deno.serve` — against a simulated CORS preflight and
+real POST requests. It is regression coverage for a real bug: their
+`Access-Control-Allow-Headers` omitted `apikey` and `x-client-info`, which
+supabase-js's `functions.invoke()` always sends, so the browser silently
+refused to send the POST after an OPTIONS that returned 200. It proves the
+preflight response covers every header a real `functions.invoke()` call
+sends, that a POST response carries the identical CORS headers (success,
+missing-auth and wrong-secret cases alike), that a request with no
+Authorization header — and one with a bearer token Supabase rejects — both
+still get a 401 rather than silently proceeding, and that a genuinely
+signed-in POST to `gmail-oauth-start` still returns a usable Google consent
+URL with no secret in the response. Checked out against the pre-fix code, 33
+of these assertions fail; against the fix, all pass.
 
 `expense-display.test.js` drives `expense-display.js` — the pure function
 `app.js` uses to decide what an expense row's large/small amounts show. It
