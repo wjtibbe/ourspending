@@ -790,5 +790,151 @@ console.log("\n-- nothing secret is ever written to the ledger --");
     !JSON.stringify(db.store.email_import_credentials).includes("SECRET-RT"));
 }
 
+// ---------------------------------------------------------------------------
+// Regression: 14 production-shaped Gmail messages must all reach the ledger.
+//
+// This mirrors a real incident: a live Gmail sync reported messagesSeen=14,
+// everything else 0, failed=14, and email_import_messages stayed completely
+// empty -- every message failed at (or before) the very first ledger insert,
+// with no diagnostic beyond an aggregate counter. Root cause turned out to
+// be a database-level defect (a PARTIAL unique index that PostgREST's
+// on_conflict=connection_id,provider_message_id cannot match -- see
+// supabase/email_import_ledger_fix.sql and verify_email_import_ledger_fix.sql
+// for the exact reproduction against real PostgreSQL). This FakeDb-based
+// suite cannot exercise that SQL defect directly -- it proves two things a
+// SQL test cannot: the full 14-message pipeline lands every ledger row when
+// claims succeed, and the new per-message diagnostics (stage + safe reason,
+// best-effort ledger retention) behave correctly if a claim ever fails again
+// for any reason.
+// ---------------------------------------------------------------------------
+
+/** 14 distinct, realistic Wise completed-payment emails. */
+function productionShapedMessage(i: number): GmailMessage {
+  const copAmount = 71362 + i;
+  const eurAmount = (19.76 + i * 0.5).toFixed(2);
+  const text = `Hi Alex,\n\nYou spent ${copAmount.toLocaleString("en-US")} COP at Éxito Express.\n\n` +
+    `This used ${eurAmount} EUR from your account.\n\nThanks for using Wise.`;
+  const html = `<html><body><p>Hi Alex,</p>` +
+    `<p>You spent ${copAmount.toLocaleString("en-US")} COP at Éxito Express.</p>` +
+    `<p>This used ${eurAmount} EUR from your account.</p></body></html>`;
+  return {
+    id: `gm-prod-${i}`,
+    internalDate: String(1785769440000 + i * 60_000),
+    payload: {
+      mimeType: "multipart/alternative",
+      headers: [
+        { name: "From", value: "Wise <noreply@wise.com>" },
+        { name: "To", value: "alex@example.com" },
+        { name: "Subject", value: `${copAmount.toLocaleString("en-US")} COP spent at Éxito Express` },
+        { name: "Message-ID", value: `<prod-${i}@wise.com>` },
+      ],
+      parts: [
+        { mimeType: "text/plain", body: { data: b64url(text) } },
+        { mimeType: "text/html", body: { data: b64url(html) } },
+      ],
+    },
+  };
+}
+
+console.log("\n-- 14 production-shaped Gmail messages: none vanish before ledger insertion --");
+{
+  const db = seedDb();
+  const state = { plaintext: JSON.stringify({ refresh_token: "rt-1" }) };
+  const messages = Array.from({ length: 14 }, (_, i) => productionShapedMessage(i));
+  const { impl } = gmailFetch(messages);
+
+  const stats = await syncGmailConnections(
+    depsFor(db, impl, state), [{ id: "conn-1", user_id: "user-1" }]);
+
+  check("all 14 messages were seen", stats.messagesSeen === 14, String(stats.messagesSeen));
+  check("none failed", stats.failed === 0, JSON.stringify(stats));
+  check("all 14 reached the ledger -- the exact incident this reproduces",
+    db.store.email_import_messages.length === 14, String(db.store.email_import_messages.length));
+  check("all 14 became expenses", db.store.expenses.length === 14, String(db.store.expenses.length));
+  check("all 14 expenses are the connected user's, shared, correct payer",
+    db.store.expenses.every((e) => e.created_by === "user-1" && e.kind === "shared" && e.payer === 0));
+  check("all 14 ledger rows are marked imported",
+    db.store.email_import_messages.every((m) => m.status === "imported"));
+
+  // Running again over the same (overlapping) window must not duplicate any
+  // of the 14 -- the fix restores dedupe, it does not disable it.
+  const second = await syncGmailConnections(depsFor(db, impl, state), [{ id: "conn-1", user_id: "user-1" }]);
+  check("a second run imports none of the 14 again", second.expensesImported === 0);
+  check("and counts all 14 as duplicates", second.duplicatesSkipped === 14, JSON.stringify(second));
+  check("still exactly 14 expenses", db.store.expenses.length === 14);
+  check("still exactly 14 ledger rows", db.store.email_import_messages.length === 14);
+}
+
+console.log("\n-- safe diagnostics: a claim failure is logged by stage, never by content, and still isolated --");
+{
+  // A FakeDb that reproduces the exact defect being fixed: the claim insert
+  // for email_import_messages always fails, exactly as the unmatched
+  // ON CONFLICT target did against real Postgres before
+  // email_import_ledger_fix.sql. Everything else behaves normally.
+  class ClaimFailingDb extends FakeDb {
+    insert(table: string, body: Row | Row[], prefer = ""): Promise<Row[]> {
+      if (table.startsWith("email_import_messages") && table.includes("on_conflict")) {
+        return Promise.reject(new Error(
+          "db_400: there is no unique or exclusion constraint matching the ON CONFLICT specification",
+        ));
+      }
+      return super.insert(table, body, prefer);
+    }
+  }
+  const db = new ClaimFailingDb();
+  db.store.profiles = [{ id: "user-1", household_id: "hh-1", slot: 0 }];
+  db.store.households = [{ id: "hh-1", usd_per_eur: 1.08, cop_per_eur: 4500 }];
+  db.store.household_categories = [];
+  db.store.expenses = [];
+  db.store.email_import_messages = [];
+  db.store.email_import_connections = [{ id: "conn-1", user_id: "user-1", provider: "gmail", enabled: true }];
+  db.store.email_import_credentials = [{ connection_id: "conn-1", user_id: "user-1", ciphertext: "CT", iv: "IV" }];
+
+  const state = { plaintext: JSON.stringify({ refresh_token: "rt-1" }) };
+  const messages = Array.from({ length: 14 }, (_, i) => productionShapedMessage(i));
+  const { impl } = gmailFetch(messages);
+
+  const originalError = console.error;
+  const logs: string[] = [];
+  console.error = (...args: unknown[]) => { logs.push(args.map(String).join(" ")); };
+  let stats: Awaited<ReturnType<typeof syncGmailConnections>>;
+  try {
+    stats = await syncGmailConnections(depsFor(db, impl, state), [{ id: "conn-1", user_id: "user-1" }]);
+  } finally {
+    console.error = originalError;
+  }
+
+  check("reproduces the exact incident: every message fails, none imported",
+    stats.failed === 14 && stats.expensesImported === 0, JSON.stringify(stats));
+  check("the connection itself is NOT reported failed -- these are per-message, not connection-level",
+    stats.connectionsFailed === 0 && stats.connectionsProcessed === 1);
+  check("one failing message did not stop the other 13 from being attempted",
+    stats.messagesSeen === 14);
+
+  const claimLogs = logs.filter((l) => l.includes("stage=ledger_claim"));
+  check("the failing stage is now named in the logs (this is what was missing)",
+    claimLogs.length === 14, String(claimLogs.length));
+  check("logs carry a sanitised reason", claimLogs.every((l) => l.includes("reason=")));
+  check("logs never carry the merchant name",
+    !logs.some((l) => l.includes("Éxito")));
+  check("logs never carry an amount", !logs.some((l) => /71,?362|19\.76/.test(l)));
+  check("logs never carry the subject line", !logs.some((l) => l.includes("spent at")));
+  check("logs never carry the refresh token", !logs.some((l) => l.includes("rt-1")));
+  check("logs never carry the stored ciphertext", !logs.some((l) => l.includes("ciphertext=CT") || l.includes('"CT"')));
+  check("logs identify the connection and Gmail's own message id (safe, opaque)",
+    claimLogs.every((l) => l.includes("connection=conn-1") && /gmail_id=gm-prod-\d+/.test(l)));
+
+  // No expenses either way -- but with this diagnostic layer, is a claim
+  // still even attempted for a message ledger row, or does it stay
+  // completely invisible? Because the SAME defect blocks the retry too
+  // (it's the identical insert), no row can land here -- this is the "when
+  // safely possible" boundary: the fix must not pretend to retain what a
+  // still-broken claim path genuinely cannot.
+  check("with the claim path itself broken, no ledger row can be retained (expected, not silently faked)",
+    db.store.email_import_messages.length === 0);
+  check("no expenses were created from a run that could not claim anything",
+    db.store.expenses.length === 0);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

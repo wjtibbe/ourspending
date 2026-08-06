@@ -116,6 +116,18 @@ malformed message does not stop the ones after it, one failing connection
 does not stop other users, an expired access token is refreshed and a rotated
 refresh token is honoured, and no token ever reaches the ledger.
 
+It also has dedicated regression coverage for a real production incident: 14
+production-shaped Gmail messages all reaching `email_import_messages` (not
+zero — the exact symptom when the ledger-claim insert cannot match its unique
+index; see `supabase/email_import_ledger_fix.sql`), a repeat run over the
+same messages producing zero new expenses and all 14 counted as duplicates,
+and — using a FakeDb that reproduces the exact failure mode being fixed — that
+a broken claim path logs `stage=ledger_claim` plus a sanitised reason for
+every one of the 14 (never the merchant, amount, subject, a token or
+ciphertext), that the connection is not wrongly reported as failed for a
+per-message problem, and that one failing message never stops the ones after
+it.
+
 The Wise parsing and expense rules are deliberately NOT re-tested there: both
 adapters run the same `_shared/email-import-core.ts`, so those rules are
 covered once, by `inbound-email.test.ts` and `import-core.test.ts`.
@@ -160,6 +172,7 @@ Run in the Supabase SQL editor. Each wraps itself in a transaction that ends in
     supabase/verify_email_import.sql               -> EMAIL IMPORT VERIFICATION PASSED
     supabase/verify_expense_conversion_fields.sql  -> EXPENSE CONVERSION FIELDS VERIFICATION PASSED
     supabase/verify_gmail_import.sql               -> GMAIL IMPORT VERIFICATION PASSED
+    supabase/verify_email_import_ledger_fix.sql    -> LEDGER CLAIM FIX VERIFICATION PASSED
 
 `verify_email_import.sql` additionally proves the retention contract: the
 default expiry is seven days, the purge leaves unexpired content alone, an
@@ -183,3 +196,17 @@ unreadable by every client role including the row's own owner; the
 without an alias and a Gmail one from carrying a stray alias; Gmail message
 ids dedupe per connection but not across users; and disconnecting takes the
 credential and the ledger rows with it. Verified on real PostgreSQL 16.
+
+`verify_email_import_ledger_fix.sql` proves the fix for a real production
+incident where every inbound message failed at the very first ledger insert.
+It reproduces the exact statement PostgREST issues for
+`claimMessage()`'s `on_conflict=connection_id,provider_message_id` target —
+confirmed, checked out against the pre-fix schema, to fail with "there is no
+unique or exclusion constraint matching the ON CONFLICT specification" on
+every attempt — and proves that with the fix applied: the claim lands a row,
+re-claiming the same id no-ops rather than duplicating, the same id under a
+different connection is still claimable, multiple `NULL` `provider_message_id`
+rows still never collide with each other, and the other three dedupe indexes
+(which are never targeted by an `on_conflict` upsert) are untouched and still
+partial. Verified on real PostgreSQL 16, both against a fresh database and
+after `email_import.sql`/`gmail_import.sql` have already been applied.
