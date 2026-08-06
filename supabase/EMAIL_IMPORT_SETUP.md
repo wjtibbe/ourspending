@@ -1,4 +1,20 @@
-# Wise email import — setup
+# Wise email import (Resend) — INACTIVE
+
+> **Superseded by [GMAIL_SETUP.md](GMAIL_SETUP.md).** Gmail OAuth polling
+> replaced Resend inbound forwarding: it needs no inbound domain, no MX
+> records and no forwarding confirmation, which suits a private app with a
+> handful of users.
+>
+> This guide is kept as the rollback path. The `inbound-email` function and
+> the Resend adapter are still present and still tested, and both now share
+> `_shared/email-import-core.ts` with the Gmail path.
+>
+> **Note:** `supabase/email_import.sql` is still required — the Gmail path
+> extends its tables. Do not drop it.
+
+---
+
+# Wise email import — setup (Resend)
 
 Transactions arrive as Wise notification emails instead of via the Wise API
 (personal Wise accounts cannot read balance statements). Gmail forwards those

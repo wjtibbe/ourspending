@@ -33,7 +33,14 @@ export interface Db {
   patch(path: string, body: Row, prefer?: string): Promise<Row[]>;
 }
 
-const q = (v: string) => encodeURIComponent(v);
+/**
+ * PostgREST filter-value escaping. Exported so the modules layered on top of
+ * this one can build queries without importing _shared/rest.ts, which reads
+ * the service-role key from the environment at module scope. Those modules
+ * receive their Db by parameter and must stay independent of how it was
+ * constructed.
+ */
+export const q = (v: string) => encodeURIComponent(v);
 
 // ---------------------------------------------------------------------------
 // The neutral contract

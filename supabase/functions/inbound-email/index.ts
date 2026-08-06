@@ -1,3 +1,19 @@
+// =============================================================================
+// INACTIVE -- retained as a future/alternate inbound adapter.
+// =============================================================================
+// Gmail OAuth polling replaced Resend inbound forwarding: it needs no inbound
+// domain, no MX records and no manual forwarding setup, which suits a private
+// app with a handful of users. See supabase/GMAIL_SETUP.md.
+//
+// This function is NOT part of the current setup instructions and no UI calls
+// it. It is kept, unbroken and still tested, because it is the only adapter
+// that works for a mailbox the app cannot poll -- and because rollback should
+// be a redeploy rather than a rewrite.
+//
+// Note that it now shares _shared/email-import-core.ts with the Gmail path, so
+// both adapters produce byte-identical expenses from the same email.
+// =============================================================================
+//
 // Supabase Edge Function: inbound transaction emails.
 //
 // Deploy with "Verify JWT" OFF -- an email provider cannot present a user JWT.
@@ -25,15 +41,14 @@
 import { db, q } from "../_shared/rest.ts";
 import { createResendAdapter } from "../_shared/inbound-resend.ts";
 import {
-  addressOf, aliasFromRecipients, InboundVerificationError,
+  addressOf, aliasFromRecipients,
   type InboundMessage,
 } from "../_shared/inbound-types.ts";
-import { fingerprint, wiseEmailParser } from "../_shared/parse-wise-email.ts";
-import { retentionExpiry, sanitizeForRetention } from "../_shared/sanitize.ts";
+import { wiseEmailParser } from "../_shared/parse-wise-email.ts";
+import { safeError } from "../_shared/import-core.ts";
 import {
-  classifyNormalized, createExpense, isContextFailure, resolveImportContext,
-  safeError, type NormalizedTransaction,
-} from "../_shared/import-core.ts";
+  claimMessage, importClaimedMessage, markMessage,
+} from "../_shared/email-import-core.ts";
 
 const RESEND_WEBHOOK_SECRET = Deno.env.get("RESEND_WEBHOOK_SECRET");
 const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY");
@@ -48,10 +63,8 @@ const json = (body: unknown, status = 200) =>
   });
 
 /** Records the outcome on the ledger row we already claimed. */
-async function mark(rowId: string, patch: Record<string, unknown>) {
-  await db.patch(`email_import_messages?id=eq.${q(rowId)}`, patch, "return=minimal")
-    .catch(() => {});
-}
+const mark = (rowId: string, patch: Record<string, unknown>) =>
+  markMessage(db, rowId, patch);
 
 Deno.serve(async (req) => {
   if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
@@ -103,24 +116,22 @@ Deno.serve(async (req) => {
   // ---- dedupe layer 1: the provider's own message id ----
   // Claimed BEFORE any work, so a webhook retry cannot double-import even if
   // the first attempt is still running.
-  const claimed = await db.insert(
-    "email_import_messages?on_conflict=connection_id,provider_message_id",
-    {
-      connection_id: connectionId,
-      user_id: userId,
-      source: adapter.name,
-      provider_message_id: envelope.providerMessageId,
-      from_address: addressOf(envelope.from),
-      received_at: envelope.receivedAt,
-      status: "received",
-    },
-    "resolution=ignore-duplicates,return=representation",
-  );
-  if (!claimed.length) return json({ ok: true, ignored: "duplicate_message" });
-  const rowId = String(claimed[0].id);
+  const claim = await claimMessage(db, {
+    connectionId,
+    userId,
+    source: adapter.name,
+    providerMessageId: envelope.providerMessageId,
+    fromAddress: addressOf(envelope.from),
+    receivedAt: envelope.receivedAt,
+  });
+  if (!claim.claimed) return json({ ok: true, ignored: "duplicate_message" });
+  const rowId = claim.rowId;
 
   try {
-    // ---- sender authenticity: an alias alone must not be enough ----
+    // ---- sender authenticity, checked on the ENVELOPE ----
+    // Done here rather than leaving it to the shared core purely as an
+    // optimisation: rejecting junk now avoids paying for a content fetch.
+    // The core checks it again on the full message regardless.
     if (!wiseEmailParser.recognises({ ...envelope, text: null, html: null, headers: {}, rfcMessageId: null })) {
       await mark(rowId, { status: "skipped", skip_reason: "sender_not_recognised" });
       return json({ ok: true, ignored: "sender_not_recognised" });
@@ -137,127 +148,32 @@ Deno.serve(async (req) => {
       return json({ ok: false, error: "content_fetch_failed" }, 500);
     }
 
-    // ---- retain a sanitised copy for 7 days, for parser diagnosis ----
-    // Written now, before parsing, so a message that fails at ANY later step
-    // is still diagnosable. Cleared again immediately below if it imports.
-    const retained = sanitizeForRetention(message.text, message.html);
-    if (retained.text || retained.html) {
-      await mark(rowId, {
-        raw_text: retained.text,
-        raw_html: retained.html,
-        raw_content_expires_at: retentionExpiry(new Date()),
-      });
-    }
-
-    // ---- dedupe layer 2: RFC Message-ID ----
-    if (message.rfcMessageId) {
-      const dup = await db.select(
-        `email_import_messages?connection_id=eq.${q(connectionId)}` +
-          `&rfc_message_id=eq.${q(message.rfcMessageId)}&select=id&limit=1`,
-      );
-      if (dup.length) {
-        await mark(rowId, { status: "duplicate", skip_reason: "rfc_message_id" });
-        return json({ ok: true, ignored: "duplicate_rfc_message_id" });
-      }
-      await mark(rowId, { rfc_message_id: message.rfcMessageId });
-    }
-
-    // ---- parse ----
-    const outcome = wiseEmailParser.parse(message);
-    if (!outcome.ok) {
-      await mark(rowId, {
-        status: outcome.reason === "not_a_transaction" ? "skipped" : "unparsed",
-        skip_reason: outcome.detail,
-      });
-      // 200: a marketing mail or a template we cannot read yet is not a
-      // failure the provider should retry.
-      return json({ ok: true, ignored: outcome.reason });
-    }
-    const tx: NormalizedTransaction = outcome.transaction;
-
-    // ---- dedupe layers 3 and 4: transaction reference, then fingerprint ----
-    const fp = await fingerprint({
-      userScope: connectionId,
-      merchant: tx.merchant,
-      amount: tx.amount?.value ?? null,
-      currency: tx.amount?.currency ?? null,
-      occurredAt: tx.occurredAt,
+    // ---- everything else is the SHARED pipeline ----
+    // Retention, dedupe layers 2-4, parsing, classification, household/payer
+    // resolution and expense creation all live in email-import-core.ts, so
+    // this adapter and the Gmail poller cannot drift apart.
+    const result = await importClaimedMessage(db, {
+      rowId,
+      connectionId,
+      userId,
+      message,
+      now: new Date(),
     });
 
-    for (
-      const [column, value] of [
-        ["external_ref", tx.externalRef],
-        ["fingerprint", fp],
-      ] as const
-    ) {
-      if (!value) continue;
-      const dup = await db.select(
-        `email_import_messages?connection_id=eq.${q(connectionId)}` +
-          `&${column}=eq.${q(value)}&select=id&limit=1`,
-      );
-      if (dup.length) {
-        await mark(rowId, { status: "duplicate", skip_reason: column });
-        return json({ ok: true, ignored: `duplicate_${column}` });
-      }
+    if (result.outcome === "imported") {
+      await db.patch(
+        `email_import_connections?id=eq.${q(connectionId)}`,
+        { last_message_at: new Date().toISOString(), status: "active", last_error: null },
+        "return=minimal",
+      ).catch(() => {});
+      // Counters only.
+      console.log("inbound-email: imported 1 transaction");
+      return json({ ok: true, imported: 1 });
     }
 
-    await mark(rowId, {
-      external_ref: tx.externalRef,
-      fingerprint: fp,
-      merchant: tx.merchant,
-      amount_value: tx.amount?.value ?? null,
-      amount_currency: tx.amount?.currency ?? null,
-      merchant_amount_value: tx.merchantAmount?.value ?? null,
-      merchant_amount_currency: tx.merchantAmount?.currency ?? null,
-      occurred_at: tx.occurredAt,
-    });
-
-    // ---- only completed outgoing spend becomes an expense ----
-    const classification = classifyNormalized(tx);
-    if (classification.action === "skip") {
-      await mark(rowId, { status: "skipped", skip_reason: classification.reason });
-      return json({ ok: true, ignored: classification.reason });
-    }
-
-    // ---- household, payer and rates come from the database, never the mail --
-    const ctx = await resolveImportContext(db, userId, new Date());
-    if (isContextFailure(ctx)) {
-      await mark(rowId, { status: "skipped", skip_reason: ctx.error });
-      return json({ ok: true, ignored: ctx.error });
-    }
-
-    const result = await createExpense(db, ctx, tx, {
-      sourceProvider: "wise",
-      conversionSource: wiseEmailParser.provider,
-    });
-    if (result.status === "failed") {
-      await mark(rowId, { status: "failed", error_summary: result.reason });
-      return json({ ok: true, ignored: "import_failed" });
-    }
-
-    await mark(rowId, {
-      status: "imported",
-      household_id: ctx.householdId,
-      expense_id: result.expenseId,
-      mapped_category: result.category,
-      category_source: result.categoryFallback ? "fallback" : "mapped",
-      error_summary: null,
-      // Early purge: a message that parsed cleanly needs no diagnosis, so its
-      // body goes now rather than sitting for the full seven days.
-      raw_text: null,
-      raw_html: null,
-      raw_content_expires_at: null,
-    });
-
-    await db.patch(
-      `email_import_connections?id=eq.${q(connectionId)}`,
-      { last_message_at: new Date().toISOString(), status: "active", last_error: null },
-      "return=minimal",
-    ).catch(() => {});
-
-    // Counters only.
-    console.log("inbound-email: imported 1 transaction");
-    return json({ ok: true, imported: 1 });
+    // 200 for everything else: a marketing mail, a duplicate, or a template
+    // we cannot read yet is not a failure the provider should retry.
+    return json({ ok: true, ignored: result.outcome, reason: result.reason });
   } catch (e) {
     // One malformed message must never take the endpoint down.
     console.error("inbound-email: unexpected error:", safeError(e));
