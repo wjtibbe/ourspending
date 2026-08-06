@@ -41,6 +41,14 @@ Supabase dashboard → **SQL Editor**, in this order:
 2. `supabase/verify_email_import.sql` → expect `EMAIL IMPORT VERIFICATION PASSED`
 3. `supabase/expense_conversion_fields.sql`
 4. `supabase/verify_expense_conversion_fields.sql` → expect `EXPENSE CONVERSION FIELDS VERIFICATION PASSED`
+5. `supabase/email_import_ledger_fix.sql` — **required**. Without it, every
+   inbound message (Resend or Gmail) fails at the very first ledger insert —
+   `email_import_messages?on_conflict=connection_id,provider_message_id`
+   cannot match the partial unique index `email_import.sql` originally
+   created, so PostgREST rejects the claim for 100% of messages regardless
+   of anything else being configured correctly. See
+   `supabase/GMAIL_SETUP.md` §17 for the full root-cause writeup.
+6. `supabase/verify_email_import_ledger_fix.sql` → expect `LEDGER CLAIM FIX VERIFICATION PASSED`
 
 | Table | Purpose |
 |---|---|

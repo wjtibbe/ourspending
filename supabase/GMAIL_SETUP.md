@@ -24,6 +24,13 @@ Supabase dashboard → **SQL Editor**, in this order:
 2. `supabase/expense_conversion_fields.sql` *(if not already applied)*
 3. `supabase/gmail_import.sql`
 4. `supabase/verify_gmail_import.sql` → expect `GMAIL IMPORT VERIFICATION PASSED`
+5. `supabase/email_import_ledger_fix.sql` — **required**, even if you already ran everything above
+6. `supabase/verify_email_import_ledger_fix.sql` → expect `LEDGER CLAIM FIX VERIFICATION PASSED`
+
+Step 5 fixes a real defect: without it, **every** message fails at the very
+first ledger insert (`messagesSeen` > 0, everything else 0, `failed` equal to
+`messagesSeen`, `email_import_messages` staying completely empty) regardless
+of how correctly everything else is configured. See §17.
 
 | Table | Purpose |
 |---|---|
@@ -363,3 +370,56 @@ use under the 100-user cap.
 
 No domain-wide delegation, no service account impersonation, in either
 Testing or Production. Each user authorises their own mailbox individually.
+
+---
+
+## 17. Fixed: every message failing at the ledger claim (messagesSeen > 0, everything else 0)
+
+If you connected Gmail before `email_import_ledger_fix.sql` existed, a sync
+would report something like:
+
+    messagesSeen: 14, expensesImported: 0, duplicatesSkipped: 0,
+    unparsed: 0, skipped: 0, failed: 14
+
+with `email_import_messages` staying completely empty — Gmail access, OAuth,
+scopes, the query and the parser were all fine; nothing ever got the chance
+to reach them.
+
+**Root cause.** `claimMessage()` — the very first step of importing any
+message, Resend or Gmail — claims dedupe key 1 via PostgREST's
+`on_conflict=connection_id,provider_message_id`, which generates
+`ON CONFLICT (connection_id, provider_message_id) DO NOTHING` with no `WHERE`
+clause (PostgREST's `on_conflict` parameter has no syntax for one). Postgres
+only matches a bare `ON CONFLICT (columns)` against a unique index that is
+*also* unconditional — and the only index on those two columns was **partial**
+(`where provider_message_id is not null`, from `email_import.sql`). Every
+claim attempt was rejected with `there is no unique or exclusion constraint
+matching the ON CONFLICT specification`, for every message, deterministically.
+
+This was latent from the moment `email_import.sql` first shipped — the
+Node test suite's mocked database doesn't replicate Postgres's exact
+`ON CONFLICT` target-matching rules, and `verify_email_import.sql` inserts
+with plain SQL, never through PostgREST's `on_conflict`. It only became
+visible once a real sync actually went through the live PostgREST endpoint.
+
+**Fixed by** `email_import_ledger_fix.sql`, which replaces that one index
+with a non-partial equivalent. This is not a widening: ordinary SQL `UNIQUE`
+semantics already let multiple `NULL` `provider_message_id` rows coexist —
+that guarantee was never what the `WHERE` clause provided, so nothing about
+duplicate protection changes. `verify_email_import_ledger_fix.sql` proves
+this against the exact insert shape PostgREST sends.
+
+**If you already applied everything else**, running `email_import_ledger_fix.sql`
+is the only step you need — it does not require re-running `email_import.sql`
+or `gmail_import.sql`, and your existing connection, OAuth grant and
+credentials are untouched.
+
+**Diagnosing a claim failure, if one happens again for any other reason:**
+the Edge Function logs now name the exact stage —
+
+    gmail-sync: message failed stage=ledger_claim connection=<id> gmail_id=<id> reason=<safe code>
+
+— instead of only an aggregate `failed` counter. Never the subject, merchant,
+amount or a token; always enough to know which of "couldn't fetch from
+Gmail," "couldn't read the MIME payload," or "the ledger insert itself
+failed" actually happened.

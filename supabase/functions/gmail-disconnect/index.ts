@@ -16,18 +16,29 @@ import { decryptToken } from "../_shared/crypto.ts";
 import { revokeToken } from "../_shared/gmail.ts";
 import { safeError } from "../_shared/import-core.ts";
 
+// Matches provider-connect's established pattern. supabase-js's
+// functions.invoke() always sends apikey and x-client-info alongside
+// authorization and content-type -- omitting either from Allow-Headers
+// makes the browser's CORS preflight fail closed with no error surfaced to
+// this function at all: the request never arrives, only the OPTIONS does.
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), {
     status,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Headers": "authorization, content-type",
-    },
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
   });
 
 Deno.serve(async (req) => {
-  if (req.method === "OPTIONS") return json({ ok: true });
+  // Answered before anything else, and unauthenticated: the platform lets an
+  // OPTIONS preflight through even with "Verify JWT" on, but only if the
+  // function itself replies -- and the reply must carry these headers or the
+  // browser blocks the real request that would have followed.
+  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
   if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
 
   const user = await currentUser(req);

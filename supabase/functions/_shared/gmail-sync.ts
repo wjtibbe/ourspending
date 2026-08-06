@@ -18,7 +18,7 @@
 
 import type { Db, Row } from "./import-core.ts";
 import { q, safeError } from "./import-core.ts";
-import { claimMessage, importClaimedMessage } from "./email-import-core.ts";
+import { claimMessage, importClaimedMessage, markMessage } from "./email-import-core.ts";
 import { gmailToInboundMessage, type GmailMessage } from "./gmail-message.ts";
 import {
   buildWiseQuery, getMessage, GmailError, listMessageIds, needsReconnect,
@@ -126,6 +126,53 @@ async function accessTokenFor(
   return refreshed.accessToken;
 }
 
+/**
+ * Records a message failure that happened BEFORE (or instead of) a normal
+ * claim -- a Gmail fetch error, an unreadable MIME payload, or the claim
+ * insert itself failing. Two things, both best-effort and both safe:
+ *
+ *   1. A log line naming the STAGE and a sanitised error code -- Gmail's own
+ *      message id and the connection id are opaque platform identifiers, not
+ *      content, so they are safe to log; the subject, body, merchant, amount
+ *      and any token never are and never appear here.
+ *   2. An attempt to claim (or re-use an already-claimed) ledger row and
+ *      mark it failed, so the failure has a durable trace instead of only
+ *      ever existing as an aggregate counter. This reuses claimMessage()
+ *      itself, so it is exactly as duplicate-safe as the normal path: if a
+ *      row already exists for this id, this is a no-op.
+ *
+ * Deliberately swallows its own errors: a ledger that is itself unreachable
+ * must not turn a per-message failure into a second, unhandled exception.
+ */
+async function recordPreClaimFailure(
+  deps: GmailSyncDeps,
+  conn: GmailConnectionRow,
+  gmailId: string,
+  stage: string,
+  reason: string,
+): Promise<void> {
+  console.error(
+    `gmail-sync: message failed stage=${stage} connection=${conn.id} gmail_id=${gmailId} reason=${reason}`,
+  );
+  try {
+    const claim = await claimMessage(deps.db, {
+      connectionId: conn.id,
+      userId: conn.user_id,
+      source: "gmail",
+      providerMessageId: gmailId,
+      fromAddress: null,
+      receivedAt: deps.now().toISOString(),
+    });
+    if (claim.claimed) {
+      await markMessage(deps.db, claim.rowId, { status: "failed", error_summary: reason });
+    }
+  } catch {
+    // The ledger itself is unavailable. The log line above is the only
+    // remaining diagnostic, and it must not be masked by a second exception
+    // escaping this best-effort path.
+  }
+}
+
 /** Collects matching message ids across pages, bounded. */
 async function collectIds(
   deps: GmailSyncDeps,
@@ -184,11 +231,24 @@ export async function syncOneConnection(
 
   for (const id of ids) {
     stats.messagesSeen++;
+    // Tracked so a failure caught below can log exactly where it happened --
+    // "message failed" alone, with no stage, is what hid the ledger-claim
+    // bug: every one of 14 messages failed the same way and there was no way
+    // to tell claim-insert-rejected apart from Gmail-fetch-failed apart from
+    // unreadable-MIME without this.
+    let stage = "gmail_fetch";
     try {
       const raw = await getMessage({ accessToken, id }, deps.fetchImpl) as GmailMessage;
-      const message = gmailToInboundMessage(raw);
-      if (!message) { stats.failed++; continue; }
 
+      stage = "mime_adapt";
+      const message = gmailToInboundMessage(raw);
+      if (!message) {
+        await recordPreClaimFailure(deps, conn, id, stage, "no_usable_id");
+        stats.failed++;
+        continue;
+      }
+
+      stage = "ledger_claim";
       const claim = await claimMessage(deps.db, {
         connectionId: conn.id,
         userId: conn.user_id,
@@ -201,6 +261,7 @@ export async function syncOneConnection(
       });
       if (!claim.claimed) { stats.duplicatesSkipped++; continue; }
 
+      stage = "import";
       const result = await importClaimedMessage(deps.db, {
         rowId: claim.rowId,
         connectionId: conn.id,
@@ -219,6 +280,7 @@ export async function syncOneConnection(
       // every remaining message would fail the same way, so stop this
       // connection and let the others carry on.
       if (needsReconnect(e)) throw e;
+      await recordPreClaimFailure(deps, conn, id, stage, safeError(e));
       stats.failed++;
     }
   }
@@ -256,8 +318,9 @@ export async function syncGmailConnections(
         status: "error",
         last_error: code,
       });
-      // Counters only -- never the address, the mailbox or the error body.
-      console.error("gmail-sync: connection failed:", code);
+      // A connection id and a sanitised code -- never the mailbox address,
+      // an email body, or the raw exception text.
+      console.error(`gmail-sync: connection failed connection=${conn.id} reason=${code}`);
     }
   }
 
