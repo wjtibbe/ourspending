@@ -167,6 +167,25 @@ console.log("\n-- 4. Spotify maps to Subscriptions --");
   })).category === "subscriptions");
 }
 
+console.log("\n-- 4b. real merchants reported as mis-categorized, now fixed --");
+{
+  const db = new FakeDb();
+  const noAi = null; // deterministic keyword layer must resolve these without ever reaching AI.
+  for (const [merchant, expected] of [
+    ["D1", "groceries"],
+    ["Butcher eficarnes", "groceries"],
+    ["Crepes y gelato", "dining"],
+  ] as const) {
+    const result = await categorizeTransaction(db as any, {
+      householdId: "hh-1", merchant, categoryInput: { description: merchant },
+      allowed: ALLOWED, aiClassifier: noAi,
+    });
+    check(`"${merchant}" -> ${expected}`, result.category === expected, JSON.stringify(result));
+    check(`"${merchant}" resolved deterministically, not via AI/fallback`,
+      result.provenance === "keyword" || result.provenance === "global_rule", result.provenance);
+  }
+}
+
 console.log("\n-- 5. unknown merchant reaches AI fallback --");
 {
   const db = new FakeDb();

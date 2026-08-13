@@ -41,9 +41,19 @@ const ALIAS_GROUPS: Record<AppCategory, string[]> = {
     // Named Colombian supermarket chains -- brand names, not generic words,
     // but common enough in Wise merchant strings to be worth matching directly.
     "exito", "jumbo", "carulla",
+    // "butcher"/"carniceria" are generic-word keywords (participate in the
+    // word-loop below like any other alias). "d1" is deliberately NOT a
+    // generic keyword: at 2 characters it is shorter than the word-loop's
+    // 3-character floor (see lookupText's `phrase.length < 3` guard, which
+    // exists precisely to stop short tokens from matching noisily inside
+    // unrelated longer strings), so it can only ever match via the
+    // full-string direct lookup at the top of lookupText -- i.e. only when
+    // "D1" (a real discount-supermarket chain) is the *entire* normalized
+    // merchant name, never as a substring of something else.
+    "butcher", "carniceria", "d1",
   ],
   snacks: [
-    "snacks", "snack", "drinks", "beverages", "coffee", "coffee shop", "cafe",
+    "snacks", "snack", "drinks", "beverages", "coffee", "coffee shop",
     "kiosk", "convenience store",
     "snoep", "frisdrank", "koffie", "tussendoortjes",
     "bebidas", "cafeteria", "refrescos", "botanas", "dulces",
@@ -51,7 +61,10 @@ const ALIAS_GROUPS: Record<AppCategory, string[]> = {
   dining: [
     "dining", "dining out", "restaurant", "restaurants", "restaurants and bars",
     "bars", "bar", "pub", "fast food", "takeaway", "take away", "food delivery",
-    "eating out", "food and drink", "pizza", "burger", "crepes",
+    "eating out", "food and drink", "pizza", "burger", "crepes", "gelato",
+    // "cafe" moves here from snacks: a household ordering food/drink at a
+    // cafe is "going out" the same way a restaurant visit is.
+    "cafe",
     "uit eten", "eten bestellen", "afhaal", "eetcafe",
     "restaurante", "restaurantes", "comida", "comida rapida", "cena", "almuerzo",
   ],
