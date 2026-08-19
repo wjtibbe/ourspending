@@ -176,12 +176,24 @@ To pause: `select cron.unschedule('gmail-daily-sync');`
 Not required — the sender+date search is already narrow. Use this if you want
 an explicit allowlist you control from Gmail.
 
-1. Gmail → **Settings → Filters → Create a new filter**, From: `noreply@wise.com`
+1. Gmail → **Settings → Filters → Create a new filter**, From:
+   `wise.com OR transferwise.com`
 2. Tick **Apply the label**, create one called `Wise Import`
 3. `supabase secrets set GMAIL_LABEL="Wise Import"`
 
 The app then reads only messages carrying that label. No forwarding, no
 confirmation code, no password.
+
+> **Match the filter to the domains, not to one address.** A filter on the
+> single address `noreply@wise.com` will not label a card-payment notice sent
+> from any other Wise address, and a message the label never reaches is a
+> message the sync never sees — with no error, no skip and no ledger row to
+> explain its absence. That asymmetry is exactly the bug that made the search
+> itself miss transactions; do not reintroduce it here.
+
+If `GMAIL_LABEL` is set and imports stop, check this filter first: the sync
+response reports the exact query it used (`queryUsed`) and how many messages
+Gmail returned for it (`gmailMessagesListed`).
 
 ---
 
