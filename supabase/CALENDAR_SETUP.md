@@ -3,7 +3,7 @@
 ## 1. Database (required — do this first)
 
 Supabase dashboard → **SQL Editor** → New query → paste the contents of
-`supabase/calendar.sql` → **Run**.
+`supabase/migrations/20260727214607_calendar.sql` → **Run**.
 
 This creates three tables and leaves all existing data untouched:
 

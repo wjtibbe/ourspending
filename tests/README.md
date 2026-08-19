@@ -11,6 +11,7 @@ Functions import, using Node's native type stripping (Node 22.6+).
     node --experimental-strip-types tests/inbound-email.test.ts
     node --experimental-strip-types tests/gmail-import.test.ts
     node --experimental-strip-types tests/gmail-cors.test.ts
+    node --experimental-strip-types tests/merchant-categorization.test.ts
     node tests/expense-display.test.js
 
 `categories.test.ts` covers the mapping layer: multilingual aliases, MCC codes,
@@ -119,7 +120,7 @@ refresh token is honoured, and no token ever reaches the ledger.
 It also has dedicated regression coverage for a real production incident: 14
 production-shaped Gmail messages all reaching `email_import_messages` (not
 zero — the exact symptom when the ledger-claim insert cannot match its unique
-index; see `supabase/email_import_ledger_fix.sql`), a repeat run over the
+index; see `supabase/migrations/20260806211500_email_import_ledger_fix.sql`), a repeat run over the
 same messages producing zero new expenses and all 14 counted as duplicates,
 and — using a FakeDb that reproduces the exact failure mode being fixed — that
 a broken claim path logs `stage=ledger_claim` plus a sanitised reason for
@@ -149,6 +150,29 @@ signed-in POST to `gmail-oauth-start` still returns a usable Google consent
 URL with no secret in the response. Checked out against the pre-fix code, 33
 of these assertions fail; against the fix, all pass.
 
+`merchant-categorization.test.ts` drives `_shared/merchant-categorization.ts`
+— the five-layer categoriser (household rule → existing global/keyword
+mapping via `resolveCategory` → AI → `other`) that `email-import-core.ts`
+calls for every Wise Gmail import. It proves priority order end to end: a
+household's own learned rule beats every other source (and a rule pointing
+at a category the household has since disabled is not resurrected — it falls
+through to the keyword layer instead); `normalizeMerchant()` collapses
+`UBER *TRIP` / `Uber BV` / `UBER COLOMBIA` onto the same normalized form
+without merging genuinely different merchants like `Uber Eats`; the EN/ES/NL
+keyword groups (transport, groceries, dining, subscriptions, entertainment)
+each map every listed word to the same canonical category; an unrecognised
+merchant reaches the AI classifier with exactly `{merchant, subject,
+categories}` and nothing amount/currency/email-shaped; a low-confidence
+(<0.85) or invalid AI reply is discarded in favour of `other`, at an exact
+boundary check on `AI_CONFIDENCE_THRESHOLD`; a throwing, disabled, or hung AI
+classifier never blocks categorisation, and `createAiClassifier`'s own
+10-second `AbortController` timeout resolves to `null` rather than hanging;
+a manually-taught household rule is picked up by later imports for the same
+merchant without rewriting any historical expense already stored under the
+old category; one household's rule never leaks into another's; and a broken
+rule lookup still falls through to the keyword layer rather than failing the
+import.
+
 `expense-display.test.js` drives `expense-display.js` — the pure function
 `app.js` uses to decide what an expense row's large/small amounts show. It
 proves: a display currency matching the deducted amount shows that amount
@@ -173,6 +197,7 @@ Run in the Supabase SQL editor. Each wraps itself in a transaction that ends in
     supabase/verify_expense_conversion_fields.sql  -> EXPENSE CONVERSION FIELDS VERIFICATION PASSED
     supabase/verify_gmail_import.sql               -> GMAIL IMPORT VERIFICATION PASSED
     supabase/verify_email_import_ledger_fix.sql    -> LEDGER CLAIM FIX VERIFICATION PASSED
+    supabase/verify_merchant_category_rules.sql    -> MERCHANT CATEGORY RULES VERIFICATION PASSED
 
 `verify_email_import.sql` additionally proves the retention contract: the
 default expiry is seven days, the purge leaves unexpired content alone, an
@@ -210,3 +235,15 @@ rows still never collide with each other, and the other three dedupe indexes
 (which are never targeted by an `on_conflict` upsert) are untouched and still
 partial. Verified on real PostgreSQL 16, both against a fresh database and
 after `email_import.sql`/`gmail_import.sql` have already been applied.
+
+`verify_merchant_category_rules.sql` proves the household-learned-rule table:
+a household can create and read its own rule; re-teaching the same merchant
+updates the existing row in place rather than duplicating it; another
+household can neither read, update, nor insert into the first household's
+rows, but can freely create its own rule for the same normalized merchant
+because the unique constraint is per-household; a second rule for the same
+household+merchant is rejected as a `unique_violation`; the `anon` role has
+no privilege on the table at all; and a blank or whitespace-only
+`normalized_merchant` is rejected by a CHECK constraint. Verified on real
+PostgreSQL 16, including a clean idempotent re-run of the migration and a
+re-run of every pre-existing verify script above with no regression.

@@ -27,8 +27,8 @@ once an hour — see [The hourly import](#the-hourly-import).
 Supabase dashboard → **SQL Editor** → New query → paste each file below and
 **Run**, in this order:
 
-1. `supabase/provider_connections.sql` — the connection + credential tables
-2. `supabase/wise_transactions.sql` — the import ledger and the run log
+1. `supabase/migrations/20260803034033_provider_connections.sql` — the connection + credential tables
+2. `supabase/migrations/20260803035849_wise_transactions.sql` — the import ledger and the run log
 3. `supabase/wise_cron.sql` — the hourly schedule (do this **last**, after the
    Edge Functions are deployed and the secrets are set)
 
@@ -53,8 +53,8 @@ Then verify, which proves the guarantees rather than assuming them:
 It runs inside a transaction that ends in `ROLLBACK`, so it cannot touch real
 data.
 
-> **Note:** `supabase/multiuser.sql` depends on `public.touch_updated_at()`,
-> which is created by `supabase/calendar.sql`. If you have not run
+> **Note:** `supabase/migrations/20260729012421_multiuser.sql` depends on `public.touch_updated_at()`,
+> which is created by `supabase/migrations/20260727214607_calendar.sql`. If you have not run
 > `calendar.sql` yet, run it before `multiuser.sql`, or `multiuser.sql` will
 > stop partway through. `provider_connections.sql` creates that function
 > itself, so it is safe to run in any order.
@@ -275,7 +275,7 @@ Why something was skipped:
 
 ## Adding another provider later
 
-1. `supabase/provider_connections.sql` — add the id to the `provider` CHECK
+1. `supabase/migrations/20260803034033_provider_connections.sql` — add the id to the `provider` CHECK
    constraint.
 2. `supabase/functions/provider-connect/index.ts` — add an entry to `ADAPTERS`
    with a `verify(token)` that returns non-secret display metadata or throws.

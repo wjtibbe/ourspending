@@ -22,7 +22,7 @@
 // its own ledger row and then calls into this module, so the "which row is
 // this" question stays with the code that knows the answer.
 
-import { resolveCategory, APP_CATEGORIES, type CategoryInput } from "./categories.ts";
+import { resolveCategory, APP_CATEGORIES, type AppCategory, type CategoryInput } from "./categories.ts";
 
 export type Row = Record<string, unknown>;
 
@@ -225,6 +225,26 @@ export type ImportProvenance = {
   conversionSource?: string | null;
 };
 
+/**
+ * A category already decided by a caller -- e.g. the layered household-rule
+ * / global-mapping / keyword / AI pipeline in
+ * _shared/merchant-categorization.ts -- bypassing resolveCategory() entirely.
+ *
+ * Optional and fully backward compatible: every existing caller that has
+ * never heard of this (every test in import-core.test.ts included) omits it
+ * and gets exactly today's behaviour. `source` is caller-defined free text --
+ * import-core does not interpret it beyond the literal string "fallback",
+ * which is what makes `categoryFallback` in ImportOutcome true. Passing the
+ * SAME string a caller intends to store as categorisation provenance (e.g.
+ * "household_rule") means one value flows end to end with no translation
+ * step and no second place that can drift out of sync with the first.
+ */
+export type CategoryOverride = {
+  category: AppCategory;
+  source: string;
+  matched: string | null;
+};
+
 /** YYYY-MM-DD for the app's `spent_on` date column. */
 export function spentOn(tx: NormalizedTransaction, fallback: Date): string {
   const d = tx.occurredAt ? new Date(tx.occurredAt) : null;
@@ -247,11 +267,12 @@ export function buildExpenseRow(
   ctx: ImportContext,
   tx: NormalizedTransaction,
   provenance: ImportProvenance = {},
-): { row: ExpenseRow; category: ReturnType<typeof resolveCategory> } {
+  categoryOverride?: CategoryOverride,
+): { row: ExpenseRow; category: { category: AppCategory; source: string; matched: string | null } } {
   const rate = perEur(tx.amount.currency, ctx.rates);
   if (!Number.isFinite(rate) || rate <= 0) throw new Error("missing_household_rate");
 
-  const category = resolveCategory(tx.categoryInput, ctx.allowed);
+  const category = categoryOverride ?? resolveCategory(tx.categoryInput, ctx.allowed);
 
   // A real conversion only when the merchant's own amount is in a DIFFERENT
   // currency from what was actually deducted -- a provider that echoes the
@@ -300,9 +321,10 @@ export async function createExpense(
   ctx: ImportContext,
   tx: NormalizedTransaction,
   provenance: ImportProvenance = {},
+  categoryOverride?: CategoryOverride,
 ): Promise<ImportOutcome> {
   try {
-    const { row, category } = buildExpenseRow(ctx, tx, provenance);
+    const { row, category } = buildExpenseRow(ctx, tx, provenance, categoryOverride);
     const inserted = await db.insert("expenses", row);
     return {
       status: "imported",

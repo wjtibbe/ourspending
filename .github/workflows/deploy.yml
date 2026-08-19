@@ -1,0 +1,193 @@
+name: Deploy to Supabase (production)
+
+# Runs only after change reaches main. Never runs from a pull request and
+# never from a feature branch.
+on:
+  push:
+    branches: [main]
+    # Nothing here can change the database or a function, so a docs-only or
+    # frontend-only merge does not spend a production deploy. Vercel handles
+    # the frontend from main independently of this workflow.
+    paths:
+      - 'supabase/migrations/**'
+      - 'supabase/functions/**'
+      - 'supabase/config.toml'
+      - '.github/workflows/deploy.yml'
+  # Manual re-run: after rotating a secret, or to redeploy unchanged code.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A second merge cannot start a deploy while one is mid-flight. Not cancelling
+# in progress: interrupting a run *between* `db push` and `functions deploy`
+# would leave the schema ahead of the code.
+concurrency:
+  group: supabase-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Guard: production stays untouched until the migration baseline is done.
+  # ---------------------------------------------------------------------
+  # supabase/migrations/ holds eleven migrations that were originally applied
+  # by hand, so the project has no record of them. Until `migration repair`
+  # tells the project which of those are already applied, a `db push` would
+  # try to replay them. This gate exists so merging CI is not the same event
+  # as arming CI.
+  #
+  # Enable by creating repository VARIABLE (not secret):
+  #   Settings -> Secrets and variables -> Actions -> Variables -> New
+  #   Name: PRODUCTION_DEPLOY_ENABLED   Value: true
+  #
+  # It stays a kill switch afterwards: set it to anything else to halt
+  # production deploys immediately, with no code change and no revert.
+  guard:
+    name: Deploy guard
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - id: check
+        env:
+          FLAG: ${{ vars.PRODUCTION_DEPLOY_ENABLED }}
+        run: |
+          set -euo pipefail
+          if [ "${FLAG:-}" = "true" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "### Production deploy ARMED" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Production deploy SKIPPED (guard is off)"
+              echo ""
+              echo "Repository variable \`PRODUCTION_DEPLOY_ENABLED\` is not \`true\`."
+              echo "Tests still ran. The database and Edge Functions were not touched."
+              echo ""
+              echo "Complete the migration baseline in DEPLOYMENT.md, then set the"
+              echo "variable to \`true\` to arm automatic deploys."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # Always runs, even while the guard is off, so main keeps a green/red signal.
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Run test suite
+        run: |
+          set -euo pipefail
+          failed=0
+          for f in tests/*.test.ts tests/*.test.js; do
+            echo "::group::$f"
+            if node --experimental-strip-types "$f"; then
+              echo "OK $f"
+            else
+              echo "::error file=$f::test file failed"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $failed
+
+  deploy:
+    name: Migrate and deploy functions
+    runs-on: ubuntu-latest
+    # A failing test suite stops the deploy: this job never starts.
+    needs: [guard, test]
+    if: needs.guard.outputs.enabled == 'true'
+    environment: production
+    steps:
+      # The exact merged commit, not a moving ref.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      # Non-interactive: the CLI reads SUPABASE_ACCESS_TOKEN and
+      # SUPABASE_DB_PASSWORD from the environment, so there is no
+      # `supabase login`, no prompt, and no secret on a command line (which
+      # would be visible in the runner's process list).
+      - name: Link project
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+          PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
+        run: supabase link --project-ref "$PROJECT_ID"
+
+      # Recorded in the log before anything is applied, so the run itself
+      # documents which migrations were considered pending.
+      - name: Show migration status
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+        run: supabase migration list --linked
+
+      # What WOULD be applied, printed before it is applied.
+      - name: Dry-run pending migrations
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+        run: supabase db push --linked --dry-run
+
+      # Applies ONLY migrations not already recorded in the project's
+      # supabase_migrations.schema_migrations table. Already-applied files are
+      # skipped, never re-run.
+      - name: Apply pending migrations
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+        run: supabase db push --linked
+
+      # Explicit allowlist, never `supabase functions deploy` with no name:
+      # that would deploy every folder under supabase/functions/, including
+      # three whose own headers say they must not be deployed
+      # (provider-connect, wise-sync: OBSOLETE; inbound-email: INACTIVE).
+      #
+      # verify_jwt for each function comes from supabase/config.toml, so no
+      # --no-verify-jwt flag is needed or wanted here.
+      #
+      # Reached only if every migration step above succeeded: a failed step
+      # skips the remaining steps in this job, so a migration failure stops
+      # the function deploy.
+      - name: Deploy Edge Functions
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          for fn in \
+            gmail-sync \
+            gmail-oauth-start \
+            gmail-oauth-callback \
+            gmail-disconnect \
+            scan-receipt \
+            calendar-feed
+          do
+            echo "::group::deploy $fn"
+            supabase functions deploy "$fn" --project-ref "$PROJECT_ID"
+            echo "::endgroup::"
+          done
+
+      # Deploying never deletes anything. A function that exists in the
+      # project but not in this allowlist is left exactly as it is.
+      - name: Summary
+        if: success()
+        run: |
+          {
+            echo "### Supabase production deploy complete"
+            echo ""
+            echo "- Commit: \`${{ github.sha }}\`"
+            echo "- Migrations: pending only (already-applied ones skipped)"
+            echo "- Functions deployed: gmail-sync, gmail-oauth-start,"
+            echo "  gmail-oauth-callback, gmail-disconnect, scan-receipt, calendar-feed"
+            echo "- Not deployed, not deleted: provider-connect, wise-sync, inbound-email"
+          } >> "$GITHUB_STEP_SUMMARY"

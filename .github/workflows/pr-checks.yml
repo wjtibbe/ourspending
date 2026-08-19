@@ -1,0 +1,129 @@
+name: PR checks
+
+# Validation only. This workflow never touches production: it holds no
+# Supabase credentials, so there is nothing here that could deploy even if a
+# step were changed by mistake.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Node tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 22.x covers --experimental-strip-types, which is how these tests run
+      # the Edge Functions' own .ts modules with no build step.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run test suite
+        run: |
+          set -euo pipefail
+          failed=0
+          for f in tests/*.test.ts tests/*.test.js; do
+            echo "::group::$f"
+            if node --experimental-strip-types "$f"; then
+              echo "OK $f"
+            else
+              echo "::error file=$f::test file failed"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $failed
+
+  edge-functions:
+    name: Edge Function type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      # Catches a broken import or a type error before it can reach a deploy.
+      # These functions have no remote dependencies, so this needs no network.
+      - name: Type check active functions
+        run: |
+          set -euo pipefail
+          deno check \
+            supabase/functions/gmail-sync/index.ts \
+            supabase/functions/gmail-oauth-start/index.ts \
+            supabase/functions/gmail-oauth-callback/index.ts \
+            supabase/functions/gmail-disconnect/index.ts \
+            supabase/functions/scan-receipt/index.ts \
+            supabase/functions/calendar-feed/index.ts
+
+  migrations:
+    name: Migration hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Structural guarantees that are cheap to check and expensive to get
+      # wrong: naming, ordering, and above all that no rollback-style verify_
+      # script can ever be picked up as a production migration.
+      - name: Validate migration filenames and ordering
+        run: |
+          set -euo pipefail
+          dir=supabase/migrations
+          if [ ! -d "$dir" ]; then
+            echo "::error::$dir is missing"; exit 1
+          fi
+
+          bad=0
+          prev=""
+          for f in "$dir"/*.sql; do
+            base=$(basename "$f")
+
+            if ! echo "$base" | grep -Eq '^[0-9]{14}_[a-z0-9_]+\.sql$'; then
+              echo "::error file=$f::name must be <14-digit-timestamp>_<snake_case>.sql"
+              bad=1; continue
+            fi
+
+            case "$base" in
+              *verify_*)
+                echo "::error file=$f::verify_* scripts roll back and must never be a migration"
+                bad=1 ;;
+            esac
+
+            ts=${base%%_*}
+            if [ -n "$prev" ] && [ "$ts" = "$prev" ]; then
+              echo "::error file=$f::duplicate migration timestamp $ts"
+              bad=1
+            fi
+            prev=$ts
+          done
+
+          # ls sorts lexicographically; for zero-padded fixed-width timestamps
+          # that is the same as chronological order, so a mismatch here means a
+          # filename would apply out of order.
+          if ! ls "$dir"/*.sql | sort -c 2>/dev/null; then
+            echo "::error::migration filenames are not in ascending order"
+            bad=1
+          fi
+
+          exit $bad
+
+      - name: Confirm verify scripts stayed out of migrations
+        run: |
+          set -euo pipefail
+          if ls supabase/verify_*.sql >/dev/null 2>&1; then
+            echo "verify_* scripts present in supabase/ (correct - manual/debug use only):"
+            ls supabase/verify_*.sql
+          fi
+          if ls supabase/migrations/*verify* >/dev/null 2>&1; then
+            echo "::error::a verify script leaked into supabase/migrations/"; exit 1
+          fi

@@ -198,6 +198,35 @@ const todayStr = () => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 };
 const catById = id => catEntry(id) || BUILTIN_CATEGORIES[BUILTIN_CATEGORIES.length - 1];
+
+// Merchant normalization for learned household categorisation rules.
+//
+// Mirrors normalizeMerchant() in
+// supabase/functions/_shared/merchant-categorization.ts EXACTLY -- this repo
+// has no build step to share code between the Deno backend and this classic
+// script, so the two are kept in sync by hand, the same way perEur()/fmt()
+// already are. If you change one, change the other: a rule taught here must
+// normalize to the SAME value the import pipeline looks up, or it silently
+// never matches.
+const MERCHANT_STRIP_PREFIXES = ["sq", "tst", "sp", "paypal", "www"];
+const MERCHANT_STRIP_SUFFIXES = [
+  "bv", "inc", "llc", "ltd", "sa", "nv", "gmbh", "corp", "co", "com",
+  "colombia", "netherlands", "nederland", "usa", "us", "uk", "eu",
+];
+const normalizeMerchantForRule = raw => {
+  const display = String(raw ?? "").trim();
+  if (!display) return { normalized: "", display: "" };
+  let s = display.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  s = s.split("*")[0];
+  s = s.replace(/[^a-z0-9\s]+/g, " ");
+  const words = s.split(/\s+/).filter(Boolean);
+  while (words.length > 1 && MERCHANT_STRIP_PREFIXES.includes(words[0])) words.shift();
+  while (words.length > 1 && MERCHANT_STRIP_SUFFIXES.includes(words[words.length - 1])) words.pop();
+  return { normalized: words.join(" ").trim(), display };
+};
+const GENERIC_MERCHANT_NAMES = new Set(["imported transaction", "transaction", "payment", "purchase", "unknown"]);
+const isGenericMerchantName = normalized => !normalized || normalized.length < 3 || GENERIC_MERCHANT_NAMES.has(normalized);
+
 // Downscale a receipt photo to a small JPEG and return raw base64 (no data: prefix).
 const resizeReceiptImage = file => new Promise((resolve, reject) => {
   const reader = new FileReader();
@@ -1074,6 +1103,8 @@ function Dashboard({
       setEditingExpense(null);
       setTab("overview");
     },
+    user: user,
+    hhId: hhId,
     people: people,
     colors: colors,
     rates: rates,
@@ -1567,6 +1598,8 @@ function Overview({
 
 // ---------- Add expense ----------
 function AddExpense({
+  user,
+  hhId,
   people,
   colors,
   rates,
@@ -1583,6 +1616,7 @@ function AddExpense({
   const [currency, setCurrency] = useState(editingExpense ? editingExpense.currency : defaultCurrency);
   const [kind, setKind] = useState(editingExpense ? editingExpense.kind : "shared");
   const [payer, setPayer] = useState(editingExpense ? editingExpense.payer : 0);
+  const [confirmLearnRule, setConfirmLearnRule] = useState(null);
   const [category, setCategory] = useState(() => {
     if (editingExpense) return editingExpense.category;
     const act = activeCategories();
@@ -1646,12 +1680,53 @@ function AddExpense({
       note: note.trim()
     };
     if (editingExpense) {
+      // "Always categorize X as Y?" only for an imported expense whose
+      // category the user just changed, and only for a real merchant name --
+      // a rule keyed on nothing, or on the placeholder this app writes when
+      // a provider gave no merchant at all, would either never match or
+      // match everything.
+      const merchantName = (editingExpense.note || "").trim();
+      const {
+        normalized
+      } = normalizeMerchantForRule(merchantName);
+      const eligible = editingExpense.source_provider === "wise" && category !== editingExpense.category && hhId && user && !isGenericMerchantName(normalized);
+      if (eligible) {
+        setConfirmLearnRule({
+          exp,
+          normalized,
+          display: merchantName,
+          categoryId: category
+        });
+        return;
+      }
       onUpdate(editingExpense.id, exp);
       return;
     }
     onAdd(exp);
     setAmount("");
     setNote("");
+  };
+  const resolveLearnRule = async learn => {
+    const pending = confirmLearnRule;
+    setConfirmLearnRule(null);
+    if (!pending) return;
+    if (learn) {
+      // Best-effort: a rule that fails to save must never block saving the
+      // expense edit itself, which is the thing the user actually asked for.
+      try {
+        await db.from("merchant_category_rules").upsert({
+          household_id: hhId,
+          normalized_merchant: pending.normalized,
+          display_merchant: pending.display,
+          category_key: pending.categoryId,
+          source: "manual",
+          created_by: user.id
+        }, {
+          onConflict: "household_id,normalized_merchant"
+        });
+      } catch (e) {/* best-effort */}
+    }
+    onUpdate(editingExpense.id, pending.exp);
   };
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", {
     style: S.pageTitle
@@ -1801,7 +1876,48 @@ function AddExpense({
       marginTop: 8
     },
     onClick: onCancelEdit
-  }, t("cancel")));
+  }, t("cancel")), confirmLearnRule && /*#__PURE__*/React.createElement(LearnMerchantRuleModal, {
+    merchant: confirmLearnRule.display,
+    categoryLabel: catLabel(catById(confirmLearnRule.categoryId)),
+    onConfirm: () => resolveLearnRule(true),
+    onSkip: () => resolveLearnRule(false)
+  }));
+}
+function LearnMerchantRuleModal({
+  merchant,
+  categoryLabel,
+  onConfirm,
+  onSkip
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: S.modalWrap,
+    onClick: onSkip
+  }, /*#__PURE__*/React.createElement("div", {
+    style: S.modalCard,
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("h2", {
+    style: {
+      ...S.pageTitle,
+      marginTop: 0
+    }
+  }, t("learn_rule_title", {
+    merchant,
+    category: categoryLabel
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...S.privacyNote,
+      marginTop: 0
+    }
+  }, t("learn_rule_body")), /*#__PURE__*/React.createElement("button", {
+    style: S.primaryBtn,
+    onClick: onConfirm
+  }, t("learn_rule_yes")), /*#__PURE__*/React.createElement("button", {
+    style: {
+      ...S.ghostBtn,
+      marginTop: 8
+    },
+    onClick: onSkip
+  }, t("learn_rule_no"))));
 }
 
 // ---------- Color swatch picker ----------

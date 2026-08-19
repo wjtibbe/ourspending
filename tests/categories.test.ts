@@ -59,6 +59,44 @@ for (const label of ["Health", "Pharmacy", "Apotheek", "Farmacia", "Dentist"]) {
   mapsTo(label, "health");
 }
 
+// Real Wise merchant names reported as still falling back incorrectly.
+// These are matched via `description` (the merchant name), the same field
+// a Wise Gmail import actually populates -- not `providerCategory`.
+console.log("\n-- real merchants: deterministic mapping fix --");
+for (const [merchant, expected] of [
+  ["Éxito Express", "groceries"],
+  ["D1", "groceries"],
+  ["Supermercado boom", "groceries"],
+  ["Butcher eficarnes", "groceries"],
+  ["Crepes y gelato", "dining"],
+  ["Feria de flores", "entertainment"],
+  ["Spotify", "subscriptions"],
+] as const) {
+  const r = resolveCategory({ description: merchant });
+  check(`"${merchant}" -> ${expected}`, r.category === expected, `got ${r.category} via ${r.source}`);
+}
+
+// Uber/Didi must keep working exactly as before -- this fix must not touch
+// transport at all.
+console.log("\n-- transport is unchanged --");
+for (const merchant of ["Uber", "Didi", "UBER *TRIP BOGOTA", "DIDI COLOMBIA"]) {
+  const r = resolveCategory({ description: merchant });
+  check(`"${merchant}" -> transport (unchanged)`, r.category === "transport", `got ${r.category} via ${r.source}`);
+}
+
+// "D1" must be an exact normalized-merchant match, never a substring
+// keyword: a 2-character token embedded in an unrelated longer merchant
+// name must not be pulled into groceries.
+console.log("\n-- D1 is an exact match, not a substring keyword --");
+{
+  const r = resolveCategory({ description: "Studio D1 Fitness" });
+  check(
+    '"Studio D1 Fitness" does NOT match D1 as a substring',
+    r.category !== "groceries",
+    `got ${r.category} via ${r.source}`,
+  );
+}
+
 // Validation case 7: nothing unknown ever creates a category.
 console.log("\n-- case 7: unknown values fall back, never invent --");
 for (const label of ["Quantum Widgets", "ZZZ-9", "", "   ", "!!!"]) {

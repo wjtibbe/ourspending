@@ -20,11 +20,11 @@ the rest of your mailbox.
 
 Supabase dashboard → **SQL Editor**, in this order:
 
-1. `supabase/email_import.sql` *(if not already applied)*
-2. `supabase/expense_conversion_fields.sql` *(if not already applied)*
-3. `supabase/gmail_import.sql`
+1. `supabase/migrations/20260804002220_email_import.sql` *(if not already applied)*
+2. `supabase/migrations/20260804202613_expense_conversion_fields.sql` *(if not already applied)*
+3. `supabase/migrations/20260805182726_gmail_import.sql`
 4. `supabase/verify_gmail_import.sql` → expect `GMAIL IMPORT VERIFICATION PASSED`
-5. `supabase/email_import_ledger_fix.sql` — **required**, even if you already ran everything above
+5. `supabase/migrations/20260806211500_email_import_ledger_fix.sql` — **required**, even if you already ran everything above
 6. `supabase/verify_email_import_ledger_fix.sql` → expect `LEDGER CLAIM FIX VERIFICATION PASSED`
 
 Step 5 fixes a real defect: without it, **every** message fails at the very

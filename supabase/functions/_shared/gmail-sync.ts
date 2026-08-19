@@ -25,6 +25,7 @@ import {
   refreshAccessToken, type FetchLike,
 } from "./gmail.ts";
 import { addressOf } from "./inbound-types.ts";
+import type { AiClassifier } from "./merchant-categorization.ts";
 
 /** The decrypted credential document. Never logged, never returned. */
 export type StoredCredential = {
@@ -54,6 +55,8 @@ export interface GmailSyncDeps {
   /** Bounded so one runaway mailbox cannot consume the whole invocation. */
   maxPages?: number;
   pageSize?: number;
+  /** Layer 4 of categorizeTransaction(). Omitted/null = AI fallback disabled. */
+  aiClassifier?: AiClassifier | null;
 }
 
 export type SyncStats = {
@@ -268,6 +271,7 @@ export async function syncOneConnection(
         userId: conn.user_id,
         message,
         now: deps.now(),
+        aiClassifier: deps.aiClassifier ?? null,
       });
 
       if (result.outcome === "imported") stats.expensesImported++;
