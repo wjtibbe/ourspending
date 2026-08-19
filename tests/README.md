@@ -13,6 +13,7 @@ Functions import, using Node's native type stripping (Node 22.6+).
     node --experimental-strip-types tests/gmail-cors.test.ts
     node --experimental-strip-types tests/merchant-categorization.test.ts
     node --experimental-strip-types tests/import-retry.test.ts
+    node --experimental-strip-types tests/gmail-discovery.test.ts
     node tests/expense-display.test.js
 
 `categories.test.ts` covers the mapping layer: multilingual aliases, MCC codes,
@@ -105,7 +106,8 @@ decoding (including the multi-byte UTF-8 trap that turns "Éxito" into
 "Ãxito" if the bytes skip TextDecoder), MIME walking across flat,
 multipart/alternative and nested multipart/mixed structures with attachments
 skipped, RFC 2047 encoded-word headers, the deliberately narrow Gmail search
-(`from:noreply@wise.com newer_than:8d`, plus an optional label),
+(`from:(wise.com OR transferwise.com) newer_than:8d`, plus an optional
+label — see `gmail-discovery.test.ts` for why it is domains, not one address),
 message-list pagination, OAuth state/PKCE generation and the consent URL
 (gmail.readonly only, `access_type=offline`, S256, consent forced on first
 connect but not on reconnect), the token-endpoint error taxonomy — with
@@ -196,6 +198,35 @@ retry still working when the diagnostics migration has not been applied; and
 an unreadable ledger failing closed rather than double-importing. Gmail ids are
 production-shaped 16-character hex, and each message is a distinct amount so
 the fingerprint dedupe layer is not what is being measured.
+
+`gmail-discovery.test.ts` covers the layer before everything else: which
+messages Gmail is even asked for. It is regression coverage for the third act
+of a real incident — after the ledger-claim fix and the retry fix, a sync still
+reported 39 seen / 39 duplicates / 0 imported on a day with real purchases,
+with nothing stuck in the ledger. Nothing was failing because nothing was being
+found: discovery asked for the single literal address `from:noreply@wise.com`
+while the sender gate that runs afterwards (`isWiseSender`) has always accepted
+any `wise.com`/`transferwise.com` address including subdomains, so a notice
+from any other Wise address passed every check in the importer but was never
+listed — leaving no ledger row, no failure and no counter.
+
+It pins: the query covers exactly the domains `WISE_SENDER_DOMAINS` trusts (a
+loop over that constant, so discovery can never again be narrower than
+validation), stays sender-scoped and time-bounded, uses one `from:(a OR b)`
+term rather than two ANDed terms that would match nothing, and never reaches
+into Spam or Trash (a From header is trivially spoofable, so Gmail's own spam
+classification is load-bearing). Then end to end against a fake Gmail that
+actually honours the `from:` term: `noreply@wise.com` still imports; the same
+notice from `no-reply@`, `notifications@`, `e.wise.com` and `transferwise.com`
+now imports; **the same message under the old narrow query lists nothing and
+reports zero failures, zero skips and zero duplicates** — proving the test is
+meaningful and that the symptom was silent absence; Wise marketing mail is
+discovered but rejected at the template gate with a ledger row rather than
+vanishing; a lookalike domain is never listed and is independently refused by
+the sender gate; today's message imports on the very next sync; a message
+outside the lookback is excluded; and duplicate safety is intact — including
+that the same transaction arriving from two different Wise addresses still
+creates only one expense.
 
 `expense-display.test.js` drives `expense-display.js` — the pure function
 `app.js` uses to decide what an expense row's large/small amounts show. It

@@ -27,6 +27,9 @@ const GOOGLE_CLIENT_ID = Deno.env.get("GOOGLE_CLIENT_ID");
 const GOOGLE_CLIENT_SECRET = Deno.env.get("GOOGLE_CLIENT_SECRET");
 const SYNC_CRON_SECRET = Deno.env.get("SYNC_CRON_SECRET");
 const GMAIL_LABEL = Deno.env.get("GMAIL_LABEL") ?? "";
+// Comma-separated escape hatch, e.g. "wise.com,e.wise.com". Left unset, the
+// query uses the Wise domains the sender-authenticity gate already trusts.
+const GMAIL_SENDERS = Deno.env.get("GMAIL_SENDERS") ?? "";
 
 // AI categorisation fallback (layer 4) is feature-flagged and off by
 // default: it only ever runs once household rules, the existing global
@@ -79,6 +82,7 @@ const deps = (): GmailSyncDeps => ({
     ? lookbackConfigured
     : 8,
   label: GMAIL_LABEL.trim() || null,
+  senders: GMAIL_SENDERS.trim() || null,
   aiClassifier,
 });
 
@@ -142,7 +146,9 @@ Deno.serve(async (req) => {
         `imported=${stats.expensesImported} duplicates=${stats.duplicatesSkipped} ` +
         `(already_imported=${stats.duplicatesAlreadyImported} ` +
         `terminal_skip=${stats.terminalSkipped}) retried=${stats.retriedRows} ` +
-        `unparsed=${stats.unparsed} failed=${stats.failed}`,
+        `unparsed=${stats.unparsed} failed=${stats.failed} ` +
+        `listed=${stats.gmailMessagesListed} rejected_sender=${stats.rejectedSender} ` +
+        `rejected_template=${stats.rejectedTemplate} query=${JSON.stringify(stats.queryUsed)}`,
     );
     return json({ ok: true, trigger, ...stats });
   } catch (e) {

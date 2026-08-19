@@ -203,7 +203,14 @@ console.log("\n-- Gmail message -> InboundMessage --");
 console.log("\n-- the Gmail search query stays narrow --");
 {
   const q = buildWiseQuery();
-  check("restricted to Wise's sender", q.includes("from:noreply@wise.com"));
+  // Wise DOMAINS, not one literal address. This used to pin
+  // `from:noreply@wise.com`, which was strictly narrower than the sender gate
+  // the importer already enforces (isWiseSender accepts any wise.com /
+  // transferwise.com address), so a card-payment notice from any other Wise
+  // address was never fetched and left no trace at all. See
+  // tests/gmail-discovery.test.ts for the full contract.
+  check("restricted to Wise's sender domains", q.includes("from:(wise.com OR transferwise.com)"), q);
+  check("still scoped to Wise only -- not a whole-mailbox search", q.startsWith("from:"));
   // 8 days, not 2: the job runs once daily, so the window must survive an
   // occasional missed run (a dead token, a transient failure) without losing
   // a transaction. Overlap is safe -- duplicate protection is four
@@ -211,7 +218,8 @@ console.log("\n-- the Gmail search query stays narrow --");
   // tests further down in this file).
   check("restricted to eight days by default", q.includes("newer_than:8d"), q);
   check("no label term unless configured", !q.includes("label:"));
-  check("is exactly the documented default", q === "from:noreply@wise.com newer_than:8d", q);
+  check("is exactly the documented default",
+    q === "from:(wise.com OR transferwise.com) newer_than:8d", q);
 
   const labelled = buildWiseQuery({ label: "Wise Import" });
   check("an optional label narrows it further", labelled.includes('label:"Wise Import"'), labelled);

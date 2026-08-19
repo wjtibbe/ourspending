@@ -11,6 +11,10 @@
 // invalid_grant is mapped to its own code and surfaced as "reconnect
 // required", which is the only thing that actually fixes it.
 
+// Discovery reuses the sender trust boundary the importer already enforces,
+// so the query and the validation gate can never drift apart.
+import { WISE_SENDER_DOMAINS } from "./parse-wise-email.ts";
+
 export const GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
 
 export const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -225,15 +229,43 @@ export async function revokeToken(
 /**
  * The search that keeps this out of the rest of the mailbox.
  *
- * Restrictive on purpose: a sender filter AND a short time window, so the
- * app never asks Gmail for -- and therefore never sees -- anything but recent
- * Wise notifications. The optional label narrows it further for users who
- * want a filter-based allowlist.
+ * Restrictive on purpose: a sender filter AND a short time window, so the app
+ * never asks Gmail for -- and therefore never sees -- anything but recent Wise
+ * mail. The optional label narrows it further for users who want a
+ * filter-based allowlist.
+ *
+ * SENDER SCOPE -- why this is domains, not one address.
+ *
+ * This used to be the single literal address `noreply@wise.com`, while the
+ * sender-authenticity gate that runs afterwards (isWiseSender in
+ * parse-wise-email.ts) has always accepted ANY address at wise.com or
+ * transferwise.com, including subdomains. Discovery was therefore strictly
+ * narrower than the trust boundary the rest of the pipeline already enforces:
+ * a card-payment notice sent from any other Wise address -- a different local
+ * part, a sending subdomain like e.wise.com, a regional domain -- would pass
+ * every check in the importer but was never fetched, so it could not be
+ * imported and left no trace anywhere. Nothing reported it, because a message
+ * that is never listed is not a failure, a skip or an unparsed row; it is
+ * simply absent.
+ *
+ * The sender list is now derived from WISE_SENDER_DOMAINS, the same constant
+ * isWiseSender validates against, so discovery and validation cannot drift
+ * apart again. This is not a widening of who is trusted: every message found
+ * still has to clear that same sender gate, then the Wise card-payment
+ * template, before anything is imported.
+ *
+ * Gmail's `from:` matches the From HEADER (display name and address), not the
+ * SMTP envelope sender / Return-Path, so a domain term here matches any
+ * From address at that domain. Spam and Trash stay excluded: the Gmail API
+ * omits them unless `in:anywhere` is asked for, and a From header is trivially
+ * spoofable, so Gmail's own spam classification is load-bearing here. A
+ * genuine notice that landed in Spam is deliberately not imported.
  */
 export function buildWiseQuery(opts: {
   lookbackDays?: number;
   label?: string | null;
-  sender?: string;
+  /** Override the sender terms. Accepts addresses or bare domains. */
+  senders?: string[] | string | null;
 } = {}): string {
   // 8, not 2: the job runs once daily and an occasional missed run (a dead
   // token, a transient failure) must still be caught by the next one. Safe
@@ -242,8 +274,24 @@ export function buildWiseQuery(opts: {
   const days = Number.isFinite(opts.lookbackDays) && (opts.lookbackDays as number) > 0
     ? Math.floor(opts.lookbackDays as number)
     : 8;
-  const sender = opts.sender && opts.sender.trim() ? opts.sender.trim() : "noreply@wise.com";
-  const parts = [`from:${sender}`, `newer_than:${days}d`];
+
+  const raw = typeof opts.senders === "string"
+    ? opts.senders.split(",")
+    : Array.isArray(opts.senders)
+    ? opts.senders
+    : null;
+  const senders = (raw ?? WISE_SENDER_DOMAINS)
+    .map((s) => String(s).trim())
+    .filter(Boolean);
+  const list = senders.length ? senders : [...WISE_SENDER_DOMAINS];
+
+  // `from:(a OR b)` rather than one term per sender: separate `from:` terms
+  // would AND together and match nothing.
+  const fromTerm = list.length === 1
+    ? `from:${list[0]}`
+    : `from:(${list.join(" OR ")})`;
+
+  const parts = [fromTerm, `newer_than:${days}d`];
   if (opts.label && opts.label.trim()) {
     // Quoted so a label containing a space ("Wise Import") stays one term.
     parts.push(`label:"${opts.label.trim()}"`);

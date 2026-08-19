@@ -52,6 +52,8 @@ export interface GmailSyncDeps {
   decrypt(ciphertext: string, iv: string): Promise<string>;
   lookbackDays?: number;
   label?: string | null;
+  /** Sender terms for discovery. Omitted = the Wise domains isWiseSender trusts. */
+  senders?: string[] | string | null;
   /** Bounded so one runaway mailbox cannot consume the whole invocation. */
   maxPages?: number;
   pageSize?: number;
@@ -81,6 +83,22 @@ export type SyncStats = {
   terminalSkipped: number;
   /** Existing ledger rows that had NOT succeeded, and were re-run this time. */
   retriedRows: number;
+
+  // ---- discovery diagnostics ----
+  // "Gmail returned nothing new" and "Gmail returned it and we rejected it"
+  // look identical from expensesImported alone. These separate them.
+  //
+  // The query is safe to return: it contains sender DOMAINS and a day count,
+  // never a mailbox address, and never a subject, merchant or amount. The
+  // optional label is the user's own configured value.
+  /** The exact Gmail search string used, so discovery is never a black box. */
+  queryUsed: string | null;
+  /** Message ids Gmail returned for that query, before any of our own checks. */
+  gmailMessagesListed: number;
+  /** Listed, then rejected because the From header was not a Wise sender. */
+  rejectedSender: number;
+  /** Listed and from Wise, then rejected because no template matched. */
+  rejectedTemplate: number;
 };
 
 const emptyStats = (): SyncStats => ({
@@ -95,6 +113,10 @@ const emptyStats = (): SyncStats => ({
   duplicatesAlreadyImported: 0,
   terminalSkipped: 0,
   retriedRows: 0,
+  queryUsed: null,
+  gmailMessagesListed: 0,
+  rejectedSender: 0,
+  rejectedTemplate: 0,
 });
 
 /** Refresh a minute early, so a token cannot expire mid-run. */
@@ -245,8 +267,13 @@ export async function syncOneConnection(
   const query = buildWiseQuery({
     lookbackDays: deps.lookbackDays,
     label: deps.label ?? null,
+    senders: deps.senders ?? null,
   });
+  // Recorded before anything is fetched, so even a run that imports nothing
+  // shows exactly what was asked of Gmail and how much came back.
+  stats.queryUsed = query;
   const ids = await collectIds(deps, accessToken, query);
+  stats.gmailMessagesListed += ids.length;
 
   for (const id of ids) {
     stats.messagesSeen++;
@@ -302,9 +329,18 @@ export async function syncOneConnection(
 
       if (result.outcome === "imported") stats.expensesImported++;
       else if (result.outcome === "duplicate") stats.duplicatesSkipped++;
-      else if (result.outcome === "unparsed") stats.unparsed++;
-      else if (result.outcome === "skipped") stats.skipped++;
-      else stats.failed++;
+      else if (result.outcome === "unparsed") {
+        stats.unparsed++;
+        // Reached the parser and matched no template.
+        stats.rejectedTemplate++;
+      } else if (result.outcome === "skipped") {
+        stats.skipped++;
+        // Split the two very different reasons a listed message is skipped:
+        // the From header was not Wise at all, versus it was Wise but the mail
+        // is not a card payment (a statement, a marketing send).
+        if (result.reason === "sender_not_recognised") stats.rejectedSender++;
+        else if (result.reason === "not_a_transaction") stats.rejectedTemplate++;
+      } else stats.failed++;
     } catch (e) {
       // A dead token mid-run is a CONNECTION problem, not a message problem:
       // every remaining message would fail the same way, so stop this
