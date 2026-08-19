@@ -120,7 +120,7 @@ refresh token is honoured, and no token ever reaches the ledger.
 It also has dedicated regression coverage for a real production incident: 14
 production-shaped Gmail messages all reaching `email_import_messages` (not
 zero — the exact symptom when the ledger-claim insert cannot match its unique
-index; see `supabase/email_import_ledger_fix.sql`), a repeat run over the
+index; see `supabase/migrations/20260806211500_email_import_ledger_fix.sql`), a repeat run over the
 same messages producing zero new expenses and all 14 counted as duplicates,
 and — using a FakeDb that reproduces the exact failure mode being fixed — that
 a broken claim path logs `stage=ledger_claim` plus a sanitised reason for

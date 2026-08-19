@@ -1,1 +1,62 @@
 project_id = "cleeaaqyhmevacsfjawi"
+
+# ---------------------------------------------------------------------------
+# Edge Function JWT verification
+# ---------------------------------------------------------------------------
+#
+# Declared here so deployment never depends on remembering a CLI flag, and so
+# a change to a function's auth model is reviewable in a pull request instead
+# of being a silent dashboard edit.
+#
+# `verify_jwt = true` (the platform default) makes the Supabase gateway reject
+# any request without a valid Supabase JWT *before* it reaches the function.
+# `verify_jwt = false` lets the request through to the function, which is only
+# correct when the function authenticates the caller ITSELF.
+#
+# Every `false` below is paired with the function's own auth mechanism. None of
+# them is unauthenticated.
+
+# Browser-called, user-authenticated. currentUser() validates the JWT, but the
+# gateway rejecting anonymous callers first is a free extra layer -- keep it.
+[functions.gmail-oauth-start]
+verify_jwt = true
+
+[functions.gmail-disconnect]
+verify_jwt = true
+
+# IMPORTANT: scan-receipt has NO internal auth check of its own -- it reads the
+# posted image and calls the Anthropic API directly. The gateway is its ONLY
+# protection. Setting this to false would turn it into an open proxy that any
+# anonymous caller could use to burn the project's ANTHROPIC_API_KEY.
+[functions.scan-receipt]
+verify_jwt = true
+
+# Google redirects the user's BROWSER here after consent. Google cannot attach
+# a Supabase JWT, so the gateway would reject every callback. Identity instead
+# comes from the single-use `state` row, consumed atomically by
+# consume_email_import_oauth_state(): a forged or replayed state resolves to no
+# user and the request is refused.
+[functions.gmail-oauth-callback]
+verify_jwt = false
+
+# Two callers, neither of which can rely on the gateway:
+#   - the daily pg_cron job, which sends only `x-sync-secret` (no Authorization
+#     header at all), compared in constant time inside the function;
+#   - the browser "Sync now" button, whose JWT the function validates itself
+#     via currentUser().
+# Both paths return 401 on failure before touching any data.
+[functions.gmail-sync]
+verify_jwt = false
+
+# Subscribed by external calendar apps (Google/Apple Calendar) over plain HTTP
+# GET. They cannot send a JWT. The feed is authenticated by the unguessable
+# per-household token in the query string, checked against calendar_feeds.
+[functions.calendar-feed]
+verify_jwt = false
+
+# Not configured here, and deliberately NOT deployed by CI:
+#   provider-connect  -- header says "OBSOLETE -- NOT PART OF THE CURRENT SETUP"
+#   wise-sync         -- header says "OBSOLETE -- NOT PART OF THE CURRENT SETUP"
+#   inbound-email     -- header says "INACTIVE -- retained as an alternate adapter"
+# See .github/workflows/deploy.yml for the explicit deploy allowlist, and
+# DEPLOYMENT.md for the optional cleanup list.

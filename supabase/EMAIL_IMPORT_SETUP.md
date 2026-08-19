@@ -9,7 +9,7 @@
 > the Resend adapter are still present and still tested, and both now share
 > `_shared/email-import-core.ts` with the Gmail path.
 >
-> **Note:** `supabase/email_import.sql` is still required — the Gmail path
+> **Note:** `supabase/migrations/20260804002220_email_import.sql` is still required — the Gmail path
 > extends its tables. Do not drop it.
 
 ---
@@ -37,11 +37,11 @@ once each template lands. See §10 at the bottom.
 
 Supabase dashboard → **SQL Editor**, in this order:
 
-1. `supabase/email_import.sql`
+1. `supabase/migrations/20260804002220_email_import.sql`
 2. `supabase/verify_email_import.sql` → expect `EMAIL IMPORT VERIFICATION PASSED`
-3. `supabase/expense_conversion_fields.sql`
+3. `supabase/migrations/20260804202613_expense_conversion_fields.sql`
 4. `supabase/verify_expense_conversion_fields.sql` → expect `EXPENSE CONVERSION FIELDS VERIFICATION PASSED`
-5. `supabase/email_import_ledger_fix.sql` — **required**. Without it, every
+5. `supabase/migrations/20260806211500_email_import_ledger_fix.sql` — **required**. Without it, every
    inbound message (Resend or Gmail) fails at the very first ledger insert —
    `email_import_messages?on_conflict=connection_id,provider_message_id`
    cannot match the partial unique index `email_import.sql` originally
