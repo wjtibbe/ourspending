@@ -33,8 +33,74 @@ export async function markMessage(db: Db, rowId: string, patch: Row): Promise<vo
 }
 
 export type ClaimResult =
-  | { claimed: true; rowId: string }
-  | { claimed: false; reason: "duplicate_message" };
+  | { claimed: true; rowId: string; retryOf: null }
+  /** An existing ledger row that never reached a terminal success -- re-run it. */
+  | { claimed: true; rowId: string; retryOf: string }
+  | { claimed: false; reason: "already_imported" | "terminal_skip" };
+
+/**
+ * Which existing-row states mean "this message still deserves another attempt".
+ *
+ * Deliberately an allowlist, not a denylist: an unrecognised or future status
+ * is treated as terminal, so a new state can never silently start causing
+ * re-imports of transactions that were already handled.
+ *
+ *   received  the row was claimed but the run died before finishing -- a
+ *             timeout, a crash, a dead token mid-batch. Nothing was imported.
+ *   failed    an error before or during expense creation.
+ *   unparsed  the parser did not recognise the template AT THE TIME. Parser
+ *             support is added over time, so this must not be a life sentence.
+ */
+const RETRYABLE_STATUSES = new Set(["received", "failed", "unparsed"]);
+
+/**
+ * `skipped` is the one status that means two very different things, so it is
+ * decided by reason rather than by status alone.
+ *
+ * Everything else that produces `skipped` is a deliberate business rule --
+ * incoming money, a declined/reversed transaction, an unsupported currency, a
+ * non-positive amount, an unrecognised sender, an email that is not a
+ * transaction at all. Re-importing those would be wrong, so `skipped` defaults
+ * to terminal and only these two transient configuration problems reopen it.
+ */
+const RETRYABLE_SKIP_REASONS = new Set(["no_household", "unresolved_slot"]);
+
+/**
+ * Bumps the retry counters on a ledger row. Entirely best-effort and fully
+ * isolated: every failure is swallowed, so a project whose schema predates
+ * these columns still retries normally. Nothing branches on what this writes.
+ */
+async function recordRetryAttempt(db: Db, rowId: string): Promise<void> {
+  try {
+    const rows = await db.select(
+      `email_import_messages?id=eq.${q(rowId)}&select=attempt_count&limit=1`,
+    );
+    const attempts = Number(rows[0]?.attempt_count ?? 0);
+    await markMessage(db, rowId, {
+      attempt_count: Number.isFinite(attempts) ? attempts + 1 : 1,
+      last_attempt_at: new Date().toISOString(),
+    });
+  } catch {
+    // The columns do not exist yet, or the ledger is briefly unreachable.
+    // Neither is a reason to fail or skip a retry.
+  }
+}
+
+/** Classifies an existing ledger row. Exported for tests and diagnostics. */
+export function isRetryableLedgerRow(row: Row): boolean {
+  const status = String(row.status ?? "");
+  if (RETRYABLE_STATUSES.has(status)) return true;
+  if (status === "skipped") {
+    return RETRYABLE_SKIP_REASONS.has(String(row.skip_reason ?? ""));
+  }
+  // "imported" is terminal even when expense_id is null: expense_id is only
+  // null when the INSERT succeeded but returned no representation, so the
+  // expense exists either way. It is also null after someone deliberately
+  // deletes an expense (the FK is `on delete set null`), and re-importing
+  // would resurrect what they removed. "duplicate" is terminal because layers
+  // 2-4 already matched this transaction to one that was imported.
+  return false;
+}
 
 /**
  * Dedupe layer 1: the delivering system's own message id.
@@ -43,6 +109,12 @@ export type ClaimResult =
  * window cannot double-import even while the first attempt is still running.
  * `resolution=ignore-duplicates` turns the unique-index collision into an
  * empty result rather than an error.
+ *
+ * The collision is NOT automatically a duplicate. A row existing only proves
+ * that this message was SEEN before, not that it was successfully imported --
+ * and a row can be left behind at `received`, `failed` or `unparsed` by a run
+ * that never created an expense. Treating those as duplicates is what makes a
+ * message permanently un-importable, so the existing row's own state decides.
  */
 export async function claimMessage(db: Db, params: {
   connectionId: string;
@@ -65,8 +137,56 @@ export async function claimMessage(db: Db, params: {
     },
     "resolution=ignore-duplicates,return=representation",
   );
-  if (!claimed.length) return { claimed: false, reason: "duplicate_message" };
-  return { claimed: true, rowId: String(claimed[0].id) };
+  if (claimed.length) return { claimed: true, rowId: String(claimed[0].id), retryOf: null };
+
+  // A row already exists. Read its state before deciding.
+  let existing: Row | undefined;
+  try {
+    const rows = await db.select(
+      `email_import_messages?connection_id=eq.${q(params.connectionId)}` +
+        `&provider_message_id=eq.${q(params.providerMessageId)}` +
+        // Only columns that have existed since the ledger was created. The
+        // retry-diagnostic columns are deliberately NOT selected here: an
+        // unknown column makes PostgREST reject the whole request, and this
+        // request failing would skip the message -- reintroducing the exact
+        // bug being fixed. They are written separately, best-effort, below.
+        "&select=id,status,skip_reason,expense_id&limit=1",
+    );
+    existing = rows[0];
+  } catch {
+    // The lookup failed, so the row's state is unknown. Skipping is the safe
+    // choice: a retry we skip is recovered by the next sync, but a retry we
+    // wrongly allow could double-import.
+    return { claimed: false, reason: "already_imported" };
+  }
+  if (!existing?.id) return { claimed: false, reason: "already_imported" };
+
+  const rowId = String(existing.id);
+  if (!isRetryableLedgerRow(existing)) {
+    return {
+      claimed: false,
+      reason: String(existing.status) === "skipped" ? "terminal_skip" : "already_imported",
+    };
+  }
+
+  // Reclaim it. Resetting to `received` and clearing the stale outcome fields
+  // puts the row back at the start of the same state machine, so the retry is
+  // indistinguishable from a first attempt and cannot inherit a previous
+  // error_summary or skip_reason.
+  const previousStatus = String(existing.status ?? "");
+  await markMessage(db, rowId, {
+    status: "received",
+    skip_reason: null,
+    error_summary: null,
+  });
+
+  // Retry diagnostics, kept off the critical path on purpose: this is a
+  // separate best-effort write of columns added by a later migration, and
+  // markMessage swallows its own errors. A project that has not applied that
+  // migration yet still retries correctly -- it just records no counter.
+  await recordRetryAttempt(db, rowId);
+
+  return { claimed: true, rowId, retryOf: previousStatus };
 }
 
 export type ImportResult =
