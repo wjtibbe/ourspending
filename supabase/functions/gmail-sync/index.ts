@@ -140,6 +140,8 @@ Deno.serve(async (req) => {
     console.log(
       `gmail-sync: ${trigger} processed=${stats.connectionsProcessed} ` +
         `imported=${stats.expensesImported} duplicates=${stats.duplicatesSkipped} ` +
+        `(already_imported=${stats.duplicatesAlreadyImported} ` +
+        `terminal_skip=${stats.terminalSkipped}) retried=${stats.retriedRows} ` +
         `unparsed=${stats.unparsed} failed=${stats.failed}`,
     );
     return json({ ok: true, trigger, ...stats });

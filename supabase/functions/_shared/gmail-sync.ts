@@ -68,6 +68,19 @@ export type SyncStats = {
   unparsed: number;
   skipped: number;
   failed: number;
+  // ---- diagnostics ----
+  // Counters only. Nothing here derives from a subject, body, merchant,
+  // amount or token, so the whole object stays safe to log and to return.
+  //
+  // duplicatesSkipped answers "how many were skipped", which on its own
+  // cannot distinguish a healthy no-op from every message being permanently
+  // stuck. These three split it:
+  /** Skipped because a previous run genuinely imported them. */
+  duplicatesAlreadyImported: number;
+  /** Skipped because a previous run deliberately and terminally skipped them. */
+  terminalSkipped: number;
+  /** Existing ledger rows that had NOT succeeded, and were re-run this time. */
+  retriedRows: number;
 };
 
 const emptyStats = (): SyncStats => ({
@@ -79,6 +92,9 @@ const emptyStats = (): SyncStats => ({
   unparsed: 0,
   skipped: 0,
   failed: 0,
+  duplicatesAlreadyImported: 0,
+  terminalSkipped: 0,
+  retriedRows: 0,
 });
 
 /** Refresh a minute early, so a token cannot expire mid-run. */
@@ -262,7 +278,17 @@ export async function syncOneConnection(
         fromAddress: addressOf(message.from),
         receivedAt: message.receivedAt,
       });
-      if (!claim.claimed) { stats.duplicatesSkipped++; continue; }
+      if (!claim.claimed) {
+        // Still counted in duplicatesSkipped so the existing shape of this
+        // response does not change, but now also split by WHY, so a run
+        // where nothing imports can be told apart from a healthy no-op.
+        stats.duplicatesSkipped++;
+        if (claim.reason === "terminal_skip") stats.terminalSkipped++;
+        else stats.duplicatesAlreadyImported++;
+        continue;
+      }
+      // An existing row that had not succeeded, now being re-run.
+      if (claim.retryOf !== null) stats.retriedRows++;
 
       stage = "import";
       const result = await importClaimedMessage(deps.db, {

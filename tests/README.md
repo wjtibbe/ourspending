@@ -12,6 +12,7 @@ Functions import, using Node's native type stripping (Node 22.6+).
     node --experimental-strip-types tests/gmail-import.test.ts
     node --experimental-strip-types tests/gmail-cors.test.ts
     node --experimental-strip-types tests/merchant-categorization.test.ts
+    node --experimental-strip-types tests/import-retry.test.ts
     node tests/expense-display.test.js
 
 `categories.test.ts` covers the mapping layer: multilingual aliases, MCC codes,
@@ -172,6 +173,29 @@ merchant without rewriting any historical expense already stored under the
 old category; one household's rule never leaks into another's; and a broken
 rule lookup still falls through to the keyword layer rather than failing the
 import.
+
+`import-retry.test.ts` is regression coverage for a real production incident:
+a manual sync reported `messagesSeen: 39, duplicatesSkipped: 39,
+expensesImported: 0` on a day the user had definitely made purchases.
+`claimMessage()` treated ANY existing `(connection_id, provider_message_id)`
+row as a duplicate without reading that row's status, so a row left at
+`received` (a run that died mid-batch), `failed`, or `unparsed` blocked its
+message from ever importing again. It pins the replacement rule — a message is
+skipped only when a previous run genuinely imported it or deliberately and
+terminally skipped it — across: the full retryable/terminal state table
+(including that an unknown or future status is treated as terminal, never
+retryable); first import; repeat import as a duplicate; failure before expense
+creation; retry after that failure actually creating the expense; retrying
+again being a duplicate with still exactly one expense; a row stuck at
+`received` being recovered; an `unparsed` message importing once the parser
+supports it; a declined transaction staying terminally skipped; an `imported`
+row never re-importing even when `expense_id` is null (a deliberately deleted
+expense is not resurrected); one bad message not blocking the ones after it;
+the 39-message incident reproduced at scale and then becoming a clean no-op;
+retry still working when the diagnostics migration has not been applied; and
+an unreadable ledger failing closed rather than double-importing. Gmail ids are
+production-shaped 16-character hex, and each message is a distinct amount so
+the fingerprint dedupe layer is not what is being measured.
 
 `expense-display.test.js` drives `expense-display.js` — the pure function
 `app.js` uses to decide what an expense row's large/small amounts show. It

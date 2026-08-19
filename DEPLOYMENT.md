@@ -28,7 +28,7 @@ Supabase credentials**, so it cannot deploy anything.
 
 | Job | What it does |
 |---|---|
-| **Node tests** | Every `tests/*.test.ts` and `tests/*.test.js` — 757 assertions |
+| **Node tests** | Every `tests/*.test.ts` and `tests/*.test.js` — 861 assertions |
 | **Edge Function type check** | `deno check` on the six active functions |
 | **Migration hygiene** | Filenames match `<14-digit-timestamp>_<snake_case>.sql`, timestamps unique and ascending, and no rollback-style `verify_*.sql` has leaked into `supabase/migrations/` |
 
@@ -174,6 +174,7 @@ script's real output rather than trusting this table:
 | 9 | `20260805182726` | gmail_import | APPLIED |
 | 10 | `20260806211500` | email_import_ledger_fix | APPLIED — Gmail imports were working, which this fix is required for |
 | 11 | `20260806215948` | merchant_category_rules | **PENDING** — written but never deployed |
+| 12 | `20260819120000` | email_import_retry_state | **PENDING** — new, adds retry diagnostics |
 
 ### Step 2 — Repair the already-applied migrations
 
@@ -341,6 +342,35 @@ for what each proves.
 `supabase/baseline_status.sql` is read-only introspection, used once for the
 baseline above. It is also safe to re-run any time you want to confirm which
 migrations production has.
+
+`supabase/ledger_status.sql` is read-only introspection of the email import
+ledger: how many messages sit in each state, which of them will be retried on
+the next sync versus which are terminal, how many are retryable but have aged
+out of the Gmail lookback window, and which keep failing. It returns only
+counts and states — never a subject, merchant, amount or token. Run it when a
+sync reports imports you did not expect, or no imports at all.
+
+### Replaying messages stuck before the retry fix
+
+Ledger rows left at `received`, `failed` or `unparsed` are retried
+automatically by the next sync — no SQL, and no rows are deleted or rewritten.
+The only limit is the Gmail search window: `gmail-sync` asks Gmail for
+`newer_than:8d`, so a stuck message older than that is not re-fetched and
+therefore not retried.
+
+`ledger_status.sql` reports exactly that count as
+`retryable_but_outside_lookback`. If it is greater than zero and you want those
+recovered, widen the window for one run:
+
+1. Set the `GMAIL_LOOKBACK_DAYS` secret on the project to cover the age of the
+   oldest stuck row (e.g. `30`).
+2. Run a manual sync from the app, or
+   **Actions → Deploy to Supabase (production) → Run workflow**.
+3. Confirm with `ledger_status.sql` that the stuck counts have dropped.
+4. Set `GMAIL_LOOKBACK_DAYS` back to `8`.
+
+Nothing is deleted at any point, and re-running is safe: a message that did
+import is terminal from then on.
 
 `supabase/wise_cron.sql` is marked **OBSOLETE — DO NOT RUN**. It is kept for
 history and is deliberately not a migration.
