@@ -483,5 +483,136 @@ console.log("\n-- 7. duplicate safety is untouched by the wider query --");
     db.store.expenses.length === 1, `${db.store.expenses.length} expenses`);
 }
 
+// ---------------------------------------------------------------------------
+console.log("\n-- 8. pagination: every page is followed, nothing is dropped --");
+// ---------------------------------------------------------------------------
+// Gmail returns at most `maxResults` ids per call plus a nextPageToken. A loop
+// that processes only the first page silently loses every message after it,
+// and -- because Gmail lists NEWEST first -- what it loses is the OLDEST tail,
+// which looks exactly like "nothing new" rather than like a bug. These cases
+// keep more messages in flight than fit on one page so that regression cannot
+// return unnoticed.
+{
+  /** A fake Gmail that pages properly and honours pageToken/maxResults. */
+  const pagedGmail = (total: number, serverPageCap = 100) => {
+    const all = Array.from({ length: total }, (_, i) => `1993b${String(i).padStart(3, "0")}c0de0001`.slice(0, 16));
+    const calls: Array<{ pageToken: string | null; maxResults: number }> = [];
+    const impl = (url: string): Promise<Response> => {
+      if (url.startsWith("https://oauth2.googleapis.com/token")) {
+        return Promise.resolve(new Response(JSON.stringify({
+          access_token: "at", expires_in: 3600, scope: GMAIL_SCOPE,
+        }), { status: 200 }));
+      }
+      if (url.includes("/messages?")) {
+        const u = new URL(url);
+        const start = parseInt(u.searchParams.get("pageToken") ?? "0", 10);
+        const max = parseInt(u.searchParams.get("maxResults") ?? "100", 10);
+        calls.push({ pageToken: u.searchParams.get("pageToken"), maxResults: max });
+        const slice = all.slice(start, start + Math.min(max, serverPageCap));
+        const next = start + slice.length < all.length ? String(start + slice.length) : null;
+        return Promise.resolve(new Response(JSON.stringify({
+          messages: slice.map((id) => ({ id })),
+          nextPageToken: next,
+          resultSizeEstimate: all.length,
+        }), { status: 200 }));
+      }
+      const id = decodeURIComponent(url.split("/messages/")[1]?.split("?")[0] ?? "");
+      // Distinct amount per id so dedupe layer 4 does not collapse them.
+      const idx = all.indexOf(id);
+      return Promise.resolve(new Response(
+        JSON.stringify(cardPayment(id, "Wise <noreply@wise.com>", 5 + idx * 0.11)),
+        { status: 200 },
+      ));
+    };
+    return { impl, calls, all };
+  };
+
+  // --- exactly one page: the baseline, and the shape production is in today.
+  {
+    const db = seedDb();
+    const g = pagedGmail(38);
+    const stats = await syncGmailConnections(depsFor(db, g.impl), CONNS);
+    check("38 messages fit on one page", stats.gmailMessagesListed === 38, JSON.stringify(stats));
+    check("exactly one Gmail list call", stats.gmailPagesFetched === 1);
+    check("no further page was offered", stats.gmailMoreAvailable === false);
+    check("Gmail's estimate matches what we listed", stats.gmailResultSizeEstimate === 38);
+    check("all 38 import", db.store.expenses.length === 38);
+  }
+
+  // --- more than one page: the regression this section exists for.
+  {
+    const db = seedDb();
+    const g = pagedGmail(250);
+    const stats = await syncGmailConnections(depsFor(db, g.impl), CONNS);
+    check("EVERY message across pages is listed, not just the first page",
+      stats.gmailMessagesListed === 250, JSON.stringify(stats));
+    check("more than one list call was made", stats.gmailPagesFetched > 1);
+    check("pagination was not truncated", stats.gmailMoreAvailable === false);
+    check("the second call carried a pageToken",
+      g.calls.length > 1 && g.calls[1].pageToken !== null);
+    check("the first call carried none", g.calls[0].pageToken === null);
+    check("every message was processed, not merely listed", stats.messagesSeen === 250);
+    check("all 250 import", db.store.expenses.length === 250, `${db.store.expenses.length}`);
+  }
+
+  // --- an awkward boundary: exactly one more than a whole page.
+  {
+    const db = seedDb();
+    const g = pagedGmail(101, 100);
+    const stats = await syncGmailConnections(depsFor(db, g.impl), CONNS);
+    check("101 messages over a 100-message page are all listed",
+      stats.gmailMessagesListed === 101, JSON.stringify(stats));
+    check("that took two pages", stats.gmailPagesFetched === 2);
+    check("the 101st is not lost", db.store.expenses.length === 101);
+  }
+
+  // --- exactly a page boundary: Gmail offers a token, the last page is empty.
+  {
+    const db = seedDb();
+    const g = pagedGmail(100, 100);
+    const stats = await syncGmailConnections(depsFor(db, g.impl), CONNS);
+    check("an exact page boundary lists everything", stats.gmailMessagesListed === 100);
+    check("and is not reported as truncated", stats.gmailMoreAvailable === false);
+  }
+
+  // --- the page cap: truncation must be REPORTED, never silent.
+  {
+    const db = seedDb();
+    const g = pagedGmail(400, 50);
+    const stats = await syncGmailConnections(
+      depsFor(db, g.impl, { maxPages: 2, pageSize: 50 }), CONNS,
+    );
+    check("a low page cap does truncate", stats.gmailMessagesListed === 100, JSON.stringify(stats));
+    check("and says so, rather than looking like a complete run",
+      stats.gmailMoreAvailable === true);
+    check("the estimate reveals how much was really there",
+      stats.gmailResultSizeEstimate === 400);
+    check("estimate > listed is the signature of a truncated run",
+      (stats.gmailResultSizeEstimate ?? 0) > stats.gmailMessagesListed);
+  }
+
+  // --- the diagnostic that separates the two failure modes.
+  {
+    // Query matches nothing: listed 0, estimate 0 -> the QUERY is wrong.
+    const db = seedDb();
+    const impl = (url: string): Promise<Response> => {
+      if (url.startsWith("https://oauth2.googleapis.com/token")) {
+        return Promise.resolve(new Response(JSON.stringify({
+          access_token: "at", expires_in: 3600, scope: GMAIL_SCOPE,
+        }), { status: 200 }));
+      }
+      return Promise.resolve(new Response(JSON.stringify({
+        messages: [], nextPageToken: null, resultSizeEstimate: 0,
+      }), { status: 200 }));
+    };
+    const stats = await syncGmailConnections(depsFor(db, impl), CONNS);
+    check("a query that matches nothing reports estimate 0",
+      stats.gmailResultSizeEstimate === 0 && stats.gmailMessagesListed === 0, JSON.stringify(stats));
+    check("estimate === listed means discovery is complete -- look at the query",
+      stats.gmailResultSizeEstimate === stats.gmailMessagesListed);
+    check("and it is not reported as truncated", stats.gmailMoreAvailable === false);
+  }
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

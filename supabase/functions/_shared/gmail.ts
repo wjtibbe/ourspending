@@ -333,7 +333,12 @@ export async function listMessageIds(params: {
   query: string;
   pageToken?: string | null;
   maxResults?: number;
-}, fetchImpl: FetchLike = fetch): Promise<{ ids: string[]; nextPageToken: string | null }> {
+}, fetchImpl: FetchLike = fetch): Promise<{
+  ids: string[];
+  nextPageToken: string | null;
+  /** Gmail's rough total for the query, independent of paging. Diagnostic only. */
+  resultSizeEstimate: number | null;
+}> {
   const search = new URLSearchParams({
     q: params.query,
     maxResults: String(params.maxResults ?? 50),
@@ -349,9 +354,17 @@ export async function listMessageIds(params: {
   const ids = raw
     .map((m) => (m && typeof m === "object" ? String((m as Record<string, unknown>).id ?? "") : ""))
     .filter((id) => id.length > 0);
+  // Gmail's own rough count of everything matching the query, independent of
+  // paging. Previously discarded, which meant "Gmail has more than we
+  // fetched" and "Gmail has exactly this many" were indistinguishable -- the
+  // difference between a paging bug and a query that genuinely does not match
+  // a message. It is an ESTIMATE and can be off for large result sets; it is a
+  // diagnostic, never a control-flow input.
+  const estimate = Number(body.resultSizeEstimate);
   return {
     ids,
     nextPageToken: body.nextPageToken ? String(body.nextPageToken) : null,
+    resultSizeEstimate: Number.isFinite(estimate) ? estimate : null,
   };
 }
 

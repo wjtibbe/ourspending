@@ -228,6 +228,20 @@ outside the lookback is excluded; and duplicate safety is intact — including
 that the same transaction arriving from two different Wise addresses still
 creates only one expense.
 
+It also pins the PAGINATION contract, with more messages in flight than fit on
+one page. Gmail returns at most `maxResults` ids per call plus a
+`nextPageToken`; a loop that reads only the first page silently loses
+everything after it, and because Gmail lists newest-first what it loses is the
+oldest tail — which looks like "nothing new" rather than like a bug. Covered:
+38 messages on a single page (the shape production is in), 250 across several
+pages with every one listed and imported, the 101-over-a-100-page boundary, an
+exact page boundary, and a deliberately low page cap that truncates — asserting
+that truncation is REPORTED via `gmailMoreAvailable` rather than being
+indistinguishable from a complete run. A final case pins the diagnostic that
+separates the two failure modes: `gmailResultSizeEstimate === gmailMessagesListed`
+means discovery is complete and the query is what is wrong, while
+`estimate > listed` is the signature of a truncated fetch.
+
 `expense-display.test.js` drives `expense-display.js` — the pure function
 `app.js` uses to decide what an expense row's large/small amounts show. It
 proves: a display currency matching the deducted amount shows that amount

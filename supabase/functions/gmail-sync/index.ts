@@ -148,7 +148,9 @@ Deno.serve(async (req) => {
         `terminal_skip=${stats.terminalSkipped}) retried=${stats.retriedRows} ` +
         `unparsed=${stats.unparsed} failed=${stats.failed} ` +
         `listed=${stats.gmailMessagesListed} rejected_sender=${stats.rejectedSender} ` +
-        `rejected_template=${stats.rejectedTemplate} query=${JSON.stringify(stats.queryUsed)}`,
+        `rejected_template=${stats.rejectedTemplate} pages=${stats.gmailPagesFetched} ` +
+        `estimate=${stats.gmailResultSizeEstimate} more_available=${stats.gmailMoreAvailable} ` +
+        `query=${JSON.stringify(stats.queryUsed)}`,
     );
     return json({ ok: true, trigger, ...stats });
   } catch (e) {

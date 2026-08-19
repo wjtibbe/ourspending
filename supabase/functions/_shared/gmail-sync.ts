@@ -99,6 +99,20 @@ export type SyncStats = {
   rejectedSender: number;
   /** Listed and from Wise, then rejected because no template matched. */
   rejectedTemplate: number;
+  /** Gmail list calls actually made. 1 means everything fitted on one page. */
+  gmailPagesFetched: number;
+  /**
+   * Gmail's own rough total for the query. If this equals gmailMessagesListed,
+   * nothing was lost to paging and Gmail genuinely has no other match -- which
+   * points at the QUERY, not at discovery. If it is larger, messages were left
+   * unfetched.
+   */
+  gmailResultSizeEstimate: number | null;
+  /**
+   * True when Gmail still had a nextPageToken after the last page we fetched,
+   * i.e. the page cap truncated the results. Must be false on a healthy run.
+   */
+  gmailMoreAvailable: boolean;
 };
 
 const emptyStats = (): SyncStats => ({
@@ -117,6 +131,9 @@ const emptyStats = (): SyncStats => ({
   gmailMessagesListed: 0,
   rejectedSender: 0,
   rejectedTemplate: 0,
+  gmailPagesFetched: 0,
+  gmailResultSizeEstimate: null,
+  gmailMoreAvailable: false,
 });
 
 /** Refresh a minute early, so a token cannot expire mid-run. */
@@ -215,27 +232,66 @@ async function recordPreClaimFailure(
 }
 
 /** Collects matching message ids across pages, bounded. */
+export type DiscoveryResult = {
+  ids: string[];
+  /** How many Gmail list calls were actually made. */
+  pagesFetched: number;
+  /** Gmail's own rough total for the query, from the first page. */
+  resultSizeEstimate: number | null;
+  /**
+   * True when Gmail still offered a nextPageToken after the LAST page we were
+   * willing to fetch -- i.e. the page cap truncated the result set.
+   */
+  moreAvailable: boolean;
+};
+
+/**
+ * Walks Gmail's paged message list until there is no nextPageToken left, or
+ * until the page cap is reached.
+ *
+ * The cap exists so one runaway mailbox cannot consume the whole invocation,
+ * but hitting it used to be INVISIBLE: the loop simply stopped and discarded a
+ * live nextPageToken, so a truncated run and a complete one produced
+ * identical-looking output. `moreAvailable` makes that state reportable, and
+ * the default budget (10 x 100 = 1000 messages) is far above any realistic
+ * 8-day Wise volume, so reaching it now means something is genuinely wrong
+ * rather than merely large.
+ */
 async function collectIds(
   deps: GmailSyncDeps,
   accessToken: string,
   query: string,
-): Promise<string[]> {
-  const maxPages = deps.maxPages ?? 5;
+): Promise<DiscoveryResult> {
+  const maxPages = deps.maxPages ?? 10;
   const ids: string[] = [];
   let pageToken: string | null = null;
+  let pagesFetched = 0;
+  let resultSizeEstimate: number | null = null;
+  let moreAvailable = false;
 
   for (let page = 0; page < maxPages; page++) {
     const res = await listMessageIds({
       accessToken,
       query,
       pageToken,
-      maxResults: deps.pageSize ?? 50,
+      // Gmail's own default. 50 doubled the number of round trips for no
+      // benefit; the API accepts up to 500.
+      maxResults: deps.pageSize ?? 100,
     }, deps.fetchImpl);
+    pagesFetched++;
+    // From the first page only: later pages report the same total, and taking
+    // the first keeps it stable regardless of how far paging got.
+    if (resultSizeEstimate === null) resultSizeEstimate = res.resultSizeEstimate;
     ids.push(...res.ids);
+
     if (!res.nextPageToken) break;
     pageToken = res.nextPageToken;
+    // Gmail has more and this was our last allowed page: record it rather
+    // than silently dropping the rest.
+    if (page === maxPages - 1) moreAvailable = true;
   }
-  return ids;
+
+  return { ids, pagesFetched, resultSizeEstimate, moreAvailable };
 }
 
 /**
@@ -272,8 +328,22 @@ export async function syncOneConnection(
   // Recorded before anything is fetched, so even a run that imports nothing
   // shows exactly what was asked of Gmail and how much came back.
   stats.queryUsed = query;
-  const ids = await collectIds(deps, accessToken, query);
+  const discovery = await collectIds(deps, accessToken, query);
+  const ids = discovery.ids;
   stats.gmailMessagesListed += ids.length;
+  stats.gmailPagesFetched += discovery.pagesFetched;
+  stats.gmailMoreAvailable = stats.gmailMoreAvailable || discovery.moreAvailable;
+  if (discovery.resultSizeEstimate !== null) {
+    stats.gmailResultSizeEstimate =
+      (stats.gmailResultSizeEstimate ?? 0) + discovery.resultSizeEstimate;
+  }
+  if (discovery.moreAvailable) {
+    // Loud, because it means transactions are being left undiscovered.
+    console.error(
+      `gmail-sync: TRUNCATED discovery connection=${conn.id} ` +
+        `pages=${discovery.pagesFetched} listed=${ids.length} -- Gmail had more`,
+    );
+  }
 
   for (const id of ids) {
     stats.messagesSeen++;
