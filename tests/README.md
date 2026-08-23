@@ -242,6 +242,20 @@ separates the two failure modes: `gmailResultSizeEstimate === gmailMessagesListe
 means discovery is complete and the query is what is wrong, while
 `estimate > listed` is the signature of a truncated fetch.
 
+Finally it covers the read-only discovery diagnostic (`diagnoseDiscovery`):
+the probe query is the exact literal `from:noreply@wise.com newer_than:2d`; a
+healthy mailbox reports profile address, estimate, listed count, pages and ISO
+newest/oldest dates; an empty result is reported plainly rather than as an
+error, because an empty answer IS the finding; a token belonging to a different
+mailbox reports `accountMatchesProfile: false` while case and whitespace
+differences do not; an unknown stored address reports `null` rather than a
+misleading `false`; and a dead token or missing credential is reported, never
+thrown. The privacy contract is asserted directly: a body snippet planted in
+the Gmail response cannot appear in the report, no message id or token leaks,
+the field set is exactly the agreed list, `format=minimal` is used and
+`format=full` never is, and the probe writes no ledger row and creates no
+expense.
+
 `expense-display.test.js` drives `expense-display.js` — the pure function
 `app.js` uses to decide what an expense row's large/small amounts show. It
 proves: a display currency matching the deducted amount shows that amount

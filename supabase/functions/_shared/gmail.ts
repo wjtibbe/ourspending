@@ -388,3 +388,29 @@ export async function getProfileEmail(
   const body = await gmailGet("/users/me/profile", accessToken, fetchImpl);
   return body.emailAddress ? String(body.emailAddress) : null;
 }
+
+/**
+ * Just when a message arrived, as Gmail's own epoch-millisecond internalDate.
+ *
+ * `format=minimal` is used deliberately: it returns no payload, so no headers,
+ * no subject and no body ever reach this process. Gmail does include a
+ * `snippet` (a fragment of the body) in a minimal response -- it is read from
+ * the response object by nobody, and ONLY internalDate is returned from here,
+ * so no message content can escape through this function.
+ *
+ * Used purely to answer "how recent is the newest thing Gmail will admit to
+ * having?", which is the difference between the API seeing a stale view of the
+ * mailbox and the query simply not matching.
+ */
+export async function getMessageInternalDate(
+  params: { accessToken: string; id: string },
+  fetchImpl: FetchLike = fetch,
+): Promise<number | null> {
+  const body = await gmailGet(
+    `/users/me/messages/${encodeURIComponent(params.id)}?format=minimal`,
+    params.accessToken,
+    fetchImpl,
+  );
+  const ms = Number(body.internalDate);
+  return Number.isFinite(ms) && ms > 0 ? ms : null;
+}

@@ -33,7 +33,8 @@ import {
   WISE_SENDER_DOMAINS, isWiseSender, wiseEmailParser,
 } from "../supabase/functions/_shared/parse-wise-email.ts";
 import {
-  syncGmailConnections, type GmailSyncDeps,
+  diagnoseDiscovery, syncGmailConnections, DIAGNOSTIC_QUERY,
+  type GmailSyncDeps,
 } from "../supabase/functions/_shared/gmail-sync.ts";
 import { gmailToInboundMessage, type GmailMessage } from "../supabase/functions/_shared/gmail-message.ts";
 import type { Row } from "../supabase/functions/_shared/import-core.ts";
@@ -611,6 +612,173 @@ console.log("\n-- 8. pagination: every page is followed, nothing is dropped --")
     check("estimate === listed means discovery is complete -- look at the query",
       stats.gmailResultSizeEstimate === stats.gmailMessagesListed);
     check("and it is not reported as truncated", stats.gmailMoreAvailable === false);
+  }
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n-- 9. the read-only discovery diagnostic --");
+// ---------------------------------------------------------------------------
+// A probe that asks Gmail one deliberately literal question, so the answer
+// cannot be blamed on the production query's own sender list or lookback.
+{
+  check("the probe query is exactly the agreed literal string",
+    DIAGNOSTIC_QUERY === "from:noreply@wise.com newer_than:2d", DIAGNOSTIC_QUERY);
+
+  /** A Gmail that answers the probe with `total` matches at a given age. */
+  const probeGmail = (opts: {
+    total: number;
+    profileEmail?: string | null;
+    newestAgeHours?: number;
+    oldestAgeHours?: number;
+    now?: number;
+  }) => {
+    const now = opts.now ?? Date.parse("2026-08-19T12:00:00.000Z");
+    const ids = Array.from({ length: opts.total }, (_, i) => `1993c${String(i).padStart(3, "0")}aa000001`.slice(0, 16));
+    const seen: string[] = [];
+    const impl = (url: string): Promise<Response> => {
+      seen.push(url);
+      if (url.startsWith("https://oauth2.googleapis.com/token")) {
+        return Promise.resolve(new Response(JSON.stringify({
+          access_token: "at", expires_in: 3600, scope: GMAIL_SCOPE,
+        }), { status: 200 }));
+      }
+      if (url.endsWith("/users/me/profile")) {
+        return Promise.resolve(new Response(JSON.stringify(
+          opts.profileEmail === null ? {} : { emailAddress: opts.profileEmail ?? "alex@example.com" },
+        ), { status: 200 }));
+      }
+      if (url.includes("/messages?")) {
+        return Promise.resolve(new Response(JSON.stringify({
+          messages: ids.map((id) => ({ id })),
+          nextPageToken: null,
+          resultSizeEstimate: opts.total,
+        }), { status: 200 }));
+      }
+      // format=minimal read: internalDate only.
+      const id = decodeURIComponent(url.split("/messages/")[1]?.split("?")[0] ?? "");
+      const idx = ids.indexOf(id);
+      const spanH = (opts.oldestAgeHours ?? 40) - (opts.newestAgeHours ?? 2);
+      const ageH = (opts.newestAgeHours ?? 2) + (ids.length > 1 ? (idx / (ids.length - 1)) * spanH : 0);
+      return Promise.resolve(new Response(JSON.stringify({
+        id, internalDate: String(now - Math.round(ageH * 3600_000)),
+        snippet: "SECRET BODY FRAGMENT THAT MUST NEVER BE RETURNED",
+      }), { status: 200 }));
+    };
+    return { impl, seen, now };
+  };
+
+  const CONN = {
+    id: "conn-1", user_id: "user-1", enabled: true,
+    account_email: "alex@example.com",
+  };
+
+  // --- Gmail DOES have recent matches: discovery is healthy, look elsewhere.
+  {
+    const db = seedDb();
+    const g = probeGmail({ total: 3, newestAgeHours: 2, oldestAgeHours: 30 });
+    const r = await diagnoseDiscovery(depsFor(db, g.impl, { now: () => new Date(g.now) }), CONN);
+
+    check("the probe uses the literal query", r.queryUsed === DIAGNOSTIC_QUERY, r.queryUsed);
+    check("it reports the connected mailbox", r.profileEmailAddress === "alex@example.com");
+    check("and that the stored account matches it", r.accountMatchesProfile === true);
+    check("it lists what Gmail returned", r.gmailMessagesListed === 3, JSON.stringify(r));
+    check("it reports Gmail's own estimate", r.gmailResultSizeEstimate === 3);
+    check("one page, not truncated", r.gmailPagesFetched === 1 && r.gmailMoreAvailable === false);
+    check("newest internalDate is reported as an ISO timestamp",
+      typeof r.newestMatchingInternalDate === "string" &&
+      !Number.isNaN(Date.parse(r.newestMatchingInternalDate)), String(r.newestMatchingInternalDate));
+    check("oldest is older than newest",
+      Date.parse(r.oldestMatchingInternalDate!) < Date.parse(r.newestMatchingInternalDate!));
+    check("no error", r.error === null);
+
+    // The whole point of the privacy contract.
+    const serialized = JSON.stringify(r);
+    check("NO snippet/body leaks into the report",
+      !serialized.includes("SECRET BODY FRAGMENT"), serialized.slice(0, 200));
+    check("NO message id leaks into the report",
+      !/1993c\d{3}aa/.test(serialized), serialized.slice(0, 200));
+    check("NO token leaks into the report",
+      !serialized.includes("at") || !serialized.includes("access_token"));
+    check("the report has exactly the agreed fields",
+      Object.keys(r).sort().join(",") ===
+        [
+          "accountMatchesProfile", "connectionId", "error", "gmailMessagesListed",
+          "gmailMoreAvailable", "gmailPagesFetched", "gmailResultSizeEstimate",
+          "newestMatchingInternalDate", "oldestMatchingInternalDate",
+          "profileEmailAddress", "queryUsed",
+        ].sort().join(","), Object.keys(r).sort().join(","));
+
+    // It must be read-only.
+    check("no ledger row was written", db.store.email_import_messages.length === 0);
+    check("no expense was created", db.store.expenses.length === 0);
+    check("format=minimal was used, never format=full",
+      g.seen.some((u) => u.includes("format=minimal")) &&
+      !g.seen.some((u) => u.includes("format=full")));
+    check("users.getProfile was called", g.seen.some((u) => u.endsWith("/users/me/profile")));
+  }
+
+  // --- Gmail has NOTHING: the messages are not visible to this token.
+  {
+    const db = seedDb();
+    const g = probeGmail({ total: 0 });
+    const r = await diagnoseDiscovery(depsFor(db, g.impl, { now: () => new Date(g.now) }), CONN);
+    check("zero matches is reported plainly", r.gmailMessagesListed === 0, JSON.stringify(r));
+    check("estimate agrees there are none", r.gmailResultSizeEstimate === 0);
+    check("no dates when there is nothing to date",
+      r.newestMatchingInternalDate === null && r.oldestMatchingInternalDate === null);
+    check("still not an error -- an empty answer IS the finding", r.error === null);
+  }
+
+  // --- The token belongs to a DIFFERENT mailbox than the stored account.
+  {
+    const db = seedDb();
+    const g = probeGmail({ total: 0, profileEmail: "someone.else@example.com" });
+    const r = await diagnoseDiscovery(depsFor(db, g.impl, { now: () => new Date(g.now) }), CONN);
+    check("the mismatch is reported", r.accountMatchesProfile === false, JSON.stringify(r));
+    check("and the live mailbox is named", r.profileEmailAddress === "someone.else@example.com");
+  }
+
+  // --- Case/whitespace differences are not a mismatch.
+  {
+    const db = seedDb();
+    const g = probeGmail({ total: 0, profileEmail: "Alex@Example.com" });
+    const r = await diagnoseDiscovery(depsFor(db, g.impl, { now: () => new Date(g.now) }), CONN);
+    check("comparison is case-insensitive", r.accountMatchesProfile === true, JSON.stringify(r));
+  }
+
+  // --- Unknown stored address: report null rather than a misleading false.
+  {
+    const db = seedDb();
+    const g = probeGmail({ total: 0 });
+    const r = await diagnoseDiscovery(
+      depsFor(db, g.impl, { now: () => new Date(g.now) }),
+      { ...CONN, account_email: null },
+    );
+    check("an unknown stored address reports null, not false",
+      r.accountMatchesProfile === null, JSON.stringify(r));
+  }
+
+  // --- A dead token is reported, not thrown.
+  {
+    const db = seedDb();
+    const impl = (url: string): Promise<Response> => {
+      if (url.startsWith("https://oauth2.googleapis.com/token")) {
+        return Promise.resolve(new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 }));
+      }
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    };
+    const r = await diagnoseDiscovery(depsFor(db, impl), CONN);
+    check("a dead token reports reconnect_required", r.error === "reconnect_required", JSON.stringify(r));
+    check("and does not throw or leak", r.gmailMessagesListed === 0 && r.profileEmailAddress === null);
+  }
+
+  // --- A missing credential is reported, not thrown.
+  {
+    const db = seedDb();
+    db.store.email_import_credentials = [];
+    const g = probeGmail({ total: 0 });
+    const r = await diagnoseDiscovery(depsFor(db, g.impl), CONN);
+    check("a missing credential is reported", r.error === "no_credential", JSON.stringify(r));
   }
 }
 

@@ -28,7 +28,7 @@ Supabase credentials**, so it cannot deploy anything.
 
 | Job | What it does |
 |---|---|
-| **Node tests** | Every `tests/*.test.ts` and `tests/*.test.js` — 949 assertions |
+| **Node tests** | Every `tests/*.test.ts` and `tests/*.test.js` — 978 assertions |
 | **Edge Function type check** | `deno check` on the six active functions |
 | **Migration hygiene** | Filenames match `<14-digit-timestamp>_<snake_case>.sql`, timestamps unique and ascending, and no rollback-style `verify_*.sql` has leaked into `supabase/migrations/` |
 
@@ -328,6 +328,63 @@ rollback of a schema change is how data gets destroyed. Write a new forward
 migration that undoes the change, and merge it. Every migration in this repo is
 additive, so "undo" is usually dropping a newly added column, index or table —
 review that by hand before merging.
+
+---
+
+## The Gmail discovery diagnostic
+
+A read-only probe on `gmail-sync`. It claims and writes no ledger row, creates
+no expense, and touches neither categorisation, retry state nor the parser. It
+asks Gmail one deliberately literal question — `from:noreply@wise.com
+newer_than:2d`, hard-coded and NOT derived from the production query — so the
+answer cannot be blamed on the query's own sender list or lookback.
+
+Invoke it from the browser console while signed in to the app:
+
+```js
+const { data, error } = await window.db.functions.invoke("gmail-sync", {
+  body: { mode: "diagnose" },
+});
+console.log(error ?? data);
+```
+
+It requires a signed-in user's JWT and reports only that user's own
+connection. The cron path refuses it with `diagnose_requires_user_auth`,
+because on that path the connection list is everyone's and the report names a
+mailbox address.
+
+### Reading the result
+
+| Field | Meaning |
+|---|---|
+| `profileEmailAddress` | The mailbox Gmail says the stored token belongs to (`users.getProfile`) |
+| `accountMatchesProfile` | Whether the stored `account_email` still matches it. `null` = nothing stored to compare |
+| `queryUsed` | Always `from:noreply@wise.com newer_than:2d` |
+| `gmailResultSizeEstimate` | Gmail's own total for that query |
+| `gmailMessagesListed` | Ids actually fetched |
+| `gmailPagesFetched` | List calls made |
+| `gmailMoreAvailable` | True only if the page cap truncated the run |
+| `newestMatchingInternalDate` | ISO timestamp of the most recent match, or `null` |
+| `oldestMatchingInternalDate` | ISO timestamp of the oldest match, or `null` |
+| `error` | `reconnect_required`, `no_credential`, or a sanitised code |
+
+What the combinations mean:
+
+* **`accountMatchesProfile: false`** — the token belongs to a different mailbox
+  than the one being watched. That alone explains missing mail; nothing else
+  needs to be true.
+* **`gmailMessagesListed: 0`, `gmailResultSizeEstimate: 0`** — for this token,
+  Gmail has nothing from `noreply@wise.com` in two days. The mail is not
+  reachable through this credential.
+* **`newestMatchingInternalDate` older than the messages you can see** — Gmail
+  is serving a stale or partial view to the API.
+* **listed > 0 and recent** — discovery is healthy, and the problem is
+  downstream of it.
+
+No subject, body, merchant, amount, message id or token is returned. Message
+dates are read with `format=minimal`, so no header or body is ever fetched;
+tests assert that a body snippet planted in the Gmail response cannot appear in
+the report.
 
 ---
 
