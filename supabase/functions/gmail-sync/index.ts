@@ -18,7 +18,7 @@ import { currentUser, db } from "../_shared/rest.ts";
 import { decryptToken, encryptToken, hasEncryptionKey, safeEqual } from "../_shared/crypto.ts";
 import { safeError } from "../_shared/import-core.ts";
 import {
-  enabledGmailConnections, syncGmailConnections,
+  diagnoseDiscovery, enabledGmailConnections, syncGmailConnections,
   type GmailConnectionRow, type GmailSyncDeps,
 } from "../_shared/gmail-sync.ts";
 import { createAiClassifier, type AiClassifier } from "../_shared/merchant-categorization.ts";
@@ -101,6 +101,18 @@ Deno.serve(async (req) => {
     return json({ error: "server_not_configured" }, 500);
   }
 
+  // Read once, tolerantly: the body is optional and every existing caller
+  // sends either nothing or {"trigger":"cron"}. A malformed or absent body
+  // must behave exactly as before, so parse failures fall back to {}.
+  let body: Record<string, unknown> = {};
+  try {
+    const text = await req.text();
+    if (text) body = JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    body = {};
+  }
+  const diagnose = body.mode === "diagnose";
+
   const presented = req.headers.get("x-sync-secret");
   let connections: GmailConnectionRow[];
   let trigger: "cron" | "manual";
@@ -117,6 +129,11 @@ Deno.serve(async (req) => {
       return json({ error: "unauthorized" }, 401);
     }
     trigger = "cron";
+    // The diagnostic reports the mailbox address behind a connection. On this
+    // path `connections` is EVERY enabled connection, so answering here would
+    // hand one caller other people's addresses. The diagnostic is for a
+    // signed-in user inspecting their own connection, and nothing else.
+    if (diagnose) return json({ error: "diagnose_requires_user_auth" }, 403);
     connections = await enabledGmailConnections(db);
   } else {
     // ---- "Sync now" ----
@@ -138,6 +155,22 @@ Deno.serve(async (req) => {
     if (!connections.length) return json({ error: "not_connected" }, 400);
   }
 
+  // ---- read-only discovery probe ----
+  // Claims no ledger row, writes no ledger row, creates no expense, and does
+  // not touch categorisation, retry state or the parser. It asks Gmail one
+  // fixed, deliberately literal question and reports what came back.
+  if (diagnose) {
+    const report = await diagnoseDiscovery(deps(), connections[0]);
+    console.log(
+      `gmail-sync: diagnose connection=${report.connectionId} ` +
+        `listed=${report.gmailMessagesListed} estimate=${report.gmailResultSizeEstimate} ` +
+        `pages=${report.gmailPagesFetched} more_available=${report.gmailMoreAvailable} ` +
+        `account_matches_profile=${report.accountMatchesProfile} ` +
+        `newest=${report.newestMatchingInternalDate} error=${report.error}`,
+    );
+    return json({ ok: true, mode: "diagnose", ...report });
+  }
+
   try {
     const stats = await syncGmailConnections(deps(), connections);
     // Counters only -- no addresses, merchants or amounts.
@@ -148,7 +181,9 @@ Deno.serve(async (req) => {
         `terminal_skip=${stats.terminalSkipped}) retried=${stats.retriedRows} ` +
         `unparsed=${stats.unparsed} failed=${stats.failed} ` +
         `listed=${stats.gmailMessagesListed} rejected_sender=${stats.rejectedSender} ` +
-        `rejected_template=${stats.rejectedTemplate} query=${JSON.stringify(stats.queryUsed)}`,
+        `rejected_template=${stats.rejectedTemplate} pages=${stats.gmailPagesFetched} ` +
+        `estimate=${stats.gmailResultSizeEstimate} more_available=${stats.gmailMoreAvailable} ` +
+        `query=${JSON.stringify(stats.queryUsed)}`,
     );
     return json({ ok: true, trigger, ...stats });
   } catch (e) {
