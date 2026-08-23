@@ -215,7 +215,25 @@ export async function fingerprint(parts: {
 // plain-text parts of the same email are handled identically.
 
 const SPENT_LINE = /You spent\s+([^\n]+?)\s+at\s+(.+?)\.(?=\s|\n|$)/i;
-const USED_LINE = /This used\s+([^\n]+?)\s+from your account\.?/i;
+
+// The account phrasing varies between Wise's own template variants, seen in
+// real mail on the same account within days of each other:
+//
+//   "This used 57.04 EUR from your account."        (older)
+//   "This used 6.45 EUR from your Wise account."    (current)
+//
+// Requiring the literal "from your account" rejected every message using the
+// newer wording -- the parser found the "You spent ..." sentence perfectly and
+// then threw the whole message away on the second one. The qualifier is
+// therefore optional and not tied to the word "Wise": up to two words may sit
+// between "your" and "account", which covers "Wise" and a future
+// "Wise Business" without matching unrelated prose.
+//
+// Nothing here keys off the subject. Wise sends both
+// "Card payment: 13,552 COP spent at Uber" and "203,575 COP spent at Tiendas D1"
+// for the same kind of transaction, so the subject is metadata only and the
+// two body sentences are the sole source of truth.
+const USED_LINE = /This used\s+([^\n]+?)\s+from your(?:\s+[A-Za-z]+){0,2}\s+account\.?/i;
 
 function extractMoney(fragment: string): Money | null {
   const value = parseMoneyValue(fragment);

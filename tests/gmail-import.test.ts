@@ -403,15 +403,19 @@ class FakeDb {
   select(path: string): Promise<Row[]> {
     const [table, qs] = path.split("?");
     const params = new URLSearchParams(qs ?? "");
-    const filters: Array<[string, string]> = [];
+    const filters: Array<[string, string, string]> = [];
     for (const [k, v] of params) {
       if (["select", "limit", "order", "on_conflict"].includes(k)) continue;
-      if (v.startsWith("eq.")) filters.push([k, decodeURIComponent(v.slice(3))]);
-      if (v === "is.true") filters.push([k, "true"]);
+      if (v.startsWith("eq.")) filters.push([k, decodeURIComponent(v.slice(3)), "eq"]);
+      // PostgREST neq -- used by the dedupe layers to exclude the row
+      // being processed. A fake that ignores it lets a self-collision
+      // bug pass unnoticed, which is exactly what happened once.
+      if (v.startsWith("neq.")) filters.push([k, decodeURIComponent(v.slice(4)), "neq"]);
+      if (v === "is.true") filters.push([k, "true", "eq"]);
     }
     return Promise.resolve(
       this.rows(table)
-        .filter((r) => filters.every(([k, v]) => String(r[k]) === v))
+        .filter((r) => filters.every(([k, v, op]) => op === "neq" ? String(r[k]) !== v : String(r[k]) === v))
         .map((r) => ({ ...r })),
     );
   }
@@ -439,12 +443,16 @@ class FakeDb {
   patch(path: string, body: Row): Promise<Row[]> {
     const [table, qs] = path.split("?");
     const params = new URLSearchParams(qs ?? "");
-    const filters: Array<[string, string]> = [];
+    const filters: Array<[string, string, string]> = [];
     for (const [k, v] of params) {
-      if (v.startsWith("eq.")) filters.push([k, decodeURIComponent(v.slice(3))]);
+      if (v.startsWith("eq.")) filters.push([k, decodeURIComponent(v.slice(3)), "eq"]);
+      // PostgREST neq -- used by the dedupe layers to exclude the row
+      // being processed. A fake that ignores it lets a self-collision
+      // bug pass unnoticed, which is exactly what happened once.
+      if (v.startsWith("neq.")) filters.push([k, decodeURIComponent(v.slice(4)), "neq"]);
     }
     for (const r of this.rows(table)) {
-      if (filters.every(([k, v]) => String(r[k]) === v)) Object.assign(r, body);
+      if (filters.every(([k, v, op]) => op === "neq" ? String(r[k]) !== v : String(r[k]) === v)) Object.assign(r, body);
     }
     return Promise.resolve([]);
   }

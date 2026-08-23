@@ -14,6 +14,7 @@ Functions import, using Node's native type stripping (Node 22.6+).
     node --experimental-strip-types tests/merchant-categorization.test.ts
     node --experimental-strip-types tests/import-retry.test.ts
     node --experimental-strip-types tests/gmail-discovery.test.ts
+    node --experimental-strip-types tests/wise-templates.test.ts
     node tests/expense-display.test.js
 
 `categories.test.ts` covers the mapping layer: multilingual aliases, MCC codes,
@@ -255,6 +256,32 @@ the Gmail response cannot appear in the report, no message id or token leaks,
 the field set is exactly the agreed list, `format=minimal` is used and
 `format=full` never is, and the probe writes no ledger row and creates no
 expense.
+
+`wise-templates.test.ts` pins the real Wise card-payment template variants and
+the accounting invariant, from four messages transcribed verbatim from the
+reported mailbox (Uber, Tiendas D1, Golden Padel - Bold, DiDi). Wise sends at
+least two wordings for the same transaction — `"from your account"` and
+`"from your Wise account"` — and two subject shapes, with and without a
+`Card payment:` prefix. The parser required the literal `"from your account"`,
+so every message using the newer wording matched the `"You spent ..."` sentence
+and was then discarded on the second one.
+
+It covers each variant in plain text and as HTML-only mail; that the subject is
+metadata only (an absent or even deliberately misleading subject does not change
+the result); that the account qualifier is optional and not tied to the word
+"Wise", while `"This used up your monthly allowance."` is still not mistaken for
+a deduction; and that a message with no `"This used ..."` sentence is `unparsed`
+rather than having an amount guessed. End to end it asserts all four import with
+the deducted EUR as the authoritative amount and the COP kept as metadata.
+
+It also pins two defects that only surfaced together with the template gap: a
+retried row must not deduplicate against **itself** (the previous attempt's own
+`rfc_message_id`, which used to turn a retryable row terminal on its first
+retry) while a genuine cross-row duplicate is still caught; and the accounting
+invariant — every message that reaches processing lands in exactly one of
+imported / duplicatesAlreadyImported / terminalSkipped / dedupedAfterClaim /
+unparsed / skipped / failed, with `unaccountedFor` proven able to *fail* on a
+rigged 31-messages-no-outcome run, so the invariant is not vacuous.
 
 `expense-display.test.js` drives `expense-display.js` — the pure function
 `app.js` uses to decide what an expense row's large/small amounts show. It

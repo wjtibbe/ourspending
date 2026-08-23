@@ -83,6 +83,24 @@ export type SyncStats = {
   terminalSkipped: number;
   /** Existing ledger rows that had NOT succeeded, and were re-run this time. */
   retriedRows: number;
+  /**
+   * Deduped AFTER a successful claim, by layers 2-4 (RFC Message-ID, external
+   * reference, fingerprint) matching a DIFFERENT ledger row.
+   *
+   * Split out because it used to vanish into duplicatesSkipped. A retried row
+   * that ended here looked identical to a message that was never claimed at
+   * all, which made `retriedRows: 31` with every other bucket at zero
+   * unreadable -- 31 rows were re-run and 31 outcomes went unreported.
+   */
+  dedupedAfterClaim: number;
+  /**
+   * messagesSeen minus every terminal bucket below. MUST be 0: each message
+   * that reaches processing ends in exactly one of imported /
+   * duplicatesAlreadyImported / terminalSkipped / dedupedAfterClaim /
+   * unparsed / skipped / failed. Anything else means an outcome escaped
+   * unreported, which is the failure mode this counter exists to make loud.
+   */
+  unaccountedFor: number;
 
   // ---- discovery diagnostics ----
   // "Gmail returned nothing new" and "Gmail returned it and we rejected it"
@@ -134,7 +152,25 @@ const emptyStats = (): SyncStats => ({
   gmailPagesFetched: 0,
   gmailResultSizeEstimate: null,
   gmailMoreAvailable: false,
+  dedupedAfterClaim: 0,
+  unaccountedFor: 0,
 });
+
+/**
+ * Recomputes the accounting invariant. Called once per run, after every
+ * message has been processed.
+ */
+export function reconcileStats(stats: SyncStats): SyncStats {
+  const accounted = stats.expensesImported +
+    stats.duplicatesAlreadyImported +
+    stats.terminalSkipped +
+    stats.dedupedAfterClaim +
+    stats.unparsed +
+    stats.skipped +
+    stats.failed;
+  stats.unaccountedFor = stats.messagesSeen - accounted;
+  return stats;
+}
 
 /** Refresh a minute early, so a token cannot expire mid-run. */
 const EXPIRY_SKEW_MS = 60_000;
@@ -398,7 +434,13 @@ export async function syncOneConnection(
       });
 
       if (result.outcome === "imported") stats.expensesImported++;
-      else if (result.outcome === "duplicate") stats.duplicatesSkipped++;
+      else if (result.outcome === "duplicate") {
+        // Still counted in duplicatesSkipped so the response keeps its shape,
+        // but no longer ONLY there: this is a post-claim dedupe against a
+        // different row, not a message that was never claimed.
+        stats.duplicatesSkipped++;
+        stats.dedupedAfterClaim++;
+      }
       else if (result.outcome === "unparsed") {
         stats.unparsed++;
         // Reached the parser and matched no template.
@@ -575,6 +617,16 @@ export async function syncGmailConnections(
     }
   }
 
+  reconcileStats(stats);
+  if (stats.unaccountedFor !== 0) {
+    // Loud: some message reached processing and its outcome was never
+    // recorded in any bucket. That is a reporting bug, and the whole point of
+    // the invariant is that it cannot pass unnoticed.
+    console.error(
+      `gmail-sync: ACCOUNTING MISMATCH seen=${stats.messagesSeen} ` +
+        `unaccounted=${stats.unaccountedFor}`,
+    );
+  }
   return stats;
 }
 
