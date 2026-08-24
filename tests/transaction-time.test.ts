@@ -456,5 +456,36 @@ console.log("\n-- gmail-sync config: verify_jwt stays false --");
     /verify_jwt\s*=\s*true/.test(toml.split("[functions.scan-receipt]")[1]?.split("[functions.")[0] ?? ""));
 }
 
+// ---------------------------------------------------------------------------
+console.log("\n-- the cron health diagnostic never leaks secret material --");
+// ---------------------------------------------------------------------------
+{
+  const fs = await import("node:fs/promises");
+  const sql = await fs.readFile(
+    new URL("../supabase/migrations/20260824110000_cron_health.sql", import.meta.url), "utf8");
+
+  check("the diagnostic exists", sql.includes("create or replace function public.gmail_cron_health()"));
+  check("vault is probed with exists(), never selected",
+    sql.includes("exists (select 1 from vault.decrypted_secrets"));
+  check("no decrypted_secret VALUE is ever selected",
+    !/select\s+decrypted_secret/i.test(sql), "must not select the secret itself");
+  check("the cron command is never returned -- it embeds the endpoint and secret",
+    !/'command'|j\.command|,\s*command/.test(sql));
+  check("only existence booleans are reported for vault",
+    sql.includes("'vault_url_configured'") && sql.includes("'vault_secret_configured'"));
+  check("it reports the expected schedule for comparison",
+    sql.includes("'expected_schedule'") && sql.includes("gmail_sync_cron_schedule()"));
+  check("it reports whether the installed schedule matches",
+    sql.includes("'schedule_matches'"));
+  check("it reports the last run when available", sql.includes("'last_run_at'"));
+  check("anon cannot execute it",
+    sql.includes("revoke all on function public.gmail_cron_health() from public, anon"));
+  check("signed-in users can", 
+    sql.includes("grant execute on function public.gmail_cron_health() to authenticated"));
+  check("it is read-only -- no write statement anywhere in the function",
+    !/\b(insert into|update\s+\w+\s+set|delete from|drop |alter table)\b/i.test(sql),
+    "diagnostic must not mutate");
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

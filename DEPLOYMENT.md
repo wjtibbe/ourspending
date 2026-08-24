@@ -28,7 +28,7 @@ Supabase credentials**, so it cannot deploy anything.
 
 | Job | What it does |
 |---|---|
-| **Node tests** | Every `tests/*.test.ts` and `tests/*.test.js` — 1133 assertions |
+| **Node tests** | Every `tests/*.test.ts` and `tests/*.test.js` — 1203 assertions |
 | **Edge Function type check** | `deno check` on the six active functions |
 | **Migration hygiene** | Filenames match `<14-digit-timestamp>_<snake_case>.sql`, timestamps unique and ascending, and no rollback-style `verify_*.sql` has leaked into `supabase/migrations/` |
 
@@ -422,14 +422,31 @@ and pause with `select cron.unschedule('gmail-hourly-sync');`.
 ## Household timezone
 
 `households.timezone` decides which calendar day an imported transaction lands
-on. **NULL means UTC**, which is exactly the pre-existing behaviour, so the
-migration changes nothing until a household opts in:
+on. **NULL means UTC**, the pre-existing behaviour.
+
+Set it in the app: **Settings → Household → Household timezone**. The field
+suggests the browser's own zone when nothing is stored, validates the name
+against `Intl`, and shows the current value. A stored value is never
+overwritten by the suggestion — you have to press Save — so opening Settings
+while travelling cannot repoint an established household's days.
+
+No SQL needed.
+
+## Cron configuration health
+
+`public.gmail_cron_health()` is a read-only diagnostic, executable by any
+signed-in user. It reports whether pg_cron/pg_net are installed, whether the
+`gmail-hourly-sync` job exists and is active, whether its schedule matches
+`gmail_sync_cron_schedule()`, the last run when available, and whether each
+Vault entry exists — **existence only**. No secret value and no cron command is
+ever returned (the command embeds both the endpoint and the shared secret).
 
 ```sql
-update public.households set timezone = 'America/Bogota' where id = '<household-id>';
+select jsonb_pretty(public.gmail_cron_health());
 ```
 
-Without this, a purchase at 23:40 Bogota time is filed under the next day.
+`ready: true` means the hourly sync is fully wired. Anything else names the
+missing piece.
 
 ---
 

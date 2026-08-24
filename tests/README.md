@@ -17,6 +17,7 @@ Functions import, using Node's native type stripping (Node 22.6+).
     node --experimental-strip-types tests/wise-templates.test.ts
     node --experimental-strip-types tests/transaction-time.test.ts
     node tests/expense-display.test.js
+    node tests/sync-health.test.js
 
 `categories.test.ts` covers the mapping layer: multilingual aliases, MCC codes,
 resolution priority, deactivated household categories, and the guarantee that
@@ -308,6 +309,23 @@ comment), that it no-ops rather than failing when pg_cron or the vault entries
 are absent, that no secret is committed, that only `service_role` may reinstall
 it — and that `config.toml` keeps `gmail-sync` at `verify_jwt = false` while
 `scan-receipt` stays `true`.
+
+`sync-health.test.js` drives `sync-health.js` — the pure module `app.js` uses
+for the Gmail card's status badge and the Settings timezone field. Two rules
+carry the weight: a dead OAuth grant is never reported as merely "delayed"
+(waiting does not fix it), and "delayed" is measured from the last SUCCESS
+rather than the last ATTEMPT, so an hourly job that fails silently every hour
+cannot look healthy forever. It covers all four health states plus none /
+disabled / awaiting, their priority order, the exact 2-hour boundary, and that
+"next expected sync" is the top of the next hour (matching the cron) rather
+than "last sync + 1h", including the day rollover at 23:40.
+
+For timezones it covers IANA validation against `Intl` itself — so a zone the
+field accepts is by construction one the importer can use — rejecting bare
+offset syntax (`UTC+2`, `+05:00`) while still accepting the genuinely-IANA
+`Etc/GMT+5`; and the rule that protects an established household: a stored
+timezone always wins over the browser's, so opening Settings while travelling
+never silently repoints an existing household's calendar days.
 
 `expense-display.test.js` drives `expense-display.js` — the pure function
 `app.js` uses to decide what an expense row's large/small amounts show. It

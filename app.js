@@ -983,6 +983,26 @@ function Dashboard({
     showToast(t("source_saved"));
     loadAll();
   };
+  // Household timezone. Validated before it is stored, because an unknown
+  // zone would silently push imported transactions onto the wrong calendar
+  // day rather than failing visibly.
+  const saveTimezone = async tz => {
+    const clean = String(tz || "").trim();
+    if (!window.SyncHealth.isValidTimezone(clean)) {
+      setErr(t("tz_invalid"));
+      return false;
+    }
+    setHousehold(h => h ? { ...h, timezone: clean } : h);
+    const { error } = await db.from("households").update({
+      timezone: clean
+    }).eq("id", hhId);
+    if (error) {
+      setErr(error.message);
+      return false;
+    }
+    showToast(t("tz_saved"));
+    return true;
+  };
   const saveColor = async (who, hex) => {
     // Apply locally first so the swatch (and every screen using it) updates
     // the instant you click, instead of waiting on a round trip.
@@ -1131,6 +1151,7 @@ function Dashboard({
     household: household,
     colors: colors,
     onSaveColor: saveColor,
+    onSaveTimezone: saveTimezone,
     people: people,
     members: members,
     hhId: hhId,
@@ -2087,6 +2108,7 @@ function SettingsPage({
   household,
   colors,
   onSaveColor,
+  onSaveTimezone,
   people,
   members,
   hhId,
@@ -2294,7 +2316,10 @@ function SettingsPage({
   }, /*#__PURE__*/React.createElement("code", null, household.invite_code || "—"), /*#__PURE__*/React.createElement("button", {
     style: S.miniBtn,
     onClick: copyCode
-  }, t("copy")))) : /*#__PURE__*/React.createElement("div", {
+  }, t("copy"))), /*#__PURE__*/React.createElement(TimezoneSetting, {
+    household: household,
+    onSave: onSaveTimezone
+  })) : /*#__PURE__*/React.createElement("div", {
     style: S.privacyNote
   }, t("no_household_yet")),
   // ===== CATEGORIES =====
@@ -2442,6 +2467,60 @@ function SettingsPage({
 // There is deliberately no Wise API token field here, and no forwarding
 // address: nothing on this screen talks to the Wise API or to an inbound
 // email provider.
+
+// Household timezone. Decides which calendar day an imported transaction is
+// filed under -- 23:40 in Bogota is the NEXT day in UTC, so a household that
+// never sets this has late-evening spending land on tomorrow.
+//
+// A stored value always wins over the browser's zone. The browser is only ever
+// a SUGGESTION for a household that has none, so opening Settings while
+// travelling cannot silently repoint an established household's days; the user
+// has to press Save.
+function TimezoneSetting({ household, onSave }) {
+  const browserTz = React.useMemo(() => window.SyncHealth.browserTimezone(), []);
+  const field = window.SyncHealth.timezoneFieldState(household && household.timezone, browserTz);
+  const [draft, setDraft] = useState(field.value);
+  const [busy, setBusy] = useState(false);
+  // Re-seed only when the STORED value changes, so typing is never clobbered.
+  React.useEffect(() => {
+    setDraft(window.SyncHealth.timezoneFieldState(household && household.timezone, browserTz).value);
+  }, [household && household.timezone, browserTz]);
+
+  const stored = field.storedValue;
+  const dirty = draft.trim() !== (stored || "");
+  const valid = window.SyncHealth.isValidTimezone(draft);
+
+  const save = async () => {
+    setBusy(true);
+    await onSave(draft);
+    setBusy(false);
+  };
+
+  return /*#__PURE__*/React.createElement(React.Fragment, null,
+    /*#__PURE__*/React.createElement("div", { style: S.fieldLabel }, t("tz_label")),
+    /*#__PURE__*/React.createElement("div", { style: S.privacyNote },
+      stored ? t("tz_current", { tz: stored }) : t("tz_unset")),
+    field.isSuggestion && !stored && /*#__PURE__*/React.createElement("div", {
+      style: S.privacyNote
+    }, t("tz_suggested", { tz: field.suggestion })),
+    /*#__PURE__*/React.createElement("div", { style: S.namesRow },
+      /*#__PURE__*/React.createElement("input", {
+        style: { ...S.input, marginTop: 0, flex: 1 },
+        value: draft,
+        placeholder: "America/Bogota",
+        "aria-label": t("tz_label"),
+        onChange: e => setDraft(e.target.value)
+      }),
+      /*#__PURE__*/React.createElement("button", {
+        style: S.miniBtn,
+        disabled: busy || !dirty || !valid,
+        onClick: save
+      }, busy ? t("prov_working") : t("save"))),
+    draft.trim() && !valid && /*#__PURE__*/React.createElement("div", {
+      style: { ...S.privacyNote, color: "var(--danger)" }
+    }, t("tz_invalid")));
+}
+
 function GmailImportSettings({
   user,
   showToast
@@ -2560,26 +2639,22 @@ function GmailImportSettings({
   // A dead refresh token is its own state: only reconnecting fixes it, so it
   // must not look like an ordinary transient error.
   const reconnect = !!(conn && conn.last_error === "reconnect_required");
-  const pill = !conn ? {
-    text: t("gmi_status_none"),
-    bg: "var(--line)",
-    fg: "var(--muted)"
-  } : reconnect ? {
-    text: t("gmi_status_reconnect"),
-    bg: "var(--tint-danger)",
-    fg: "var(--danger)"
-  } : !enabled ? {
-    text: t("gmi_status_disabled"),
-    bg: "var(--line)",
-    fg: "var(--muted)"
-  } : conn.last_synced_at ? {
-    text: t("gmi_status_active"),
-    bg: "var(--tint-green)",
-    fg: "var(--green)"
-  } : {
-    text: t("gmi_status_awaiting"),
-    bg: "var(--tint-green)",
-    fg: "var(--green)"
+  // One place decides the state; the pill and the detail lines both read it,
+  // so the badge can never disagree with the text underneath it.
+  const health = window.SyncHealth.syncHealth(
+    conn ? { ...conn, enabled } : null, new Date());
+  const PILL_STYLES = {
+    none:      { bg: "var(--line)",         fg: "var(--muted)" },
+    disabled:  { bg: "var(--line)",         fg: "var(--muted)" },
+    reconnect: { bg: "var(--tint-danger)",  fg: "var(--danger)" },
+    failed:    { bg: "var(--tint-danger)",  fg: "var(--danger)" },
+    delayed:   { bg: "var(--tint-warn, var(--line))", fg: "var(--muted)" },
+    awaiting:  { bg: "var(--tint-green)",   fg: "var(--green)" },
+    healthy:   { bg: "var(--tint-green)",   fg: "var(--green)" }
+  };
+  const pill = {
+    text: t("gmi_health_" + health.state),
+    ...(PILL_STYLES[health.state] || PILL_STYLES.none)
   };
   const halfBtn = extra => ({
     ...S.ghostBtn,
@@ -2630,6 +2705,10 @@ function GmailImportSettings({
   }, /*#__PURE__*/React.createElement("div", {
     style: S.provMeta
   }, t("gmi_last_checked") + ": " + timeAgo(conn.last_checked_at)), /*#__PURE__*/React.createElement("div", {
+    style: S.privacyNote
+  }, t("gmi_last_success") + ": " + (health.lastSuccessAt ? timeAgo(health.lastSuccessAt) : t("gmi_never"))), /*#__PURE__*/React.createElement("div", {
+    style: S.privacyNote
+  }, t("gmi_next_expected") + ": " + (health.nextExpectedAt ? new Date(health.nextExpectedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—")), /*#__PURE__*/React.createElement("div", {
     style: S.provMeta
   }, t("gmi_last_import") + ": " + timeAgo(counts.lastImport)), counts.unparsed > 0 && /*#__PURE__*/React.createElement("div", {
     style: S.provMeta
