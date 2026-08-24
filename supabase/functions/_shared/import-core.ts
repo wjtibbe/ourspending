@@ -53,6 +53,14 @@ export type NormalizedTransaction = {
   externalRef: string | null;
   /** ISO 8601, or null when the source gives no usable timestamp. */
   occurredAt: string | null;
+  /**
+   * When the DELIVERING system received the notification -- Gmail's
+   * internalDate for a polled message. Optional so existing callers are
+   * unaffected. Used only when occurredAt is absent, and always preferred over
+   * the sync clock because it is a stable property of the message: a retry
+   * re-derives the same value and therefore the same calendar day.
+   */
+  receivedAt?: string | null;
   direction: "out" | "in";
   status: "completed" | "declined" | "reversed" | "refund" | "unknown";
   /** What actually left the account, in the account's own currency. */
@@ -81,6 +89,12 @@ export type ImportContext = {
   rates: { usd: number; cop: number };
   allowed: Set<string>;
   now: Date;
+  /**
+   * IANA zone the household's calendar days are measured in, e.g.
+   * "America/Bogota". Falls back to UTC when unset, which is exactly the old
+   * behaviour, so an unconfigured household sees no change.
+   */
+  timezone: string;
 };
 
 export type ContextFailure = { error: "no_household" | "unresolved_slot" };
@@ -123,6 +137,32 @@ export async function allowedCategories(db: Db, householdId: string): Promise<Se
  * Resolves everything an import needs about the owning user, from the database
  * only. Nothing here is accepted from a caller-supplied payload.
  */
+
+/** IANA zone used for a household's calendar days. UTC when unset. */
+export const DEFAULT_TIMEZONE = "UTC";
+
+/**
+ * Reads households.timezone, best-effort.
+ *
+ * Deliberately a SEPARATE query rather than another column on the rates
+ * select: `timezone` is added by a later migration, and PostgREST rejects the
+ * WHOLE request when it names an unknown column. Folding it into the rates
+ * query would therefore turn "migration not applied yet" into "every import
+ * fails", so this isolates that risk and falls back to UTC -- which is exactly
+ * the behaviour that existed before timezones were considered at all.
+ */
+export async function householdTimezone(db: Db, householdId: string): Promise<string> {
+  try {
+    const rows = await db.select(
+      `households?id=eq.${q(householdId)}&select=timezone&limit=1`,
+    );
+    const tz = rows[0]?.timezone;
+    return typeof tz === "string" && tz.trim() ? tz.trim() : DEFAULT_TIMEZONE;
+  } catch {
+    return DEFAULT_TIMEZONE;
+  }
+}
+
 export async function resolveImportContext(
   db: Db,
   userId: string,
@@ -154,6 +194,7 @@ export async function resolveImportContext(
     },
     allowed: await allowedCategories(db, householdId),
     now,
+    timezone: await householdTimezone(db, householdId),
   };
 }
 
@@ -217,6 +258,10 @@ export type ExpenseRow = {
   amount_authority: "deducted_balance_amount";
   source_provider: string | null;
   conversion_source: string | null;
+  /** The authoritative instant the transaction happened, ISO-8601 UTC. */
+  occurred_at: string;
+  /** Which source that instant came from -- see OccurredAtSource. */
+  occurred_at_source: OccurredAtSource;
 };
 
 /** Caller-supplied audit labels. Optional: import-core itself stays provider-neutral. */
@@ -245,11 +290,87 @@ export type CategoryOverride = {
   matched: string | null;
 };
 
-/** YYYY-MM-DD for the app's `spent_on` date column. */
-export function spentOn(tx: NormalizedTransaction, fallback: Date): string {
-  const d = tx.occurredAt ? new Date(tx.occurredAt) : null;
-  const use = d && !isNaN(d.getTime()) ? d : fallback;
-  return use.toISOString().slice(0, 10);
+/**
+ * Which instant a transaction actually happened at, and how confident we are.
+ *
+ *   wise_explicit        the email itself carried a transaction timestamp
+ *   gmail_internal_date  when Gmail received the notification -- within
+ *                        seconds of the payment in practice
+ *   sync_fallback        neither existed; the time the sync ran
+ *
+ * The order matters more than it looks. `sync_fallback` is the only source
+ * that is not a property of the transaction: it changes every run, so a retry
+ * would move an expense to a different day than its first attempt. Preferring
+ * Gmail's internalDate -- which is stable for a given message forever -- is
+ * what makes a retry reproduce the same date.
+ */
+export type OccurredAtSource = "wise_explicit" | "gmail_internal_date" | "sync_fallback";
+
+export type ResolvedOccurredAt = {
+  /** The authoritative instant, ISO-8601 UTC. */
+  occurredAt: string;
+  source: OccurredAtSource;
+};
+
+const validDate = (v: unknown): Date | null => {
+  if (v == null) return null;
+  const d = new Date(typeof v === "number" ? v : String(v));
+  return isNaN(d.getTime()) ? null : d;
+};
+
+/** Applies the precedence above. Never throws. */
+export function resolveOccurredAt(
+  tx: NormalizedTransaction,
+  fallback: Date,
+): ResolvedOccurredAt {
+  const explicit = validDate(tx.occurredAt);
+  if (explicit) return { occurredAt: explicit.toISOString(), source: "wise_explicit" };
+
+  const received = validDate(tx.receivedAt);
+  if (received) return { occurredAt: received.toISOString(), source: "gmail_internal_date" };
+
+  return { occurredAt: fallback.toISOString(), source: "sync_fallback" };
+}
+
+/**
+ * The calendar day an instant falls on, IN A GIVEN ZONE.
+ *
+ * `toISOString().slice(0, 10)` -- what this used to do -- is the UTC day, which
+ * silently moves a late-evening purchase in a negative-offset zone onto the
+ * NEXT day: 23:40 in America/Bogota is 04:40 UTC tomorrow. Intl is used rather
+ * than manual offset arithmetic because it knows the zone's DST history; the
+ * "en-CA" locale is chosen because it formats as YYYY-MM-DD natively.
+ *
+ * Falls back to the UTC day if the zone is unknown, so a typo in a household's
+ * configuration degrades to the old behaviour instead of failing an import.
+ */
+export function calendarDayIn(instant: Date | string, timezone: string): string {
+  const d = typeof instant === "string" ? new Date(instant) : instant;
+  if (isNaN(d.getTime())) return new Date().toISOString().slice(0, 10);
+  try {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(d);
+  } catch {
+    return d.toISOString().slice(0, 10);
+  }
+}
+
+/**
+ * YYYY-MM-DD for the app's `spent_on` column, in the household's zone.
+ *
+ * `timezone` is optional so every pre-existing caller keeps working unchanged
+ * and keeps getting the UTC day.
+ */
+export function spentOn(
+  tx: NormalizedTransaction,
+  fallback: Date,
+  timezone: string = DEFAULT_TIMEZONE,
+): string {
+  return calendarDayIn(resolveOccurredAt(tx, fallback).occurredAt, timezone);
 }
 
 /**
@@ -273,6 +394,7 @@ export function buildExpenseRow(
   if (!Number.isFinite(rate) || rate <= 0) throw new Error("missing_household_rate");
 
   const category = categoryOverride ?? resolveCategory(tx.categoryInput, ctx.allowed);
+  const occurred = resolveOccurredAt(tx, ctx.now);
 
   // A real conversion only when the merchant's own amount is in a DIFFERENT
   // currency from what was actually deducted -- a provider that echoes the
@@ -295,12 +417,16 @@ export function buildExpenseRow(
       payer: ctx.slot,
       category: category.category,
       note: (tx.merchant ?? "Imported transaction").slice(0, 60),
-      spent_on: spentOn(tx, ctx.now),
+      // Resolved once, so the stored instant and the calendar day derived
+      // from it can never disagree.
+      spent_on: calendarDayIn(occurred.occurredAt, ctx.timezone ?? DEFAULT_TIMEZONE),
       created_by: ctx.userId,
       merchant_amount: hadConversion ? tx.merchantAmount!.value : null,
       merchant_currency: hadConversion ? tx.merchantAmount!.currency : null,
       had_currency_conversion: hadConversion,
       amount_authority: "deducted_balance_amount",
+      occurred_at: occurred.occurredAt,
+      occurred_at_source: occurred.source,
       source_provider: provenance.sourceProvider ?? null,
       conversion_source: provenance.conversionSource ?? null,
     },

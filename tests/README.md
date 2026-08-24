@@ -15,7 +15,9 @@ Functions import, using Node's native type stripping (Node 22.6+).
     node --experimental-strip-types tests/import-retry.test.ts
     node --experimental-strip-types tests/gmail-discovery.test.ts
     node --experimental-strip-types tests/wise-templates.test.ts
+    node --experimental-strip-types tests/transaction-time.test.ts
     node tests/expense-display.test.js
+    node tests/sync-health.test.js
 
 `categories.test.ts` covers the mapping layer: multilingual aliases, MCC codes,
 resolution priority, deactivated household categories, and the guarantee that
@@ -282,6 +284,48 @@ invariant — every message that reaches processing lands in exactly one of
 imported / duplicatesAlreadyImported / terminalSkipped / dedupedAfterClaim /
 unparsed / skipped / failed, with `unaccountedFor` proven able to *fail* on a
 rigged 31-messages-no-outcome run, so the invariant is not vacuous.
+
+`transaction-time.test.ts` pins which day an imported expense lands on, and
+the hourly cron contract. `spent_on` used to be the UTC day of the SYNC clock,
+because the Wise parser never produced an `occurredAt` and Gmail's
+`internalDate` — already carried by the message adapter — was dropped before
+reaching the importer. Two errors compounded: the expense landed on the day the
+sync ran (which hourly syncing makes worse, and which a retry could move), and
+it was the UTC day, so 23:40 in America/Bogota was filed under tomorrow.
+
+It covers the precedence (`wise_explicit` > `gmail_internal_date` >
+`sync_fallback`, with unparseable values falling through rather than winning);
+that the calendar day is rendered in the household's zone, with the worked
+Bogota example and the mirror-image Amsterdam case; that an unknown zone or an
+invalid instant degrades to the UTC day instead of failing an import; that an
+unconfigured household is byte-for-byte unchanged; that a retry weeks later
+reproduces the ORIGINAL day and provenance; and that twelve consecutive hourly
+runs produce exactly one expense whose date never drifts.
+
+It also reads `20260824100100_gmail_hourly_cron.sql` directly and asserts the
+schedule is exactly `0 * * * *` and appears once, that the installer
+unschedules before scheduling (checked inside the function body, not the header
+comment), that it no-ops rather than failing when pg_cron or the vault entries
+are absent, that no secret is committed, that only `service_role` may reinstall
+it — and that `config.toml` keeps `gmail-sync` at `verify_jwt = false` while
+`scan-receipt` stays `true`.
+
+`sync-health.test.js` drives `sync-health.js` — the pure module `app.js` uses
+for the Gmail card's status badge and the Settings timezone field. Two rules
+carry the weight: a dead OAuth grant is never reported as merely "delayed"
+(waiting does not fix it), and "delayed" is measured from the last SUCCESS
+rather than the last ATTEMPT, so an hourly job that fails silently every hour
+cannot look healthy forever. It covers all four health states plus none /
+disabled / awaiting, their priority order, the exact 2-hour boundary, and that
+"next expected sync" is the top of the next hour (matching the cron) rather
+than "last sync + 1h", including the day rollover at 23:40.
+
+For timezones it covers IANA validation against `Intl` itself — so a zone the
+field accepts is by construction one the importer can use — rejecting bare
+offset syntax (`UTC+2`, `+05:00`) while still accepting the genuinely-IANA
+`Etc/GMT+5`; and the rule that protects an established household: a stored
+timezone always wins over the browser's, so opening Settings while travelling
+never silently repoints an existing household's calendar days.
 
 `expense-display.test.js` drives `expense-display.js` — the pure function
 `app.js` uses to decide what an expense row's large/small amounts show. It
