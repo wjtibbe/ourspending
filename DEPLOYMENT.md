@@ -28,7 +28,7 @@ Supabase credentials**, so it cannot deploy anything.
 
 | Job | What it does |
 |---|---|
-| **Node tests** | Every `tests/*.test.ts` and `tests/*.test.js` — 1065 assertions |
+| **Node tests** | Every `tests/*.test.ts` and `tests/*.test.js` — 1133 assertions |
 | **Edge Function type check** | `deno check` on the six active functions |
 | **Migration hygiene** | Filenames match `<14-digit-timestamp>_<snake_case>.sql`, timestamps unique and ascending, and no rollback-style `verify_*.sql` has leaked into `supabase/migrations/` |
 
@@ -385,6 +385,51 @@ No subject, body, merchant, amount, message id or token is returned. Message
 dates are read with `format=minimal`, so no header or body is ever fetched;
 tests assert that a body snippet planted in the Gmail response cannot appear in
 the report.
+
+---
+
+## Hourly Gmail sync
+
+The schedule lives in `supabase/migrations/20260824100100_gmail_hourly_cron.sql`
+as `gmail_sync_cron_schedule()` → `0 * * * *`, installed by
+`ensure_gmail_hourly_sync()`, which every deploy re-runs. It unschedules any
+existing `gmail-hourly-sync` job before scheduling, so repeated deploys
+converge on exactly one job — verified by calling it five times and confirming
+one job remained.
+
+The two values it needs are read from Supabase Vault at call time, never
+committed. **One-time project setup** (SQL editor):
+
+```sql
+create extension if not exists pg_cron;
+create extension if not exists pg_net;
+
+select vault.create_secret(
+  'https://cleeaaqyhmevacsfjawi.supabase.co/functions/v1/gmail-sync',
+  'gmail_sync_url', 'Gmail sync endpoint for the hourly cron job');
+select vault.create_secret(
+  '<same value as the SYNC_CRON_SECRET function secret>',
+  'gmail_sync_secret', 'Shared secret gmail-sync compares in constant time');
+
+select public.ensure_gmail_hourly_sync();   -- expect: scheduled
+```
+
+Until those exist the migration is a deliberate no-op (`skipped_not_configured`),
+so it never blocks an unrelated deploy. Verify with
+`select jobname, schedule from cron.job where jobname = 'gmail-hourly-sync';`
+and pause with `select cron.unschedule('gmail-hourly-sync');`.
+
+## Household timezone
+
+`households.timezone` decides which calendar day an imported transaction lands
+on. **NULL means UTC**, which is exactly the pre-existing behaviour, so the
+migration changes nothing until a household opts in:
+
+```sql
+update public.households set timezone = 'America/Bogota' where id = '<household-id>';
+```
+
+Without this, a purchase at 23:40 Bogota time is filed under the next day.
 
 ---
 

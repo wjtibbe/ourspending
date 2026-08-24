@@ -22,7 +22,7 @@ import { fingerprint, wiseEmailParser } from "./parse-wise-email.ts";
 import { retentionExpiry, sanitizeForRetention } from "./sanitize.ts";
 import {
   classifyNormalized, createExpense, isContextFailure, q, resolveImportContext,
-  safeError, type NormalizedTransaction,
+  resolveOccurredAt, safeError, type NormalizedTransaction,
 } from "./import-core.ts";
 import { categorizeTransaction, type AiClassifier } from "./merchant-categorization.ts";
 
@@ -266,7 +266,14 @@ export async function importClaimedMessage(db: Db, params: {
         ? { outcome: "skipped", reason: parsed.detail }
         : { outcome: "unparsed", reason: parsed.detail };
     }
-    const tx: NormalizedTransaction = parsed.transaction;
+    // Carry the delivering system's own receive time (Gmail's internalDate)
+    // onto the transaction. The parser cannot know it -- it only sees the mail
+    // body -- but it is the best available stand-in for when the payment
+    // happened, and unlike the sync clock it is stable across retries.
+    const tx: NormalizedTransaction = {
+      ...parsed.transaction,
+      receivedAt: parsed.transaction.receivedAt ?? message.receivedAt ?? null,
+    };
 
     // ---- dedupe layers 3 and 4: transaction reference, then fingerprint ----
     const fp = await fingerprint({
@@ -274,7 +281,7 @@ export async function importClaimedMessage(db: Db, params: {
       merchant: tx.merchant,
       amount: tx.amount?.value ?? null,
       currency: tx.amount?.currency ?? null,
-      occurredAt: tx.occurredAt,
+      occurredAt: resolveOccurredAt(tx, now).occurredAt,
     });
 
     for (
@@ -306,7 +313,7 @@ export async function importClaimedMessage(db: Db, params: {
       amount_currency: tx.amount?.currency ?? null,
       merchant_amount_value: tx.merchantAmount?.value ?? null,
       merchant_amount_currency: tx.merchantAmount?.currency ?? null,
-      occurred_at: tx.occurredAt,
+      occurred_at: resolveOccurredAt(tx, now).occurredAt,
     });
 
     // ---- only completed outgoing spend becomes an expense ----

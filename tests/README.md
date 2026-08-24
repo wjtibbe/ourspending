@@ -15,6 +15,7 @@ Functions import, using Node's native type stripping (Node 22.6+).
     node --experimental-strip-types tests/import-retry.test.ts
     node --experimental-strip-types tests/gmail-discovery.test.ts
     node --experimental-strip-types tests/wise-templates.test.ts
+    node --experimental-strip-types tests/transaction-time.test.ts
     node tests/expense-display.test.js
 
 `categories.test.ts` covers the mapping layer: multilingual aliases, MCC codes,
@@ -282,6 +283,31 @@ invariant — every message that reaches processing lands in exactly one of
 imported / duplicatesAlreadyImported / terminalSkipped / dedupedAfterClaim /
 unparsed / skipped / failed, with `unaccountedFor` proven able to *fail* on a
 rigged 31-messages-no-outcome run, so the invariant is not vacuous.
+
+`transaction-time.test.ts` pins which day an imported expense lands on, and
+the hourly cron contract. `spent_on` used to be the UTC day of the SYNC clock,
+because the Wise parser never produced an `occurredAt` and Gmail's
+`internalDate` — already carried by the message adapter — was dropped before
+reaching the importer. Two errors compounded: the expense landed on the day the
+sync ran (which hourly syncing makes worse, and which a retry could move), and
+it was the UTC day, so 23:40 in America/Bogota was filed under tomorrow.
+
+It covers the precedence (`wise_explicit` > `gmail_internal_date` >
+`sync_fallback`, with unparseable values falling through rather than winning);
+that the calendar day is rendered in the household's zone, with the worked
+Bogota example and the mirror-image Amsterdam case; that an unknown zone or an
+invalid instant degrades to the UTC day instead of failing an import; that an
+unconfigured household is byte-for-byte unchanged; that a retry weeks later
+reproduces the ORIGINAL day and provenance; and that twelve consecutive hourly
+runs produce exactly one expense whose date never drifts.
+
+It also reads `20260824100100_gmail_hourly_cron.sql` directly and asserts the
+schedule is exactly `0 * * * *` and appears once, that the installer
+unschedules before scheduling (checked inside the function body, not the header
+comment), that it no-ops rather than failing when pg_cron or the vault entries
+are absent, that no secret is committed, that only `service_role` may reinstall
+it — and that `config.toml` keeps `gmail-sync` at `verify_jwt = false` while
+`scan-receipt` stays `true`.
 
 `expense-display.test.js` drives `expense-display.js` — the pure function
 `app.js` uses to decide what an expense row's large/small amounts show. It
