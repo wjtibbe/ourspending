@@ -22,7 +22,7 @@ const check = (name: string, ok: boolean, detail = "") => {
 function parsePath(path: string) {
   const [table, qs] = path.split("?");
   const params = new URLSearchParams(qs ?? "");
-  const filters: Array<[string, string]> = [];
+  const filters: Array<[string, string, string]> = [];
   for (const [k, v] of params) {
     if (["select", "limit", "order", "on_conflict"].includes(k)) continue;
     if (v.startsWith("eq.")) filters.push([k, v.slice(3)]);
@@ -39,7 +39,7 @@ class FakeDb {
   select(path: string): Promise<Row[]> {
     const { table, params, filters } = parsePath(path);
     let out = this.rows(table).filter((r) =>
-      filters.every(([k, v]) => String(r[k]) === v)
+      filters.every(([k, v, op]) => op === "neq" ? String(r[k]) !== v : String(r[k]) === v)
     );
     const limit = params.get("limit");
     if (limit) out = out.slice(0, Number(limit));
@@ -73,7 +73,7 @@ class FakeDb {
 
   patch(path: string, body: Row, prefer = ""): Promise<Row[]> {
     const { table, filters } = parsePath(path);
-    const hit = this.rows(table).filter((r) => filters.every(([k, v]) => String(r[k]) === v));
+    const hit = this.rows(table).filter((r) => filters.every(([k, v, op]) => op === "neq" ? String(r[k]) !== v : String(r[k]) === v));
     hit.forEach((r) => Object.assign(r, body));
     return Promise.resolve(prefer.includes("return=minimal") ? [] : hit.map((r) => ({ ...r })));
   }

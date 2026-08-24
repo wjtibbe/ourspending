@@ -26,13 +26,13 @@ class FakeDb {
   select(path: string): Promise<Row[]> {
     const [table, qs] = path.split("?");
     const params = new URLSearchParams(qs ?? "");
-    const filters: Array<[string, string]> = [];
+    const filters: Array<[string, string, string]> = [];
     for (const [k, v] of params) {
       if (["select", "limit", "order", "on_conflict"].includes(k)) continue;
       if (v.startsWith("eq.")) filters.push([k, v.slice(3)]);
     }
     return Promise.resolve(
-      this.rows(table).filter((r) => filters.every(([k, v]) => String(r[k]) === v)).map((r) => ({ ...r })),
+      this.rows(table).filter((r) => filters.every(([k, v, op]) => op === "neq" ? String(r[k]) !== v : String(r[k]) === v)).map((r) => ({ ...r })),
     );
   }
   insert(table: string, body: Row | Row[]): Promise<Row[]> {

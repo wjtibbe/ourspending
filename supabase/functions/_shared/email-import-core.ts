@@ -239,7 +239,14 @@ export async function importClaimedMessage(db: Db, params: {
     if (message.rfcMessageId) {
       const dup = await db.select(
         `email_import_messages?connection_id=eq.${q(connectionId)}` +
-          `&rfc_message_id=eq.${q(message.rfcMessageId)}&select=id&limit=1`,
+          `&rfc_message_id=eq.${q(message.rfcMessageId)}` +
+          // Exclude THIS row. On a first attempt the row has no
+          // rfc_message_id yet, so this changes nothing -- but a RETRY runs
+          // against a row the previous attempt already stamped, and without
+          // this the row matches itself and is marked a duplicate of itself.
+          // That turned every retryable row terminal on its first retry,
+          // which is the opposite of what the retry path exists to do.
+          `&id=neq.${q(rowId)}&select=id&limit=1`,
       );
       if (dup.length) {
         await markMessage(db, rowId, { status: "duplicate", skip_reason: "rfc_message_id" });
@@ -279,7 +286,11 @@ export async function importClaimedMessage(db: Db, params: {
       if (!value) continue;
       const dup = await db.select(
         `email_import_messages?connection_id=eq.${q(connectionId)}` +
-          `&${column}=eq.${q(value)}&select=id&limit=1`,
+          `&${column}=eq.${q(value)}` +
+          // Same self-exclusion as layer 2: a retry re-derives the same
+          // external_ref and fingerprint its previous attempt already stored
+          // on this very row, and would otherwise dedupe against itself.
+          `&id=neq.${q(rowId)}&select=id&limit=1`,
       );
       if (dup.length) {
         await markMessage(db, rowId, { status: "duplicate", skip_reason: column });

@@ -179,7 +179,9 @@ Deno.serve(async (req) => {
         `imported=${stats.expensesImported} duplicates=${stats.duplicatesSkipped} ` +
         `(already_imported=${stats.duplicatesAlreadyImported} ` +
         `terminal_skip=${stats.terminalSkipped}) retried=${stats.retriedRows} ` +
+        `deduped_after_claim=${stats.dedupedAfterClaim} ` +
         `unparsed=${stats.unparsed} failed=${stats.failed} ` +
+        `unaccounted=${stats.unaccountedFor} ` +
         `listed=${stats.gmailMessagesListed} rejected_sender=${stats.rejectedSender} ` +
         `rejected_template=${stats.rejectedTemplate} pages=${stats.gmailPagesFetched} ` +
         `estimate=${stats.gmailResultSizeEstimate} more_available=${stats.gmailMoreAvailable} ` +

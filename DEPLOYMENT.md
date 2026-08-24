@@ -28,7 +28,7 @@ Supabase credentials**, so it cannot deploy anything.
 
 | Job | What it does |
 |---|---|
-| **Node tests** | Every `tests/*.test.ts` and `tests/*.test.js` — 978 assertions |
+| **Node tests** | Every `tests/*.test.ts` and `tests/*.test.js` — 1065 assertions |
 | **Edge Function type check** | `deno check` on the six active functions |
 | **Migration hygiene** | Filenames match `<14-digit-timestamp>_<snake_case>.sql`, timestamps unique and ascending, and no rollback-style `verify_*.sql` has leaked into `supabase/migrations/` |
 
